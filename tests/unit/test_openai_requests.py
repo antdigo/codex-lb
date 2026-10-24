@@ -134,6 +134,89 @@ def test_subscription_inline_function_call_preserves_incremental_lite_id(request
     assert request.to_payload()["input"] == [call]
 
 
+@pytest.mark.parametrize("request_type", [ResponsesRequest, ResponsesCompactRequest])
+@pytest.mark.parametrize("item_id", ["msg_example", "msg_" + "a" * 50])
+def test_subscription_inline_message_omits_only_item_id(request_type, item_id):
+    message = {
+        "type": "message",
+        "id": item_id,
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": "OK"}],
+    }
+    reasoning = {"type": "reasoning", "id": "rs_original", "summary": [], "encrypted_content": "ciphertext"}
+    source = {"model": "gpt-6.1-sol", "instructions": "brief", "input": [reasoning, message]}
+    original = deepcopy(source)
+    request = request_type.model_validate(source)
+    assert request.to_payload()["input"] == [
+        reasoning,
+        {
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "OK"}],
+        },
+    ]
+    assert source == original
+    assert request.input == [reasoning, message]
+    if isinstance(request, ResponsesRequest):
+        assert request.model_dump_for_forwarding()["input"] == [reasoning, message]
+        assert request.to_replay_safety_payload()["input"] == [reasoning, message]
+
+
+@pytest.mark.parametrize("request_type", [ResponsesRequest, ResponsesCompactRequest])
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"status": "incomplete"},
+        {"status": "in_progress"},
+        {"status": None},
+        {"role": "user"},
+        {"content": []},
+        {"content": [{"type": "future_output", "text": "opaque"}]},
+        {"encrypted_content": "ciphertext"},
+        {"encrypted_function_args": ["ciphertext"]},
+        {"type": "item_reference"},
+    ],
+)
+def test_subscription_inline_message_preserves_incomplete_or_opaque_ids(request_type, changes):
+    message = {
+        "type": "message",
+        "id": "msg_original",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": "OK"}],
+        **changes,
+    }
+    request = request_type.model_validate({"model": "gpt-6.1-sol", "instructions": "brief", "input": [message]})
+    wire_input = request.to_payload()["input"]
+    assert isinstance(wire_input, list)
+    assert isinstance(wire_input[0], dict)
+    assert wire_input[0]["id"] == "msg_original"
+
+
+@pytest.mark.parametrize("request_type", [ResponsesRequest, ResponsesCompactRequest])
+@pytest.mark.parametrize("metadata_only", [False, True])
+def test_subscription_inline_message_preserves_lite_ids(request_type, metadata_only):
+    message = {
+        "type": "message",
+        "id": "msg_lite",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": "OK"}],
+    }
+    items = [message] if metadata_only else [{"type": "additional_tools", "role": "developer", "tools": []}, message]
+    request = request_type.model_validate(
+        {
+            "model": "gpt-6.1-sol",
+            "instructions": "",
+            "input": items,
+            "client_metadata": {"ws_request_header_x_openai_internal_codex_responses_lite": "true"},
+        }
+    )
+    assert request.to_payload()["input"] == items
+
+
 def test_responses_requires_input():
     with pytest.raises(ValidationError):
         ResponsesRequest.model_validate({"model": "gpt-5.1", "instructions": "hi"})

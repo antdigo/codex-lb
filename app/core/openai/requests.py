@@ -763,9 +763,9 @@ class ResponsesRequest(BaseModel):
             payload.pop("tools", None)
         return payload
 
-    def to_payload(self, *, strip_inline_function_call_ids: bool = True) -> JsonObject:
+    def to_payload(self, *, strip_inline_item_ids: bool = True) -> JsonObject:
         payload = _strip_unsupported_fields(
-            self.model_dump_for_forwarding(), strip_inline_function_call_ids=strip_inline_function_call_ids
+            self.model_dump_for_forwarding(), strip_inline_item_ids=strip_inline_item_ids
         )
         _normalize_compaction_trigger_singleton(payload)
         return payload
@@ -774,7 +774,7 @@ class ResponsesRequest(BaseModel):
         return _strip_unsupported_fields(
             self.model_dump_for_forwarding(),
             strip_replayed_tool_call_namespaces=False,
-            strip_inline_function_call_ids=False,
+            strip_inline_item_ids=False,
         )
 
 
@@ -918,7 +918,7 @@ def _strip_unsupported_fields(
     payload: MutableJsonObject,
     *,
     strip_replayed_tool_call_namespaces: bool = True,
-    strip_inline_function_call_ids: bool = True,
+    strip_inline_item_ids: bool = True,
 ) -> MutableJsonObject:
     _normalize_openai_compatible_aliases(payload)
     _normalize_service_tier_aliases(payload)
@@ -927,8 +927,8 @@ def _strip_unsupported_fields(
     _strip_poisoned_local_compact_fallback_items(payload)
     if strip_replayed_tool_call_namespaces:
         strip_replayed_tool_call_namespaces_from_payload(payload)
-    if strip_inline_function_call_ids:
-        _strip_subscription_inline_function_call_ids(payload)
+    if strip_inline_item_ids:
+        _strip_subscription_inline_item_ids(payload)
     # ``tools`` is deliberately NOT canonicalized here: the wire payload must
     # forward client tool entries byte-preserved (array order, key order, and
     # unknown keys untouched) so reserved model tools survive upstream
@@ -939,7 +939,7 @@ def _strip_unsupported_fields(
     return payload
 
 
-def _strip_subscription_inline_function_call_ids(payload: MutableJsonObject) -> None:
+def _strip_subscription_inline_item_ids(payload: MutableJsonObject) -> None:
     input_value = payload.get("input")
     if (
         not is_json_list(input_value)
@@ -948,19 +948,34 @@ def _strip_subscription_inline_function_call_ids(payload: MutableJsonObject) -> 
     ):
         return
     for item in input_value:
-        if not isinstance(item, dict) or item.get("type") != "function_call":
-            continue
-        call_id = item.get("call_id")
-        name = item.get("name")
-        if not isinstance(call_id, str) or not call_id or not isinstance(name, str) or not name:
-            continue
-        if not isinstance(item.get("arguments"), str):
+        if not isinstance(item, dict) or "id" not in item:
             continue
         if item.get("encrypted_content") or item.get("encrypted_function_args"):
             continue
-        # Complete plaintext calls are self-contained. Their item id can ask
-        # the subscription backend for unsupported persisted-item lookup;
-        # call_id alone pairs the call with its output. Only mutate the wire copy.
+        item_type = item.get("type")
+        if item_type == "function_call":
+            call_id = item.get("call_id")
+            name = item.get("name")
+            if not isinstance(call_id, str) or not call_id or not isinstance(name, str) or not name:
+                continue
+            if not isinstance(item.get("arguments"), str):
+                continue
+        elif item_type == "message":
+            content = item.get("content")
+            if item.get("role") != "assistant" or item.get("status") != "completed":
+                continue
+            if not is_json_list(content) or not content:
+                continue
+            if not all(
+                isinstance(part, dict) and part.get("type") == "output_text" and isinstance(part.get("text"), str)
+                for part in content
+            ):
+                continue
+        else:
+            continue
+        # Full plaintext items do not need persisted-item lookup. Preserve
+        # call_id for tool pairing and all encrypted/reference shapes. Only
+        # mutate the wire copy; recovery retains the original ownership evidence.
         item.pop("id", None)
 
 

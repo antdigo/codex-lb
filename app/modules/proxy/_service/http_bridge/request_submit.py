@@ -632,9 +632,7 @@ class _HTTPBridgeRequestSubmitMixin:
                 deduped_replayed_input_count = len(replayed_input_items)
                 deduped_replayed_input_fingerprint = _fingerprint_input_items(replayed_input_items)
                 payload = payload.model_copy(update={"input": deduped_input_items})
-        upstream_payload = dict(
-            payload.to_payload(strip_inline_function_call_ids=transport != _REQUEST_TRANSPORT_WEBSOCKET)
-        )
+        upstream_payload = dict(payload.to_payload(strip_inline_item_ids=transport != _REQUEST_TRANSPORT_WEBSOCKET))
         upstream_payload.pop("stream", None)
         upstream_payload.pop("background", None)
         if include_type_field:
@@ -687,11 +685,13 @@ class _HTTPBridgeRequestSubmitMixin:
                 payload.previous_response_id is not None
                 or _sticky_key_from_turn_state_header(headers or {}) is not None
             ),
-            has_original_function_call_item_id=(
+            has_original_inline_item_id=(
                 transport != _REQUEST_TRANSPORT_WEBSOCKET
                 and isinstance(payload_input, list)
                 and any(
-                    isinstance(item, dict) and item.get("type") == "function_call" and item.get("id") not in (None, "")
+                    isinstance(item, dict)
+                    and item.get("type") in ("function_call", "message")
+                    and item.get("id") not in (None, "")
                     for item in payload_input
                 )
             ),

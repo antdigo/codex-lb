@@ -463,7 +463,7 @@ def _websocket_owner_switch_has_other_pending_requests(
 def _websocket_request_text_is_account_neutral_fresh_replay(
     request_text: str | None, *, request_state: "_WebSocketRequestState | None" = None
 ) -> bool:
-    if request_state is not None and request_state.has_original_function_call_item_id:
+    if request_state is not None and request_state.has_original_inline_item_id:
         return False
     if not isinstance(request_text, str):
         return False
@@ -944,7 +944,7 @@ def _websocket_fresh_request_blocks_account_switch(request_state: _WebSocketRequ
 
 
 def _websocket_auth_request_can_switch_account(request_state: _WebSocketRequestState) -> bool:
-    if request_state.file_required_preferred_account or request_state.has_original_function_call_item_id:
+    if request_state.file_required_preferred_account or request_state.has_original_inline_item_id:
         return False
     if request_state.previous_response_id is None:
         return request_state.request_text is None or _websocket_request_text_is_account_neutral_fresh_replay(

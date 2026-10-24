@@ -3100,6 +3100,54 @@ async def test_responses_route_omits_subscription_inline_function_call_id(async_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path", ["/backend-api/codex/responses", "/backend-api/codex/responses/", "/v1/responses", "/v1/responses/"]
+)
+@pytest.mark.parametrize("stream", [True, False])
+async def test_responses_route_omits_subscription_inline_message_id(async_client, monkeypatch, path, stream):
+    auth_json = _make_auth_json("acc_inline_message", "inline-message@example.com")
+    imported = await async_client.post(
+        "/api/accounts/import", files={"auth_json": ("auth.json", json.dumps(auth_json), "application/json")}
+    )
+    assert imported.status_code == 200
+    reasoning = {"type": "reasoning", "id": "rs_original", "summary": [], "encrypted_content": "ciphertext"}
+    message = {
+        "type": "message",
+        "id": "msg_replayed",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": "OK"}],
+    }
+    seen = []
+
+    async def fake_stream(payload, headers, access_token, account_id, **_kw):
+        seen.append((payload.to_payload(), payload.to_replay_safety_payload()))
+        yield (
+            'data: {"type":"response.completed","response":'
+            '{"id":"resp_inline_message","object":"response","status":"completed","output":[]}}\n\n'
+        )
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+    response = await async_client.post(
+        path,
+        json={"model": "gpt-6.1-sol", "instructions": "brief", "input": [reasoning, message], "stream": stream},
+    )
+    assert response.status_code == 200, response.text
+    assert len(seen) == 1
+    wire, safety = seen[0]
+    assert wire["input"] == [
+        reasoning,
+        {
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "OK"}],
+        },
+    ]
+    assert safety["input"] == [reasoning, message]
+
+
+@pytest.mark.asyncio
 async def test_v1_responses_normalizes_assistant_input_text(async_client, monkeypatch):
     email = "assistant-normalize@example.com"
     raw_account_id = "acc_assistant_normalize"

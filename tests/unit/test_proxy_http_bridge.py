@@ -11476,6 +11476,7 @@ async def _run_session_anchor_owner_stream(
     account_id: str,
     anchor_owner_account_id: str | None,
     inline_call_prefix: bool = False,
+    inline_message_prefix: bool = False,
     captured_states: list[proxy_service._WebSocketRequestState] | None = None,
 ) -> list[proxy_service.ResponsesRequest]:
     """Drive _stream_via_http_bridge for a trimmable session-anchor turn.
@@ -11496,6 +11497,16 @@ async def _run_session_anchor_owner_stream(
                 {"type": "function_call", "id": "fc_owner", "call_id": "call_a", "name": "note", "arguments": "{}"},
                 {"type": "function_call_output", "call_id": "call_a", "output": "OK"},
             ]
+        )
+    if inline_message_prefix:
+        prefix_items.append(
+            {
+                "type": "message",
+                "id": "msg_owner",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "OK"}],
+            }
         )
     payload = proxy_service.ResponsesRequest.model_validate(
         {
@@ -11640,7 +11651,8 @@ async def test_stream_via_http_bridge_skips_session_anchor_after_cross_account_f
 
 
 @pytest.mark.asyncio
-async def test_http_inline_call_authority_survives_anchor_trim_and_fresh_replay(monkeypatch):
+@pytest.mark.parametrize("item_kind", ["function_call", "message"])
+async def test_http_inline_item_authority_survives_anchor_trim_and_fresh_replay(monkeypatch, item_kind):
     from app.modules.proxy._service.websocket.helpers import _install_verified_fresh_replay
 
     states = []
@@ -11648,18 +11660,19 @@ async def test_http_inline_call_authority_survives_anchor_trim_and_fresh_replay(
         monkeypatch,
         account_id="acc-1",
         anchor_owner_account_id="acc-1",
-        inline_call_prefix=True,
+        inline_call_prefix=item_kind == "function_call",
+        inline_message_prefix=item_kind == "message",
         captured_states=states,
     )
     assert len(states) >= 2
     assert states[0] is not states[-1]
-    assert states[0].has_original_function_call_item_id
+    assert states[0].has_original_inline_item_id
     state = states[-1]
     assert state.previous_response_id == "resp_session_latest"
-    assert state.has_original_function_call_item_id
+    assert state.has_original_inline_item_id
     assert state.fresh_upstream_request_is_retry_safe
     fresh = json.loads(state.fresh_upstream_request_text)
-    assert any(item.get("type") == "function_call" and "id" not in item for item in fresh["input"])
+    assert any(item.get("type") == item_kind and "id" not in item for item in fresh["input"])
     assert _bind_websocket_request_dispatch_owner(state, account_id="acc-1", exact_request_text=state.request_text)
     assert _install_verified_fresh_replay(state) is None
     assert _install_verified_fresh_replay(state, require_account_neutral=False) is not None
@@ -31575,7 +31588,8 @@ async def test_admission_waiters_do_not_accumulate_callbacks_on_shared_inflight_
 
 
 @pytest.mark.parametrize("lite", [False, True])
-def test_direct_websocket_inline_call_id_preserves_ownership_and_lite(lite):
+@pytest.mark.parametrize("item_kind", ["function_call", "message"])
+def test_direct_websocket_inline_item_id_preserves_ownership_and_lite(lite, item_kind):
     call = {
         "type": "function_call",
         "id": "fc_call_example",
@@ -31584,7 +31598,15 @@ def test_direct_websocket_inline_call_id_preserves_ownership_and_lite(lite):
         "arguments": "{}",
     }
     output = {"type": "function_call_output", "call_id": "call_example", "output": "OK"}
-    payload = {"model": "gpt-6.1-sol", "instructions": "brief", "input": [call, output]}
+    message = {
+        "type": "message",
+        "id": "msg_owner",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": "OK"}],
+    }
+    input_items = [call, output] if item_kind == "function_call" else [message]
+    payload = {"model": "gpt-6.1-sol", "instructions": "brief", "input": input_items}
     metadata = {CODEX_RESPONSES_LITE_WEBSOCKET_METADATA_KEY: "true"} if lite else None
     if lite:
         payload["previous_response_id"] = "resp_lite_previous"
@@ -31600,7 +31622,7 @@ def test_direct_websocket_inline_call_id_preserves_ownership_and_lite(lite):
         transport="websocket",
         client_metadata=metadata,
     )
-    assert json.loads(wire)["input"] == [call, output]
+    assert json.loads(wire)["input"] == input_items
     assert _bind_websocket_request_dispatch_owner(state, account_id="owner-a", exact_request_text=wire)
     assert state.replay_required_account_id == "owner-a"
     assert not _bind_websocket_request_dispatch_owner(state, account_id="owner-b", exact_request_text=wire)
@@ -31612,10 +31634,11 @@ def test_direct_websocket_inline_call_id_preserves_ownership_and_lite(lite):
         transport="websocket",
     )
     assert replay is not None
-    assert json.loads(replay)["input"] == [call, output]
+    assert json.loads(replay)["input"] == input_items
 
 
-def test_http_inline_call_wire_normalization_preserves_recovery_owner():
+@pytest.mark.parametrize("item_kind", ["function_call", "message"])
+def test_http_inline_item_wire_normalization_preserves_recovery_owner(item_kind):
     from app.modules.proxy._service.websocket.helpers import (
         _install_verified_fresh_replay,
         _prepare_websocket_request_state_for_account_switch,
@@ -31625,9 +31648,15 @@ def test_http_inline_call_wire_normalization_preserves_recovery_owner():
 
     call = {"type": "function_call", "id": "fc_owner", "call_id": "call_a", "name": "note", "arguments": "{}"}
     output = {"type": "function_call_output", "call_id": "call_a", "output": "OK"}
-    request = ResponsesRequest.model_validate(
-        {"model": "gpt-6.1-sol", "instructions": "brief", "input": [call, output]}
-    )
+    message = {
+        "type": "message",
+        "id": "msg_owner",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": "OK"}],
+    }
+    input_items = [call, output] if item_kind == "function_call" else [message]
+    request = ResponsesRequest.model_validate({"model": "gpt-6.1-sol", "instructions": "brief", "input": input_items})
     proxy = object.__new__(proxy_service.ProxyService)
     state, wire = proxy._prepare_response_bridge_request_state(
         request,

@@ -2989,11 +2989,11 @@ class _WebSocketMixin:
             # parse failure keeps the source guards active instead of
             # changing that behavior here.
             source_route_excluded = False
-        normalized_payload = responses_payload.to_payload(strip_inline_function_call_ids=False)
+        normalized_payload = responses_payload.to_payload(strip_inline_item_ids=False)
         stripped_client_metadata = strip_capability_metadata(normalized_payload.get("client_metadata"))
         if stripped_client_metadata is not normalized_payload.get("client_metadata"):
             responses_payload = responses_payload.model_copy(update={"client_metadata": stripped_client_metadata})
-            normalized_payload = responses_payload.to_payload(strip_inline_function_call_ids=False)
+            normalized_payload = responses_payload.to_payload(strip_inline_item_ids=False)
         body_uses_responses_lite = _payload_uses_responses_lite(normalized_payload)
         trusted_incremental_responses_lite = bool(
             not body_uses_responses_lite
@@ -3131,7 +3131,7 @@ class _WebSocketMixin:
             refreshed_api_key,
             request_model=responses_payload.model,
             request_service_tier=_facade()._normalize_service_tier_value(
-                dict(responses_payload.to_payload(strip_inline_function_call_ids=False)).get("service_tier")
+                dict(responses_payload.to_payload(strip_inline_item_ids=False)).get("service_tier")
             ),
             request_usage_budget=estimate_api_key_request_usage(responses_payload),
         )
