@@ -20,6 +20,12 @@ TDD reproduced 14 missing-normalization/ownership failures before the production
 
 The actual patched serializer, before changing the running service, was also tested on the still-affected bridge: baseline rejected; patched body completed with 124,813 input / 124,672 cached / 495 output; baseline rejected again. An offline equality check proved the normalized bodies differed only by the six message IDs. All eight candidate production modules match the reviewed source; isolated installed-package import and real HTTP preparation/ownership checks passed.
 
+The unfiltered mixed whole-project run (`pytest -n 4 --timeout=60`) finished with **8,679 passed, 62 failed, 108 skipped**. It was not green. Fifty-three failures were in auth_manager/proxy_utils; running both entire modules separately on the patch passed **1,155 tests**. A three-test sequence on previous commit 64fe4f7 reproduced the same auth/proxy errors: the route-cache integration test leaves routing enabled without a default pool, and subsequent fake-repository unit tests read that persisted setting. This demonstrates existing order-sensitive DB fixture contamination, without proving the exact scheduler ordering of every whole-suite failure.
+
+The sticky-owner case failed identically on the previous commit and the patch with its 50 ms budget. The credit-claim SQLite lock case passed in isolation on both. Five shutdown-fixture startup failures, missing built dashboard assets and the previously reproduced repeated-401 failure were also present. These comparisons do not classify all 62 failures individually or establish green cloud CI. No unrelated production or fixture behavior was changed to mask them.
+
+Deployment is prepared in a separate pinned runtime; seven disposable activation/rollback control-flow checks passed and independent review has no open findings. The existing system service still uses the previous runtime until an interactive sudo restart is performed. Production activation and post-restart route verification remain pending.
+
 ## Serialization cost
 
 Paired measurements under concurrent test load (microseconds per wire serialization): common no-ID input 144.06 -> 97.10; one completed message 85.82 -> 86.33; captured 219-item request 12,529.95 -> 13,184.97. Timing ranges were wide and overlapping (large request 11,758.34–14,361.45 vs 9,698.66–19,904.20), so these are observations rather than a speedup or latency guarantee. Peak traced memory was unchanged for the small shapes and 378,743 -> 378,807 bytes for the large request (+64 bytes).
