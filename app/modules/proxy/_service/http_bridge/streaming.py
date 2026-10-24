@@ -1124,11 +1124,14 @@ class _HTTPBridgeStreamingMixin:
             deferred_account_backoff_tracker.current_lifecycle = lifecycle
             return lifecycle
 
+        original_function_call_item_id_seen = False
+
         def prepare_bridge_request(
             request_payload: ResponsesRequest,
             *,
             reservation: ApiKeyUsageReservationData | None = api_key_reservation,
         ) -> tuple[_WebSocketRequestState, str]:
+            nonlocal original_function_call_item_id_seen
             if bridge_uses_responses_lite:
                 request_state, text_data = self._prepare_http_bridge_request(
                     request_payload,
@@ -1148,6 +1151,10 @@ class _HTTPBridgeStreamingMixin:
                     request_id=request_id,
                     client_ip=client_ip,
                 )
+            original_function_call_item_id_seen = (
+                original_function_call_item_id_seen or request_state.has_original_function_call_item_id
+            )
+            request_state.has_original_function_call_item_id = original_function_call_item_id_seen
             request_state.capacity_startup_wait_event = capacity_startup_wait_event
             request_state.capacity_startup_ready_event = capacity_startup_ready_event
             lifecycle = begin_bridge_lifecycle(request_state.api_key_reservation)
@@ -1907,6 +1914,7 @@ class _HTTPBridgeStreamingMixin:
             )
 
         def switch_to_account_neutral_replay() -> None:
+            nonlocal original_function_call_item_id_seen
             nonlocal account_neutral_recovery
             nonlocal affinity
             nonlocal bridge_session_key
@@ -1970,6 +1978,9 @@ class _HTTPBridgeStreamingMixin:
             fresh_payload = durable_full_resend_fresh_payload
             if fresh_payload is None:
                 raise RuntimeError("account-neutral replay projection missing after eligibility check")
+            # The proven projection deliberately removed account-owned input.
+            # Ordinary trim/reprepare paths above retain the original evidence.
+            original_function_call_item_id_seen = False
             request_state, text_data = prepare_bridge_request(fresh_payload)
             if preserve_operation_identity:
                 request_state.operation_id = prior_operation_id

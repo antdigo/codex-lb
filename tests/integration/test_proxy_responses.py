@@ -3001,6 +3001,105 @@ async def test_v1_chat_completions_invalid_tool_calls_returns_openai_400(async_c
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path", ["/backend-api/codex/responses", "/backend-api/codex/responses/", "/v1/responses", "/v1/responses/"]
+)
+@pytest.mark.parametrize("stream", [True, False])
+async def test_responses_route_preserves_mid_conversation_prefix(async_client, monkeypatch, path, stream):
+    auth_json = _make_auth_json("acc_prefix", "prefix@example.com")
+    response = await async_client.post(
+        "/api/accounts/import", files={"auth_json": ("auth.json", json.dumps(auth_json), "application/json")}
+    )
+    assert response.status_code == 200
+    seen = []
+
+    async def fake_stream(payload, headers, access_token, account_id, **_kw):
+        seen.append(payload.to_payload())
+        yield (
+            'data: {"type":"response.completed","response":'
+            '{"id":"resp_prefix","object":"response","status":"completed","output":[]}}\n\n'
+        )
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+    items = [
+        {"role": "system", "content": "stable rules"},
+        {"role": "user", "content": "task"},
+        {"role": "system", "content": "<total_tokens>1000</total_tokens>"},
+    ]
+    for tail in ([], [{"role": "user", "content": "continue"}, {"role": "system", "content": "budget 900"}]):
+        response = await async_client.post(
+            path,
+            json={
+                "model": "gpt-6.1-sol",
+                "input": items + tail,
+                "prompt_cache_key": "prefix-session",
+                "stream": stream,
+            },
+        )
+        assert response.status_code == 200, response.text
+
+    assert len(seen) == 2
+    assert seen[0]["instructions"] == seen[1]["instructions"] == "stable rules"
+    assert seen[0]["input"] == [
+        {"role": "user", "content": "task"},
+        {"role": "developer", "content": "<total_tokens>1000</total_tokens>"},
+    ]
+    assert seen[1]["input"][:2] == seen[0]["input"]
+    assert seen[1]["input"][-1] == {"role": "developer", "content": "budget 900"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path", ["/backend-api/codex/responses", "/backend-api/codex/responses/", "/v1/responses", "/v1/responses/"]
+)
+@pytest.mark.parametrize("stream", [True, False])
+async def test_responses_route_omits_subscription_inline_function_call_id(async_client, monkeypatch, path, stream):
+    auth_json = _make_auth_json("acc_inline_call", "inline-call@example.com")
+    imported = await async_client.post(
+        "/api/accounts/import", files={"auth_json": ("auth.json", json.dumps(auth_json), "application/json")}
+    )
+    assert imported.status_code == 200
+    reasoning = {"type": "reasoning", "id": "rs_original", "summary": [], "encrypted_content": "ciphertext"}
+    call = {
+        "type": "function_call",
+        "id": "fc_call_example",
+        "call_id": "call_example",
+        "name": "note",
+        "arguments": "{}",
+    }
+    output = {"type": "function_call_output", "call_id": "call_example", "output": "OK"}
+    seen = []
+
+    async def fake_stream(payload, headers, access_token, account_id, **_kw):
+        wire = payload.to_payload()
+        seen.append((wire, payload.to_replay_safety_payload()))
+        if "id" in wire["input"][1]:
+            yield (
+                'data: {"type":"response.failed","response":{"id":"resp_inline_call",'
+                '"object":"response","status":"failed","error":{"type":"invalid_request_error",'
+                '"code":"unsupported_parameter","message":'
+                '"Supplied input item IDs require persisted-item lookup"}}}\n\n'
+            )
+            return
+        yield (
+            'data: {"type":"response.completed","response":'
+            '{"id":"resp_inline_call","object":"response","status":"completed","output":[]}}\n\n'
+        )
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+    response = await async_client.post(
+        path,
+        json={"model": "gpt-6.1-sol", "instructions": "brief", "input": [reasoning, call, output], "stream": stream},
+    )
+    assert response.status_code == 200, response.text
+    assert "unsupported_parameter" not in response.text
+    assert len(seen) == 1
+    wire, safety = seen[0]
+    assert wire["input"] == [reasoning, {key: value for key, value in call.items() if key != "id"}, output]
+    assert safety["input"] == [reasoning, call, output]
+
+
+@pytest.mark.asyncio
 async def test_v1_responses_normalizes_assistant_input_text(async_client, monkeypatch):
     email = "assistant-normalize@example.com"
     raw_account_id = "acc_assistant_normalize"

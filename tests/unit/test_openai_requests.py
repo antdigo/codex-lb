@@ -36,6 +36,104 @@ def test_responses_requires_instructions():
         ResponsesRequest.model_validate({"model": "gpt-5.1", "input": []})
 
 
+@pytest.mark.parametrize("request_type", [ResponsesRequest, ResponsesCompactRequest])
+@pytest.mark.parametrize("item_id", ["fc_call_example", "fc_toolu_example", "fc_" + "a" * 50])
+def test_subscription_inline_function_call_omits_item_id(request_type, item_id):
+    reasoning = {"type": "reasoning", "id": "rs_original", "summary": [], "encrypted_content": "ciphertext"}
+    call = {"type": "function_call", "id": item_id, "call_id": "call_example", "name": "note", "arguments": "{}"}
+    output = {"type": "function_call_output", "call_id": "call_example", "output": "OK"}
+    request = request_type.model_validate(
+        {"model": "gpt-6.1-sol", "instructions": "brief", "input": [reasoning, call, output]}
+    )
+    wire = request.to_payload()
+    assert wire["input"] == [reasoning, {key: value for key, value in call.items() if key != "id"}, output]
+    assert request.input == [reasoning, call, output]
+    assert call["id"] == item_id
+
+
+@pytest.mark.parametrize("request_type", [ResponsesRequest, ResponsesCompactRequest])
+@pytest.mark.parametrize(
+    "item",
+    [
+        {"type": "item_reference", "id": "fc_reference"},
+        {"type": "function_call", "id": "fc_reference"},
+        {"type": "function_call", "id": "fc_incomplete", "call_id": "call_example", "name": "note"},
+        {
+            "type": "function_call",
+            "id": "fc_encrypted",
+            "call_id": "call_example",
+            "name": "note",
+            "arguments": "{}",
+            "encrypted_content": "ciphertext",
+        },
+        {
+            "type": "function_call",
+            "id": "fc_encrypted_args",
+            "call_id": "call_example",
+            "name": "note",
+            "arguments": "{}",
+            "encrypted_function_args": ["ciphertext"],
+        },
+        {"type": "future_call", "id": "future_example", "call_id": "call_example", "name": "note", "arguments": "{}"},
+    ],
+)
+def test_subscription_inline_function_call_preserves_reference_and_encrypted_ids(request_type, item):
+    request = request_type.model_validate({"model": "gpt-6.1-sol", "instructions": "brief", "input": [item]})
+    assert request.to_payload()["input"] == [item]
+
+
+def test_subscription_inline_function_call_keeps_replay_safety_and_forwarding_evidence():
+    call = {
+        "type": "function_call",
+        "id": "fc_call_example",
+        "call_id": "call_example",
+        "name": "note",
+        "arguments": "{}",
+    }
+    request = ResponsesRequest.model_validate({"model": "gpt-6.1-sol", "instructions": "brief", "input": [call]})
+    assert request.model_dump_for_forwarding()["input"] == [call]
+    assert request.to_replay_safety_payload()["input"] == [call]
+    wire_input = request.to_payload()["input"]
+    assert isinstance(wire_input, list)
+    assert isinstance(wire_input[0], dict)
+    assert "id" not in wire_input[0]
+
+
+@pytest.mark.parametrize("request_type", [ResponsesRequest, ResponsesCompactRequest])
+def test_subscription_inline_function_call_preserves_responses_lite_id(request_type):
+    call = {
+        "type": "function_call",
+        "id": "fc_call_example",
+        "call_id": "call_example",
+        "name": "note",
+        "arguments": "{}",
+    }
+    items = [{"type": "additional_tools", "role": "developer", "tools": []}, call]
+    request = request_type.model_validate({"model": "gpt-6.1-sol", "instructions": "", "input": items})
+    assert request.to_payload()["input"] == items
+
+
+@pytest.mark.parametrize("request_type", [ResponsesRequest, ResponsesCompactRequest])
+def test_subscription_inline_function_call_preserves_incremental_lite_id(request_type):
+    call = {
+        "type": "function_call",
+        "id": "fc_call_example",
+        "call_id": "call_example",
+        "name": "note",
+        "arguments": "{}",
+    }
+    request = request_type.model_validate(
+        {
+            "model": "gpt-6.1-sol",
+            "instructions": "",
+            "input": [call],
+            "previous_response_id": "resp_previous",
+            "client_metadata": {"ws_request_header_x_openai_internal_codex_responses_lite": "true"},
+        }
+    )
+    assert request.to_payload()["input"] == [call]
+
+
 def test_responses_requires_input():
     with pytest.raises(ValidationError):
         ResponsesRequest.model_validate({"model": "gpt-5.1", "instructions": "hi"})
@@ -817,6 +915,92 @@ def test_v1_system_message_moves_to_instructions():
 
     assert request.instructions == "sys"
     assert request.input == [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}]
+
+
+@pytest.mark.parametrize("request_type", [ResponsesRequest, ResponsesCompactRequest])
+@pytest.mark.parametrize("role", ["system", "developer"])
+def test_responses_mid_conversation_instruction_preserves_prefix(request_type, role):
+    payload = {
+        "model": "gpt-6.1-sol",
+        "instructions": "primary",
+        "input": [
+            {"role": "system", "content": "rules"},
+            {"role": "user", "content": "task"},
+            {"type": "reasoning", "id": "rs_history", "encrypted_content": "opaque", "summary": []},
+            {"type": "function_call", "call_id": "call_1", "name": "read", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "file content"},
+            {"type": "message", "id": "msg_budget", "role": role, "content": "<total_tokens>1000</total_tokens>"},
+        ],
+    }
+    original = deepcopy(payload)
+    first = request_type.model_validate(payload).to_payload()
+    assert first["instructions"] == "primary\nrules"
+    assert first["input"] == [
+        {"role": "user", "content": "task"},
+        {"type": "reasoning", "id": "rs_history", "encrypted_content": "opaque", "summary": []},
+        {"type": "function_call", "call_id": "call_1", "name": "read", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "call_1", "output": "file content"},
+        {"type": "message", "id": "msg_budget", "role": "developer", "content": "<total_tokens>1000</total_tokens>"},
+    ]
+    assert payload == original
+
+    followup = deepcopy(payload)
+    followup_input = followup["input"]
+    assert isinstance(followup_input, list)
+    followup_input.extend(
+        [
+            {"role": "user", "content": "continue"},
+            {"role": role, "content": "<total_tokens>900</total_tokens>"},
+        ]
+    )
+    second = request_type.model_validate(followup).to_payload()
+    assert second["instructions"] == first["instructions"]
+    assert second["input"][:5] == first["input"]
+    assert second["input"][-1] == {"role": "developer", "content": "<total_tokens>900</total_tokens>"}
+
+
+@pytest.mark.parametrize("request_type", [ResponsesRequest, ResponsesCompactRequest])
+@pytest.mark.parametrize("role", ["system", "developer"])
+def test_responses_late_instruction_without_initial_instructions_stays_in_input(request_type, role):
+    request = request_type.model_validate(
+        {
+            "model": "gpt-6.1-sol",
+            "input": [{"role": "user", "content": "task"}, {"role": role, "content": "reminder"}],
+        }
+    )
+    dumped = request.to_payload()
+    assert dumped["instructions"] == ""
+    assert dumped["input"] == [
+        {"role": "user", "content": "task"},
+        {"role": "developer", "content": "reminder"},
+    ]
+
+
+@pytest.mark.parametrize("request_type", [ResponsesRequest, ResponsesCompactRequest])
+def test_responses_leading_attachment_ends_instruction_prefix(request_type):
+    request = request_type.model_validate(
+        {
+            "model": "gpt-6.1-sol",
+            "input": [
+                {
+                    "role": "system",
+                    "content": [
+                        {"type": "input_text", "text": "rules"},
+                        {"type": "input_image", "image_url": "https://example.invalid/image.png"},
+                    ],
+                },
+                {"role": "system", "content": "after attachment"},
+                {"role": "user", "content": "task"},
+            ],
+        }
+    )
+    dumped = request.to_payload()
+    assert dumped["instructions"] == "rules"
+    assert dumped["input"] == [
+        {"role": "user", "content": [{"type": "input_image", "image_url": "https://example.invalid/image.png"}]},
+        {"role": "developer", "content": "after attachment"},
+        {"role": "user", "content": "task"},
+    ]
 
 
 def test_responses_input_system_message_moves_to_instructions():
