@@ -253,7 +253,7 @@ def _response_create_text(
     include_type_field: bool,
     client_metadata: Mapping[str, JsonValue] | None,
 ) -> str:
-    upstream_payload = dict(payload.to_payload())
+    upstream_payload = dict(payload.to_payload(strip_inline_item_ids=False))
     upstream_payload.pop("stream", None)
     upstream_payload.pop("background", None)
     if include_type_field:
@@ -283,7 +283,7 @@ def _response_create_text_with_size_guard(
         if isinstance(payload.input, list)
         else {}
     )
-    upstream_payload = dict(payload.to_payload())
+    upstream_payload = dict(payload.to_payload(strip_inline_item_ids=transport != "websocket"))
     upstream_payload.pop("stream", None)
     upstream_payload.pop("background", None)
     if include_type_field:

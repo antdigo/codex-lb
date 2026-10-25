@@ -1064,6 +1064,9 @@ class _WebSocketRequestState:
     source_route_excluded: bool = False
     request_usage_budget: ApiKeyRequestUsageBudget | None = None
     request_text: str | None = None
+    # HTTP wire normalization can omit plaintext function-call/message item IDs.
+    # Retain their original ownership evidence for recovery/account switches.
+    has_original_inline_item_id: bool = False
     replay_count: int = 0
     # Counts only the one extra replay permitted after the initial recovery
     # replay when the replacement upstream socket also closes cleanly before

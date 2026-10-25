@@ -1562,6 +1562,17 @@
         "test",
         "doc"
       ]
+    },
+    {
+      "login": "antdigo",
+      "name": "antdigo",
+      "avatar_url": "https://avatars.githubusercontent.com/u/9997218?v=4",
+      "profile": "https://github.com/antdigo",
+      "contributions": [
+        "code",
+        "test",
+        "bug"
+      ]
     }
   ],
   "contributorsPerLine": 7,
