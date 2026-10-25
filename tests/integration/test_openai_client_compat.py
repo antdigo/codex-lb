@@ -8,10 +8,93 @@ import httpx2
 import openai
 import pytest
 from httpx import ASGITransport
+from openai.types.responses import ResponseFunctionToolCall
 
 import app.modules.proxy.service as proxy_module
 
 pytestmark = pytest.mark.integration
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/v1", "/v1/"])
+async def test_openai_sdk_recovers_owned_terminal_after_long_unowned_prelude(app_instance, monkeypatch, path):
+    async def fake_stream(self, payload, headers, **kwargs):
+        for index in range(96):
+            yield (
+                "data: "
+                + json.dumps(
+                    {
+                        "type": "response.output_text.delta",
+                        "sequence_number": index,
+                        "output_index": 0,
+                        "item_id": "msg_orphan",
+                        "delta": "discard me",
+                    }
+                )
+                + "\n\n"
+            )
+        yield (
+            "data: "
+            + json.dumps(
+                {
+                    "type": "response.completed",
+                    "sequence_number": 96,
+                    "response": {
+                        "id": "resp_recovered",
+                        "object": "response",
+                        "created_at": 1,
+                        "model": "gpt-5.1",
+                        "status": "completed",
+                        "output": [
+                            {
+                                "type": "message",
+                                "id": "msg_owned",
+                                "role": "assistant",
+                                "status": "completed",
+                                "content": [{"type": "output_text", "text": "owned answer", "annotations": []}],
+                            },
+                            {
+                                "type": "function_call",
+                                "id": "fc_owned",
+                                "call_id": "call_owned",
+                                "name": "echo",
+                                "arguments": '{"note":"owned"}',
+                                "status": "completed",
+                            },
+                        ],
+                        "usage": {"input_tokens": 100, "output_tokens": 10, "total_tokens": 110},
+                    },
+                }
+            )
+            + "\n\n"
+        )
+
+    monkeypatch.setattr(proxy_module.ProxyService, "stream_http_responses", fake_stream)
+    async with httpx.AsyncClient(transport=ASGITransport(app=app_instance), base_url="http://testserver") as admin:
+        account = _make_auth_json("acc_long_prelude", "long-prelude@example.com")
+        imported = await admin.post(
+            "/api/accounts/import", files={"auth_json": ("auth.json", json.dumps(account), "application/json")}
+        )
+        assert imported.status_code == 200
+    async with httpx2.AsyncClient(
+        transport=httpx2.ASGITransport(app=app_instance), base_url="http://testserver" + path
+    ) as http:
+        client = openai.AsyncOpenAI(
+            api_key="test", base_url="http://testserver" + path, http_client=http, max_retries=0
+        )
+        async with client.responses.stream(model="gpt-5.1", input="hi") as stream:
+            events = [event async for event in stream]
+            result = await stream.get_final_response()
+    assert result.id == "resp_recovered"
+    assert result.status == "completed"
+    assert result.output_text == "owned answer"
+    call = result.output[1]
+    assert isinstance(call, ResponseFunctionToolCall)
+    assert call.id == "fc_owned"
+    assert call.call_id == "call_owned"
+    assert call.arguments == '{"note":"owned"}'
+    assert [event.delta for event in events if event.type == "response.output_text.delta"] == ["owned answer"]
+    assert not any(event.type == "response.failed" for event in events)
 
 
 def _encode_jwt(payload: dict) -> str:
