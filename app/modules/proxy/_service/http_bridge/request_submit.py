@@ -772,7 +772,11 @@ class _HTTPBridgeRequestSubmitMixin:
             else {}
         )
         if upstream_payload_base is None:
-            upstream_payload_base = payload.to_payload(strip_inline_item_ids=transport != _REQUEST_TRANSPORT_WEBSOCKET)
+            upstream_payload_base = (
+                payload.to_payload(strip_inline_item_ids=False)
+                if transport == _REQUEST_TRANSPORT_WEBSOCKET
+                else payload.to_payload()
+            )
         # Shallow copy: every mutation below rebinds top-level keys only, so
         # ``upstream_payload_base`` stays the pristine dump for the budget.
         upstream_payload = dict(upstream_payload_base)
