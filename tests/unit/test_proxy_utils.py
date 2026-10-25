@@ -50414,8 +50414,11 @@ async def test_http_bridge_prewarm_times_out_on_silent_upstream(monkeypatch):
         require_same_account: bool = False,
         require_preferred_account: bool = False,
         dashboard_settings: Any | None = None,
+        discard_pending_request_state: proxy_service._WebSocketRequestState | None = None,
     ) -> None:
         del require_same_account, require_preferred_account
+        assert discard_pending_request_state in reconnect_session.pending_requests
+        assert reconnect_session.lifecycle_lock.locked()
         reconnect_observations.append(
             {
                 "pending_request_ids": [state.request_id for state in reconnect_session.pending_requests],

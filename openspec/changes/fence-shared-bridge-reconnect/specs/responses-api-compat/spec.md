@@ -6,6 +6,8 @@ When an HTTP bridge transport ends while several requests remain pending, automa
 
 Every bridge reconnect entry MUST also reject replacement before account selection or connection mutation when a different request remains pending. A prewarm timeout MAY explicitly discard its own identified warmup request during replacement, but MUST NOT discard any other pending owner.
 
+The prewarm timeout's reconnect MUST serialize its ownership check and replacement against submissions through the session lifecycle lock. A submitter that already owns that lock MUST finish publishing its pending request before the prewarm reconnect evaluates ownership. The reconnect MUST NOT overtake such a submitter between its closed-session check and pending publication.
+
 #### Scenario: Pre-created retry has an accepted sibling
 
 - **GIVEN** an HTTP bridge has an accepted pending response and one retryable request awaiting `response.created`
@@ -38,3 +40,10 @@ Every bridge reconnect entry MUST also reject replacement before account selecti
 - **GIVEN** a warmup and another accepted response remain pending on a bridge
 - **WHEN** the warmup times out
 - **THEN** the bridge does not replace the other response's socket for the warmup
+
+#### Scenario: Plain submission is already inside the lifecycle lock
+
+- **GIVEN** a plain submitter owns the lifecycle lock but has not yet published its pending request
+- **WHEN** a prewarm timeout starts recovery
+- **THEN** prewarm recovery waits for the submitter's lifecycle section to finish
+- **AND** it observes the published pending owner and refuses to replace its socket

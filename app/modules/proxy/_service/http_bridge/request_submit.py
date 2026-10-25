@@ -2592,17 +2592,18 @@ class _HTTPBridgeRequestSubmitMixin:
                             # The warmup request has already been sent upstream.  Close/reconnect the
                             # socket while the warmup state is still attached so any late warmup
                             # response cannot be assigned to the next visible request on this session.
-                            await self._reconnect_http_bridge_session(
-                                session,
-                                request_state=request_state,
-                                discard_pending_request_state=warmup_state,
-                                restart_reader=True,
-                                require_same_account=is_http_bridge_account_neutral_replay(
-                                    kind=session.key.affinity_kind,
-                                    key=session.key.affinity_key,
-                                ),
-                                dashboard_settings=dashboard_settings,
-                            )
+                            async with session.lifecycle_lock:
+                                await self._reconnect_http_bridge_session(
+                                    session,
+                                    request_state=request_state,
+                                    discard_pending_request_state=warmup_state,
+                                    restart_reader=True,
+                                    require_same_account=is_http_bridge_account_neutral_replay(
+                                        kind=session.key.affinity_kind,
+                                        key=session.key.affinity_key,
+                                    ),
+                                    dashboard_settings=dashboard_settings,
+                                )
                         except Exception:
                             session.closed = True
                             raise

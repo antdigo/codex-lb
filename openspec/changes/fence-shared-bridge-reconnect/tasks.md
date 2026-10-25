@@ -5,3 +5,4 @@
 - [x] 1.3 Verify shared-socket reader failure settles every request without sending on a replacement socket; verify single-request replay remains available.
 - [ ] 1.4 Run focused bridge tests, lint/type checks, broad tests within host resources, and strict OpenSpec validation; record limitations and archive only after verification.
 - [x] 1.5 Audit and fence reconnect entry itself for fresh-upstream recovery and prewarm timeout ownership, with explicit warmup disposal and regression coverage.
+- [x] 1.6 Reproduce a plain submitter publishing after the prewarm reconnect's ownership check; serialize prewarm recovery with lifecycle ownership and verify cancellation/sole-warmup recovery.
