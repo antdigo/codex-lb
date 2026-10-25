@@ -157,6 +157,20 @@ def _assert_created_text_delta_completed(events: list[dict]) -> None:
     assert events[1]["delta"] == "OK"
 
 
+def _assert_created_item_text_delta_completed(events: list[dict]) -> None:
+    assert [event["type"] for event in events] == [
+        "response.created",
+        "response.output_item.added",
+        "response.content_part.added",
+        "response.output_text.delta",
+        "response.output_text.done",
+        "response.content_part.done",
+        "response.output_item.done",
+        "response.completed",
+    ]
+    assert events[3]["delta"] == "OK"
+
+
 async def _import_account(async_client, account_id: str, email: str, *, plan_type: str = "plus") -> str:
     auth_json = _make_auth_json(account_id, email, plan_type=plan_type)
     files = {"auth_json": ("auth.json", json.dumps(auth_json), "application/json")}
@@ -1872,7 +1886,7 @@ async def test_v1_responses_http_bridge_fails_over_confirmed_proxy_connect_befor
         },
     )
 
-    _assert_created_text_delta_completed(events)
+    _assert_created_item_text_delta_completed(events)
     assert len(connect_calls) == 2
     assert selection_exclusions == [set(), {first_account.id}]
     assert backed_off_accounts == [first_account.id]
@@ -7403,7 +7417,7 @@ async def test_v1_responses_http_bridge_streaming_path_uses_persistent_upstream_
         lines = [line async for line in response.aiter_lines() if line.startswith("data: ")]
 
     events = [json.loads(line[6:]) for line in lines if line[6:] != "[DONE]"]
-    _assert_created_text_delta_completed(events)
+    _assert_created_item_text_delta_completed(events)
     assert connect_count == 1
 
 
@@ -13703,7 +13717,7 @@ async def test_v1_responses_http_bridge_retries_stale_account_model_route_on_ano
         },
     )
 
-    _assert_created_text_delta_completed(events)
+    _assert_created_item_text_delta_completed(events)
     assert len(connect_calls) == 2
     assert selection_exclusions[0] == set()
     assert first_account.id in selection_exclusions[-1]
@@ -15828,9 +15842,9 @@ async def test_v1_responses_http_bridge_stream_keeps_session_alive_after_foreign
         },
     )
 
-    _assert_created_text_delta_completed(first_events)
+    _assert_created_item_text_delta_completed(first_events)
     assert [event["type"] for event in second_events] == ["response.created", "response.failed"]
-    _assert_created_text_delta_completed(third_events)
+    _assert_created_item_text_delta_completed(third_events)
     assert second_events[-1]["response"]["error"]["code"] == "stream_incomplete"
     assert "previous_response_not_found" not in json.dumps(second_events[-1])
     assert third_events[-1]["response"]["output"][0]["content"][0]["text"] == "OK"
@@ -15968,13 +15982,13 @@ async def test_v1_responses_http_bridge_stream_keeps_session_alive_after_anonymo
                 },
             )
 
-    _assert_created_text_delta_completed(first_events)
+    _assert_created_item_text_delta_completed(first_events)
     assert [event["type"] for event in second_events] == ["response.created", "response.failed"]
     assert second_events[0]["response"]["id"] == "resp_bridge_followup_created"
     assert second_events[1]["response"]["id"] == "resp_bridge_followup_created"
     assert second_events[1]["response"]["error"]["code"] == "stream_incomplete"
     assert "previous_response_not_found" not in json.dumps(second_events[1])
-    _assert_created_text_delta_completed(third_events)
+    _assert_created_item_text_delta_completed(third_events)
     assert third_events[-1]["response"]["output"][0]["content"][0]["text"] == "OK"
     assert connect_count == 1
 
@@ -16135,7 +16149,7 @@ async def test_v1_responses_http_bridge_stream_matches_previous_response_error_t
             )
 
     assert [event["type"] for event in third_events] == ["response.created", "response.failed"]
-    _assert_created_text_delta_completed(fourth_events)
+    _assert_created_item_text_delta_completed(fourth_events)
     assert third_events[0]["response"]["id"] == "resp_bridge_followup_a"
     assert third_events[1]["response"]["id"] == "resp_bridge_followup_a"
     assert third_events[1]["response"]["error"]["code"] == "stream_incomplete"
@@ -16143,7 +16157,7 @@ async def test_v1_responses_http_bridge_stream_matches_previous_response_error_t
     assert fourth_events[0]["response"]["id"] == "resp_bridge_followup_b"
     assert fourth_events[-1]["response"]["id"] == "resp_bridge_followup_b"
     assert fourth_events[-1]["response"]["output"][0]["content"][0]["text"] == "OK"
-    _assert_created_text_delta_completed(fifth_events)
+    _assert_created_item_text_delta_completed(fifth_events)
     assert fifth_events[-1]["response"]["output"][0]["content"][0]["text"] == "OK"
     assert connect_count == 1
 
@@ -16299,7 +16313,7 @@ async def test_v1_responses_http_bridge_stream_masks_anonymous_previous_response
     assert third_events[1]["response"]["error"]["code"] == "stream_incomplete"
     assert "previous_response_not_found" not in json.dumps(second_events[1])
     assert "previous_response_not_found" not in json.dumps(third_events[1])
-    _assert_created_text_delta_completed(fourth_events)
+    _assert_created_item_text_delta_completed(fourth_events)
     assert fourth_events[-1]["response"]["id"] == "resp_bridge_after_same_anchor_error"
     assert connect_count == 1
 
