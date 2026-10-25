@@ -9056,6 +9056,8 @@ async def _normalize_public_responses_stream(
     # we synthesize a ``response.created`` snapshot from the terminal event's
     # ``response`` envelope so the SDK parser can complete the stream.
     created_emitted = False
+    created_response_id: str | None = None
+    output_event_emitted = False
     # Anonymous pre-created events cannot be made SDK-safe until a response
     # envelope arrives: the public OpenAI SDK requires response.created first.
     # Buffer them temporarily. Once an envelope arrives, replay only lightweight
@@ -9118,6 +9120,8 @@ async def _normalize_public_responses_stream(
             done_seen = True
             if terminal_seen:
                 yield event_block
+            continue
+        if enforce_openai_sdk_contract and terminal_seen:
             continue
         if _looks_like_sse_comment_block(event_block):
             yield event_block
@@ -9191,11 +9195,29 @@ async def _normalize_public_responses_stream(
         if synthetic_created is not None and synthetic_created_sequence is not None:
             synthetic_created["sequence_number"] = synthetic_created_sequence
         recover_terminal_output = (
-            pre_created_discarded
-            and not created_emitted
-            and synthetic_created is not None
-            and event_type in {"response.completed", "response.incomplete"}
+            enforce_openai_sdk_contract
+            and event_type
+            in {
+                "response.completed",
+                "response.incomplete",
+            }
+            and (
+                (pre_created_discarded and not created_emitted and synthetic_created is not None)
+                or (
+                    created_emitted
+                    and not output_event_emitted
+                    and created_response_id is not None
+                    and _response_id_from_event_payload(normalized_payload) == created_response_id
+                )
+            )
         )
+        if recover_terminal_output and created_emitted:
+            terminal_response = normalized_payload.get("response")
+            recover_terminal_output = (
+                is_json_mapping(terminal_response)
+                and isinstance(terminal_response.get("output"), list)
+                and bool(terminal_response["output"])
+            )
         if recover_terminal_output and synthetic_created is not None:
             created_sequence = synthetic_created.get("sequence_number")
             if not isinstance(created_sequence, int) or isinstance(created_sequence, bool):
@@ -9214,7 +9236,9 @@ async def _normalize_public_responses_stream(
                 created_emitted = True
                 yield format_sse_event(normalized_payload)
                 response_id = _response_id_from_event_payload(normalized_payload)
+                created_response_id = response_id
                 for formatted_payload in buffered_pre_created_payloads_to_replay(response_id):
+                    output_event_emitted = True
                     yield formatted_payload
                 continue
 
@@ -9222,7 +9246,9 @@ async def _normalize_public_responses_stream(
                 yield format_sse_event(synthetic_created)
                 created_emitted = True
                 response_id = _response_id_from_event_payload(synthetic_created)
+                created_response_id = response_id
                 for formatted_payload in buffered_pre_created_payloads_to_replay(response_id):
+                    output_event_emitted = True
                     yield formatted_payload
             elif _should_buffer_public_pre_created_event(event_type):
                 if not pre_created_discarded:
@@ -9275,6 +9301,15 @@ async def _normalize_public_responses_stream(
                 next_sequence_number += 1
 
         _collect_output_item_event(normalized_payload, output_items)
+        if (
+            not output_event_emitted
+            and enforce_openai_sdk_contract
+            and isinstance(event_type, str)
+            and event_type.startswith("response.")
+            and event_type not in _PUBLIC_RESPONSE_STREAM_TERMINAL_TYPES
+            and event_type not in {"response.created", "response.in_progress", "response.queued", "response.metadata"}
+        ):
+            output_event_emitted = True
         if event_type == "response.output_text.delta":
             seen_text_delta_keys.add(_text_delta_stream_key(normalized_payload))
         # Both the backfill branch and _normalize_public_stream_payload copy

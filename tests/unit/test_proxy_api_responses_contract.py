@@ -6,7 +6,9 @@ from collections.abc import AsyncIterator
 from typing import Any, cast
 
 import anyio
+import httpx
 import pytest
+from openai import AsyncOpenAI
 from openai.types.responses import ResponseStreamEvent
 from pydantic import TypeAdapter
 
@@ -960,16 +962,19 @@ async def test_normalize_public_responses_stream_normalizes_unknown_terminal_out
         )
     ]
 
-    # Now: response.created, synthetic delta, response.completed
-    assert len(blocks) == 3
-    created_payload = proxy_api_module._parse_sse_payload(blocks[0])
-    assert created_payload is not None
-    assert created_payload["type"] == "response.created"
-    delta_payload = proxy_api_module._parse_sse_payload(blocks[1])
-    assert delta_payload is not None
-    assert delta_payload["type"] == "response.output_text.delta"
-    assert delta_payload["delta"] == "normalized"
-    payload = proxy_api_module._parse_sse_payload(blocks[2])
+    payloads = [p for block in blocks if (p := proxy_api_module._parse_sse_payload(block)) is not None]
+    assert [p["type"] for p in payloads] == [
+        "response.created",
+        "response.output_item.added",
+        "response.content_part.added",
+        "response.output_text.delta",
+        "response.output_text.done",
+        "response.content_part.done",
+        "response.output_item.done",
+        "response.completed",
+    ]
+    assert payloads[3]["delta"] == "normalized"
+    payload = payloads[-1]
     assert payload is not None
     assert payload["type"] == "response.completed"
     response = payload["response"]
@@ -1046,17 +1051,19 @@ async def test_normalize_public_responses_stream_synthesizes_delta_from_complete
         )
     ]
 
-    payloads = [proxy_api_module._parse_sse_payload(block) for block in blocks]
-    assert payloads[0] is not None and payloads[0]["type"] == "response.created"
-    assert payloads[1] == {
-        "type": "response.output_text.delta",
-        "output_index": 0,
-        "content_index": 0,
-        "delta": "terminal text",
-        "item_id": "msg_1",
-    }
-    assert payloads[2] is not None
-    assert payloads[2]["type"] == "response.completed"
+    payloads = [p for block in blocks if (p := proxy_api_module._parse_sse_payload(block)) is not None]
+    assert [p["type"] for p in payloads] == [
+        "response.created",
+        "response.output_item.added",
+        "response.content_part.added",
+        "response.output_text.delta",
+        "response.output_text.done",
+        "response.content_part.done",
+        "response.output_item.done",
+        "response.completed",
+    ]
+    assert payloads[3]["delta"] == "terminal text"
+    assert payloads[3]["item_id"] == "msg_1"
 
 
 @pytest.mark.asyncio
@@ -1763,6 +1770,218 @@ async def test_normalize_public_responses_stream_consumes_owned_terminal_after_l
         assert isinstance(sequence_number, int)
         sequence_numbers.append(sequence_number)
     assert all(a < b for a, b in zip(sequence_numbers, sequence_numbers[1:]))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_type", ["response.completed", "response.incomplete"])
+@pytest.mark.parametrize("reasoning_summary", [[], [{"type": "summary_text", "text": "owned reasoning"}]])
+async def test_normalize_public_responses_stream_recovers_terminal_items_after_accepted_creation(
+    terminal_type: str,
+    reasoning_summary: list[JsonValue],
+) -> None:
+    """A full terminal must open every item before exposing its text or tool arguments."""
+    output: list[JsonValue] = [
+        {"type": "reasoning", "id": "rs_accepted", "summary": reasoning_summary},
+        {
+            "type": "message",
+            "id": "msg_accepted",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "owned answer", "annotations": []}],
+        },
+        {
+            "type": "function_call",
+            "id": "fc_accepted",
+            "call_id": "call_accepted",
+            "name": "Read",
+            "arguments": '{"path":"owned.txt"}',
+            "status": "completed",
+        },
+    ]
+    source: list[dict[str, JsonValue]] = [
+        {
+            "type": event_type,
+            "sequence_number": sequence,
+            "response": {"id": "resp_accepted", "object": "response", "status": "in_progress", "output": []},
+        }
+        for sequence, event_type in enumerate(["response.created", "response.in_progress"])
+    ]
+    source.extend(
+        [
+            {"type": "response.metadata", "sequence_number": 155, "response_id": "resp_accepted"},
+            {
+                "type": terminal_type,
+                "sequence_number": 156,
+                "response": {
+                    "id": "resp_accepted",
+                    "object": "response",
+                    "status": terminal_type.removeprefix("response."),
+                    "output": output,
+                },
+            },
+        ]
+    )
+
+    blocks = [
+        block
+        async for block in proxy_api_module._normalize_public_responses_stream(
+            _iter_blocks(*(proxy_api_module.format_sse_event(payload) for payload in source))
+        )
+    ]
+    events = [p for block in blocks if (p := proxy_api_module._parse_sse_payload(block)) is not None]
+
+    opened: set[int] = set()
+    closed: set[int] = set()
+    for event in events:
+        output_index = event.get("output_index")
+        if event["type"] == "response.output_item.added":
+            assert isinstance(output_index, int)
+            assert output_index not in opened
+            opened.add(output_index)
+        elif isinstance(output_index, int):
+            assert output_index in opened, f"content arrived before its item: {event['type']}"
+            assert output_index not in closed
+            if event["type"] == "response.output_item.done":
+                closed.add(output_index)
+    assert opened == closed == {0, 1, 2}
+    assert [e["delta"] for e in events if e["type"] == "response.output_text.delta"] == ["owned answer"]
+    assert [e["delta"] for e in events if e["type"] == "response.function_call_arguments.delta"] == [
+        '{"path":"owned.txt"}'
+    ]
+    assert [e["type"] for e in events].count("response.created") == 1
+    assert events[-1]["type"] == terminal_type
+    response = events[-1]["response"]
+    assert isinstance(response, dict)
+    assert response["output"] == output
+    sequences = [cast(int, event["sequence_number"]) for event in events]
+    assert all(a < b for a, b in zip(sequences, sequences[1:]))
+
+    async with AsyncOpenAI(
+        api_key="offline-test",
+        http_client=cast(
+            Any,
+            httpx.AsyncClient(
+                transport=httpx.MockTransport(
+                    lambda _request: httpx.Response(
+                        200, headers={"content-type": "text/event-stream"}, content="".join(blocks).encode()
+                    )
+                )
+            ),
+        ),
+    ) as client:
+        async with client.responses.stream(model="offline-test", input="offline-test") as stream:
+            sdk_events = [event async for event in stream]
+            assert [event.delta for event in sdk_events if event.type == "response.output_text.delta"] == [
+                "owned answer"
+            ]
+            assert [event.delta for event in sdk_events if event.type == "response.function_call_arguments.delta"] == [
+                '{"path":"owned.txt"}'
+            ]
+            if terminal_type == "response.completed":
+                final = await stream.get_final_response()
+                assert final.output_text == "owned answer"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scenario", ["native", "text_delta", "tool_delta", "reasoning_delta", "empty_terminal", "different_owner"]
+)
+async def test_accepted_terminal_recovery_does_not_duplicate_or_reassign_existing_output(scenario: str) -> None:
+    created: dict[str, JsonValue] = {
+        "type": "response.created",
+        "sequence_number": 0,
+        "response": {"id": "resp_accepted", "status": "in_progress", "output": []},
+    }
+    terminal: dict[str, JsonValue] = {
+        "type": "response.completed",
+        "sequence_number": 10,
+        "response": {
+            "id": "resp_other" if scenario == "different_owner" else "resp_accepted",
+            "status": "completed",
+            "output": []
+            if scenario == "empty_terminal"
+            else [
+                {
+                    "id": "msg_accepted",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "terminal answer"}],
+                }
+            ],
+        },
+    }
+    source = [created]
+    prior_delta = {
+        "text_delta": "response.output_text.delta",
+        "tool_delta": "response.function_call_arguments.delta",
+        "reasoning_delta": "response.reasoning_summary_text.delta",
+    }.get(scenario)
+    if prior_delta is not None:
+        source.append({"type": prior_delta, "sequence_number": 1, "delta": "already sent"})
+    source.append(terminal)
+    blocks = [
+        block
+        async for block in proxy_api_module._normalize_public_responses_stream(
+            _iter_blocks(*(proxy_api_module.format_sse_event(payload) for payload in source)),
+            enforce_openai_sdk_contract=scenario != "native",
+        )
+    ]
+    events = [p for block in blocks if (p := proxy_api_module._parse_sse_payload(block)) is not None]
+
+    assert not any(event["type"] == "response.output_item.added" for event in events)
+    if prior_delta is not None:
+        assert [event["delta"] for event in events if event["type"] == prior_delta] == ["already sent"]
+    if scenario == "empty_terminal":
+        assert events == source
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "extra_type", ["response.completed", "response.incomplete", "response.function_call_arguments.delta"]
+)
+async def test_accepted_terminal_recovery_emits_no_output_after_the_first_terminal(extra_type: str) -> None:
+    created: dict[str, JsonValue] = {
+        "type": "response.created",
+        "sequence_number": 0,
+        "response": {"id": "resp_accepted", "status": "in_progress", "output": []},
+    }
+    terminal: dict[str, JsonValue] = {
+        "type": "response.completed",
+        "sequence_number": 20,
+        "response": {
+            "id": "resp_accepted",
+            "status": "completed",
+            "output": [
+                {
+                    "id": "fc_accepted",
+                    "type": "function_call",
+                    "call_id": "call_accepted",
+                    "name": "Read",
+                    "arguments": '{"path":"owned.txt"}',
+                    "status": "completed",
+                }
+            ],
+        },
+    }
+    extra = {**terminal, "type": extra_type, "sequence_number": 21}
+    if extra_type.endswith(".delta"):
+        extra = {"type": extra_type, "sequence_number": 21, "output_index": 0, "delta": "late arguments"}
+    source = _iter_blocks(*(proxy_api_module.format_sse_event(p) for p in [created, terminal, extra]))
+
+    blocks = [block async for block in proxy_api_module._normalize_public_responses_stream(source)]
+    events = [p for block in blocks if (p := proxy_api_module._parse_sse_payload(block)) is not None]
+
+    assert [event["type"] for event in events] == [
+        "response.created",
+        "response.output_item.added",
+        "response.function_call_arguments.delta",
+        "response.function_call_arguments.done",
+        "response.output_item.done",
+        "response.completed",
+    ]
+    assert [event["delta"] for event in events if event["type"] == "response.function_call_arguments.delta"] == [
+        '{"path":"owned.txt"}'
+    ]
 
 
 @pytest.mark.asyncio
