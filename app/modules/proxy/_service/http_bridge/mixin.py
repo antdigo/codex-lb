@@ -753,23 +753,23 @@ class _HTTPBridgeMixin(
                     current_instance = settings.http_responses_session_bridge_instance_id
                     if _durable_bridge_lookup_allows_local_reuse(durable_lookup, current_instance=current_instance):
                         existing.api_key = api_key
-                        existing.request_model = request_model
-                        existing.request_service_tier = request_service_tier
+                        existing.request_model, existing.request_service_tier = request_model, request_service_tier
                         existing.last_used_at = clock_for(self).monotonic()
-                        await _refresh_reused_http_bridge_session_with_handoff(
+                        if await _refresh_reused_http_bridge_session_with_handoff(
                             self,
                             existing,
                             key=key,
                             request_scope_id=request_scope_id,
                             reserve_handoff=original_request_unanchored,
-                        )
-                        return existing
-                    old_account_id = existing.account.id
-                    detached = self._detach_http_bridge_session_locked(key, expected_session=existing)
-                    if detached is not None:
-                        force_durable_takeover = True
-                        self._schedule_http_bridge_session_closes([detached], reason="registry_detach")
-                    existing = None
+                        ):
+                            return existing
+                    else:
+                        old_account_id = existing.account.id
+                        detached = self._detach_http_bridge_session_locked(key, expected_session=existing)
+                        if detached is not None:
+                            force_durable_takeover = True
+                            self._schedule_http_bridge_session_closes([detached], reason="registry_detach")
+                        existing = None
                 if existing is not None and (
                     force_goal_restart_account_reselection
                     or (not existing.closed and existing.account.status in ROUTABLE_STATUSES)

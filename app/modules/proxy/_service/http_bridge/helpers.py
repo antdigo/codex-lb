@@ -2052,11 +2052,16 @@ async def _refresh_reused_http_bridge_session_with_handoff(
     key: "_HTTPBridgeSessionKey",
     request_scope_id: str,
     reserve_handoff: bool,
-) -> None:
+) -> bool:
     if reserve_handoff:
         _reserve_http_bridge_unanchored_handoff(session, request_scope_id=request_scope_id)
     try:
         await service._refresh_durable_http_bridge_session(session)
+        # An older response can detach while lease refresh yields. Its
+        # retirement does not take the registry lock held by this lookup.
+        # Only a reserved handoff already owns the condemned generation.
+        if session.upstream_control.retire_after_drain and not reserve_handoff:
+            return False
         _log_http_bridge_event(
             "reuse",
             key,
@@ -2066,6 +2071,7 @@ async def _refresh_reused_http_bridge_session_with_handoff(
             cache_key_family=key.affinity_kind,
             model_class=_extract_model_class(session.request_model) if session.request_model else None,
         )
+        return True
     except BaseException:
         if reserve_handoff:
             _release_http_bridge_unanchored_handoff(session, request_scope_id=request_scope_id)

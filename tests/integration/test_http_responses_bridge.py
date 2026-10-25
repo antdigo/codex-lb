@@ -38,7 +38,9 @@ from app.core.utils.time import to_utc_naive, utcnow
 from app.db.models import (
     Account,
     AccountStatus,
+    ApiKeyUsageReservation,
     DashboardSettings,
+    HttpBridgeOperationRecord,
     HttpBridgeSessionRecord,
     HttpBridgeSessionState,
     RequestLog,
@@ -12413,9 +12415,11 @@ async def test_v1_responses_http_bridge_reserved_handoff_forks_before_submit(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("retire_during_refresh", [False, True])
 async def test_v1_responses_http_bridge_reused_unanchored_refresh_reserves_canonical_handoff(
     app_instance,
     monkeypatch,
+    retire_during_refresh: bool,
 ):
     service = get_proxy_service_for_app(app_instance)
     service._http_bridge_sessions.clear()
@@ -12448,6 +12452,9 @@ async def test_v1_responses_http_bridge_reused_unanchored_refresh_reserves_canon
         assert session is canonical
         refresh_started.set()
         await allow_refresh.wait()
+        if retire_during_refresh:
+            session.upstream_control.reconnect_requested = True
+            session.upstream_control.retire_after_drain = True
 
     async def fake_create_http_bridge_session(self, key, **kwargs):
         del self
@@ -18996,3 +19003,209 @@ async def test_smart_single_turn_stays_http_before_history_promotes(async_client
     assert len(upstreams) == 1
     assert "reason=smart_single_turn" in caplog.text
     assert "reason=smart_history" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("client_anchor", "hard_owner"),
+    [(None, False), ("resp_client_anchor", False), ("resp_client_anchor", True)],
+)
+@pytest.mark.parametrize("visible_sibling", [False, True])
+@pytest.mark.parametrize("authenticated", [False, True])
+async def test_public_prompt_cache_reacquires_when_old_request_detaches_during_refresh(
+    async_client,
+    app_instance,
+    monkeypatch: pytest.MonkeyPatch,
+    client_anchor: str | None,
+    hard_owner: bool,
+    visible_sibling: bool,
+    authenticated: bool,
+) -> None:
+    _install_bridge_settings(monkeypatch, enabled=True)
+    account_id = await _import_account(async_client, "acc-retirement-audit", "retirement-audit@example.com")
+    account = await _get_account(account_id)
+    service = get_proxy_service_for_app(app_instance)
+    auth_headers: dict[str, str] = {}
+    api_key_id: str | None = None
+    api_key_data = None
+    if authenticated:
+        settings_response = await async_client.put("/api/settings", json={"apiKeyAuthEnabled": True})
+        assert settings_response.status_code == 200
+        key_response = await async_client.post(
+            "/api/api-keys/", json={"name": "retirement-race", "weeklyTokenLimit": 1000000}
+        )
+        assert key_response.status_code == 200
+        api_key_id = key_response.json()["id"]
+        auth_headers = {"Authorization": f"Bearer {key_response.json()['key']}"}
+        api_key_data = _make_api_key_data(key_id=api_key_id, assigned_account_ids=[])
+    dashboard = await proxy_module.get_settings_cache().get()
+    dashboard.upstream_stream_transport = "websocket"
+    replacement_upstream = _FakeBridgeUpstreamWebSocket("resp_replacement")
+    selection_calls: list[dict[str, Any]] = []
+
+    async def select_account(*args: Any, **kwargs: Any) -> AccountSelection:
+        selection_calls.append(kwargs)
+        return AccountSelection(account=account, error_message=None, error_code=None)
+
+    monkeypatch.setattr(service, "_select_account_with_budget", select_account)
+    monkeypatch.setattr(service, "_ensure_fresh_with_budget", AsyncMock(return_value=account))
+
+    async def connect(*args: Any, **kwargs: Any) -> _FakeBridgeUpstreamWebSocket:
+        return replacement_upstream
+
+    monkeypatch.setattr(proxy_module, "connect_responses_websocket", connect)
+    body = {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "input": "new request",
+        "prompt_cache_key": "retirement-audit",
+        "stream": True,
+    }
+    if client_anchor is not None:
+        body["previous_response_id"] = client_anchor
+    request_headers = (
+        {
+            "session_id": "retirement-hard-owner",
+            "x-codex-turn-state": "turn-retirement-owner",
+            "user-agent": "codex_cli_rs/0.145.0",
+        }
+        if hard_owner
+        else {}
+    )
+    payload = proxy_module.ResponsesRequest.model_validate(body)
+    affinity = proxy_module._sticky_key_for_responses_request(
+        payload,
+        request_headers,
+        codex_session_affinity=hard_owner,
+        openai_cache_affinity=True,
+        openai_cache_affinity_max_age_seconds=300,
+        sticky_threads_enabled=False,
+        api_key=api_key_data,
+    )
+    key = proxy_module._make_http_bridge_session_key(
+        payload, headers=request_headers, affinity=affinity, api_key=api_key_data, request_id="audit"
+    )
+    old = _make_dummy_bridge_session(key)
+    old.account = account
+    old.api_key = api_key_data
+    old.request_model = payload.model
+    old.codex_session = hard_owner
+    old.headers = request_headers
+    old.affinity = affinity
+    old_upstream = _SilentUpstreamWebSocket()
+    old.upstream = cast(proxy_module.UpstreamWebSocket, old_upstream)
+    stale = proxy_module._WebSocketRequestState(
+        request_id="req-old-cancelled",
+        model=payload.model,
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=time.monotonic(),
+        transport="http",
+        event_queue=asyncio.Queue(),
+    )
+    stale.response_id = "resp_old"
+    stale.awaiting_response_created = False
+    stale.downstream_visible = True
+    old.pending_requests = deque([stale])
+    old.queued_request_count = 0
+    sibling = proxy_module._WebSocketRequestState(
+        request_id="req-accepted-sibling",
+        model=payload.model,
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=time.monotonic(),
+        transport="http",
+        event_queue=asyncio.Queue(),
+    )
+    if visible_sibling:
+        sibling.response_id = "resp_accepted_sibling"
+        sibling.awaiting_response_created = False
+        sibling.downstream_visible = True
+        old.pending_requests.append(sibling)
+        old.queued_request_count = 2
+    service._http_bridge_sessions[key] = old
+    if client_anchor is not None:
+        old.previous_response_ids.add(client_anchor)
+        service._http_bridge_previous_response_index[(client_anchor, api_key_id)] = key
+    prepared_states: list[proxy_module._WebSocketRequestState] = []
+    original_prepare = service._prepare_http_bridge_request
+
+    def prepare(*args: Any, **kwargs: Any) -> tuple[proxy_module._WebSocketRequestState, str]:
+        state, text = original_prepare(*args, **kwargs)
+        prepared_states.append(state)
+        return state, text
+
+    monkeypatch.setattr(service, "_prepare_http_bridge_request", prepare)
+    if hard_owner:
+        assert key.strength == "hard"
+        old.downstream_turn_state = request_headers["x-codex-turn-state"]
+        old.downstream_turn_state_aliases.add(old.downstream_turn_state)
+        service._http_bridge_turn_state_index[(old.downstream_turn_state, api_key_id)] = key
+    original_refresh = service._refresh_durable_http_bridge_session
+    original_retire = service._retire_http_bridge_after_drain_if_ready
+    retirement_started = asyncio.Event()
+    detach_task: asyncio.Task[bool] | None = None
+
+    async def retire(session: proxy_module._HTTPBridgeSession, **kwargs: Any) -> bool:
+        if session is old:
+            retirement_started.set()
+        return await original_retire(session, **kwargs)
+
+    monkeypatch.setattr(service, "_retire_http_bridge_after_drain_if_ready", retire)
+
+    async def refresh(session: proxy_module._HTTPBridgeSession) -> None:
+        nonlocal detach_task
+        if session is old and detach_task is None:
+            # Cancellation marks retirement without taking the registry lock;
+            # its close waits for this lookup's refresh to release that lock.
+            detach_task = asyncio.create_task(service._detach_http_bridge_request(old, request_state=stale))
+            await _wait_for_event(retirement_started)
+        await original_refresh(session)
+
+    monkeypatch.setattr(service, "_refresh_durable_http_bridge_session", refresh)
+    try:
+        response = await asyncio.wait_for(
+            async_client.post("/v1/responses", json=body, headers={**request_headers, **auth_headers}), timeout=5
+        )
+    finally:
+        if detach_task is not None:
+            assert await detach_task
+    assert detach_task is not None
+    assert not old_upstream.sent_text
+    assert await service.drain_persistence_tasks(timeout_seconds=10)
+    async with SessionLocal() as db_session:
+        operations = list((await db_session.execute(select(HttpBridgeOperationRecord))).scalars())
+        reservations = list((await db_session.execute(select(ApiKeyUsageReservation))).scalars())
+    assert not operations
+    if authenticated:
+        assert len(reservations) == 1
+        assert reservations[0].api_key_id == api_key_id
+        assert reservations[0].status == ("released" if client_anchor is not None else "finalized")
+    if visible_sibling:
+        assert old.closed is False
+        assert old_upstream.closed is False
+        assert sibling in old.pending_requests
+        assert sibling.event_queue is not None and sibling.event_queue.empty()
+    if client_anchor is not None:
+        assert response.status_code == 502
+        assert response.json()["error"]["code"] == "stream_incomplete"
+        assert not replacement_upstream.sent_text
+        assert not selection_calls
+        assert prepared_states
+        assert all(state.previous_response_id == client_anchor for state in prepared_states)
+        assert all(state.response_create_attempt_count == 0 for state in prepared_states)
+        return
+    assert response.status_code == 200, response.json()
+    assert all(state.api_key_reservation is None for state in prepared_states)
+    assert len(replacement_upstream.sent_text) == 1
+    frame = json.loads(replacement_upstream.sent_text[0])
+    assert frame["input"] == payload.to_payload()["input"]
+    assert frame.get("previous_response_id") == client_anchor
+    assert len(selection_calls) == 1
+    assert sum(state.response_create_attempt_count for state in prepared_states) == 1
+    assert all(state.replay_count == 0 for state in prepared_states)
+    assert all(not state.operation_registered for state in prepared_states)
+    assert old.closed is not visible_sibling
+    assert any(current is not old for current in service._http_bridge_sessions.values())
