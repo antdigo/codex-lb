@@ -88,9 +88,18 @@ from app.core.openai.parsing import (
     parse_error_payload,
 )
 from app.core.openai.requests import (
+    CODEX_RESPONSES_LITE_WEBSOCKET_METADATA_KEY as CODEX_RESPONSES_LITE_WEBSOCKET_METADATA_KEY,
+)
+from app.core.openai.requests import (
     ResponsesCompactRequest,
     ResponsesRequest,
     validate_compact_input_wire_budget,
+)
+from app.core.openai.requests import (
+    _client_metadata_uses_responses_lite as _client_metadata_uses_responses_lite,
+)
+from app.core.openai.requests import (
+    _payload_has_responses_lite_websocket_marker as _payload_has_responses_lite_websocket_marker,
 )
 from app.core.resilience.circuit_breaker import (
     CircuitBreaker,
@@ -127,7 +136,6 @@ CODEX_TURN_METADATA_HEADER = "x-codex-turn-metadata"
 CODEX_ROUTING_HINT_HEADER = "x-codex-routing-hint"
 CODEX_LB_REQUIRED_CAPABILITY_HEADER = "x-codex-lb-required-capability"
 CODEX_RESPONSES_LITE_HEADER = "x-openai-internal-codex-responses-lite"
-CODEX_RESPONSES_LITE_WEBSOCKET_METADATA_KEY = "ws_request_header_x_openai_internal_codex_responses_lite"
 
 
 class CodexWireTransport(Enum):
@@ -2344,20 +2352,6 @@ def _payload_uses_responses_lite(payload: Mapping[str, JsonValue]) -> bool:
     if not isinstance(input_value, list):
         return False
     return any(is_json_mapping(item) and item.get("type") == "additional_tools" for item in input_value)
-
-
-def _client_metadata_uses_responses_lite(client_metadata: Mapping[str, JsonValue]) -> bool:
-    return any(
-        key.lower() == CODEX_RESPONSES_LITE_WEBSOCKET_METADATA_KEY
-        and isinstance(value, str)
-        and value.strip().lower() == "true"
-        for key, value in client_metadata.items()
-    )
-
-
-def _payload_has_responses_lite_websocket_marker(payload: Mapping[str, JsonValue]) -> bool:
-    raw_metadata = payload.get("client_metadata")
-    return is_json_mapping(raw_metadata) and _client_metadata_uses_responses_lite(raw_metadata)
 
 
 def _finalize_responses_lite_reasoning_context(

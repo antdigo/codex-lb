@@ -772,7 +772,11 @@ class _HTTPBridgeRequestSubmitMixin:
             else {}
         )
         if upstream_payload_base is None:
-            upstream_payload_base = payload.to_payload()
+            upstream_payload_base = (
+                payload.to_payload(strip_inline_item_ids=False)
+                if transport == _REQUEST_TRANSPORT_WEBSOCKET
+                else payload.to_payload()
+            )
         # Shallow copy: every mutation below rebinds top-level keys only, so
         # ``upstream_payload_base`` stays the pristine dump for the budget.
         upstream_payload = dict(upstream_payload_base)
@@ -836,6 +840,16 @@ class _HTTPBridgeRequestSubmitMixin:
             # retirement when that operation path supplies the id.
             proxy_injected_anchor_had_full_resend_payload=_http_bridge_payload_looks_like_full_resend(payload),
             payload_conversation_bound=bool(payload.conversation),
+            has_original_inline_item_id=(
+                transport != _REQUEST_TRANSPORT_WEBSOCKET
+                and isinstance(payload_input, list)
+                and any(
+                    isinstance(item, dict)
+                    and item.get("type") in ("function_call", "message")
+                    and item.get("id") not in (None, "")
+                    for item in payload_input
+                )
+            ),
             input_item_count=input_item_count,
             input_full_fingerprint=input_full_fingerprint,
             request_kind=request_kind,
@@ -3963,7 +3977,7 @@ class _HTTPBridgeRequestSubmitMixin:
                 # identity on its owner unless a dedicated rebind path has
                 # already replaced the operation ID.
                 candidate_portable = request_state.operation_id is None and (
-                    _websocket_request_text_is_account_neutral_fresh_replay(candidate_text)
+                    _websocket_request_text_is_account_neutral_fresh_replay(candidate_text, request_state=request_state)
                 )
                 request_text = _prepare_websocket_request_state_for_visible_output_replay(request_state)
                 if request_text is None or request_text != candidate_text:

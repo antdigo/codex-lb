@@ -44,6 +44,8 @@ type PassthroughJsonList = SkipValidation[SerializeAsAny[list[JsonValue]]]
 PASSTHROUGH_MAX_DEPTH = 200
 _JSON_CONTAINER_TYPES = (dict, list)
 
+CODEX_RESPONSES_LITE_WEBSOCKET_METADATA_KEY = "ws_request_header_x_openai_internal_codex_responses_lite"
+
 _RESPONSES_INCLUDE_ALLOWLIST = {
     "code_interpreter_call.outputs",
     "computer_call_output.output.image_url",
@@ -92,6 +94,20 @@ def _json_mapping_or_none(value: JsonValue) -> Mapping[str, JsonValue] | None:
     if not is_json_mapping(value):
         return None
     return value
+
+
+def _client_metadata_uses_responses_lite(client_metadata: Mapping[str, JsonValue]) -> bool:
+    return any(
+        key.lower() == CODEX_RESPONSES_LITE_WEBSOCKET_METADATA_KEY
+        and isinstance(value, str)
+        and value.strip().lower() == "true"
+        for key, value in client_metadata.items()
+    )
+
+
+def _payload_has_responses_lite_websocket_marker(payload: Mapping[str, JsonValue]) -> bool:
+    raw_metadata = payload.get("client_metadata")
+    return is_json_mapping(raw_metadata) and _client_metadata_uses_responses_lite(raw_metadata)
 
 
 def _json_parts(value: JsonValue) -> list[JsonValue]:
@@ -346,11 +362,13 @@ def _normalize_responses_input_instructions(data: JsonValue) -> JsonValue:
 
     instruction_parts: list[str] = []
     input_items: list[JsonValue] = []
+    instruction_prefix = True
     changed = False
     for item in input_value:
         item_mapping = _json_mapping_or_none(item)
         if item_mapping is None:
             input_items.append(item)
+            instruction_prefix = False
             continue
         # Only hoist actual message items (type omitted or "message"). Non-message
         # typed system/developer items (e.g. the Codex responses-lite
@@ -367,6 +385,18 @@ def _normalize_responses_input_instructions(data: JsonValue) -> JsonValue:
         role = item_mapping.get("role")
         if role not in ("system", "developer"):
             input_items.append(item)
+            instruction_prefix = False
+            continue
+        if not instruction_prefix:
+            # Hoisting a replayed reminder rewrites the context before all old
+            # history. Keep its position; Codex accepts developer, not system.
+            if role == "system":
+                preserved_item = dict(item_mapping)
+                preserved_item["role"] = "developer"
+                input_items.append(preserved_item)
+            else:
+                input_items.append(item)
+            changed = True
             continue
         instruction_text, preserved_content = _split_responses_instruction_item_content(item_mapping)
         if instruction_text:
@@ -376,6 +406,7 @@ def _normalize_responses_input_instructions(data: JsonValue) -> JsonValue:
             preserved_item["role"] = "user"
             preserved_item["content"] = preserved_content
             input_items.append(preserved_item)
+            instruction_prefix = False
         changed = True
 
     if not changed:
@@ -764,13 +795,19 @@ class ResponsesRequest(BaseModel):
             payload.pop("tools", None)
         return payload
 
-    def to_payload(self) -> JsonObject:
-        payload = _strip_unsupported_fields(self.model_dump_for_forwarding())
+    def to_payload(self, *, strip_inline_item_ids: bool = True) -> JsonObject:
+        payload = _strip_unsupported_fields(
+            self.model_dump_for_forwarding(), strip_inline_item_ids=strip_inline_item_ids
+        )
         _normalize_compaction_trigger_singleton(payload)
         return payload
 
     def to_replay_safety_payload(self) -> JsonObject:
-        return _strip_unsupported_fields(self.model_dump_for_forwarding(), strip_replayed_tool_call_namespaces=False)
+        return _strip_unsupported_fields(
+            self.model_dump_for_forwarding(),
+            strip_replayed_tool_call_namespaces=False,
+            strip_inline_item_ids=False,
+        )
 
 
 class ResponsesCompactRequest(BaseModel):
@@ -913,6 +950,7 @@ def _strip_unsupported_fields(
     payload: MutableJsonObject,
     *,
     strip_replayed_tool_call_namespaces: bool = True,
+    strip_inline_item_ids: bool = True,
 ) -> MutableJsonObject:
     _normalize_openai_compatible_aliases(payload)
     _normalize_service_tier_aliases(payload)
@@ -921,6 +959,8 @@ def _strip_unsupported_fields(
     _strip_poisoned_local_compact_fallback_items(payload)
     if strip_replayed_tool_call_namespaces:
         strip_replayed_tool_call_namespaces_from_payload(payload)
+    if strip_inline_item_ids:
+        _strip_subscription_inline_item_ids(payload)
     # ``tools`` is deliberately NOT canonicalized here: the wire payload must
     # forward client tool entries byte-preserved (array order, key order, and
     # unknown keys untouched) so reserved model tools survive upstream
@@ -929,6 +969,46 @@ def _strip_unsupported_fields(
     for key in _UNSUPPORTED_UPSTREAM_FIELDS:
         payload.pop(key, None)
     return payload
+
+
+def _strip_subscription_inline_item_ids(payload: MutableJsonObject) -> None:
+    input_value = payload.get("input")
+    if (
+        not is_json_list(input_value)
+        or responses_input_uses_lite_tools(input_value)
+        or _payload_has_responses_lite_websocket_marker(payload)
+    ):
+        return
+    for item in input_value:
+        if not isinstance(item, dict) or "id" not in item:
+            continue
+        if item.get("encrypted_content") or item.get("encrypted_function_args"):
+            continue
+        item_type = item.get("type")
+        if item_type == "function_call":
+            call_id = item.get("call_id")
+            name = item.get("name")
+            if not isinstance(call_id, str) or not call_id or not isinstance(name, str) or not name:
+                continue
+            if not isinstance(item.get("arguments"), str):
+                continue
+        elif item_type == "message":
+            content = item.get("content")
+            if item.get("role") != "assistant" or item.get("status") != "completed":
+                continue
+            if not is_json_list(content) or not content:
+                continue
+            if not all(
+                isinstance(part, dict) and part.get("type") == "output_text" and isinstance(part.get("text"), str)
+                for part in content
+            ):
+                continue
+        else:
+            continue
+        # Full plaintext items do not need persisted-item lookup. Preserve
+        # call_id for tool pairing and all encrypted/reference shapes. Only
+        # mutate the wire copy; recovery retains the original ownership evidence.
+        item.pop("id", None)
 
 
 def _strip_poisoned_local_compact_fallback_items(payload: MutableJsonObject) -> None:

@@ -477,7 +477,9 @@ def _prepare_websocket_request_state_for_visible_output_replay(
         _install_fresh_replay_body(
             request_state,
             fresh_request_text,
-            account_neutral=_websocket_request_text_is_account_neutral_fresh_replay(fresh_request_text),
+            account_neutral=_websocket_request_text_is_account_neutral_fresh_replay(
+                fresh_request_text, request_state=request_state
+            ),
             release_owner_pin=(
                 request_state.previous_response_id is None or request_state.proxy_injected_previous_response_id
             ),
@@ -503,7 +505,11 @@ def _websocket_owner_switch_has_other_pending_requests(
     return any(pending is not request_state for pending in pending_requests)
 
 
-def _websocket_request_text_is_account_neutral_fresh_replay(request_text: str | None) -> bool:
+def _websocket_request_text_is_account_neutral_fresh_replay(
+    request_text: str | None, *, request_state: "_WebSocketRequestState | None" = None
+) -> bool:
+    if request_state is not None and request_state.has_original_inline_item_id:
+        return False
     if not isinstance(request_text, str):
         return False
     try:
@@ -526,7 +532,7 @@ def _bind_websocket_request_dispatch_owner(
     exact_request_text: str,
 ) -> bool:
     required_account_id = request_state.replay_required_account_id
-    if _websocket_request_text_is_account_neutral_fresh_replay(exact_request_text):
+    if _websocket_request_text_is_account_neutral_fresh_replay(exact_request_text, request_state=request_state):
         return required_account_id is None or required_account_id == account_id
     if required_account_id is not None and required_account_id != account_id:
         return False
@@ -546,7 +552,9 @@ def _install_verified_fresh_replay(
     if require_proxy_injected_previous_response_id and not request_state.proxy_injected_previous_response_id:
         return None
     fresh_request_text = request_state.fresh_upstream_request_text
-    account_neutral = _websocket_request_text_is_account_neutral_fresh_replay(fresh_request_text)
+    account_neutral = _websocket_request_text_is_account_neutral_fresh_replay(
+        fresh_request_text, request_state=request_state
+    )
     if require_account_neutral and not account_neutral:
         return None
     if not account_neutral and (request_state.replay_required_account_id or request_state.preferred_account_id) is None:
@@ -693,7 +701,9 @@ def _prepare_websocket_request_state_for_account_switch(
 ) -> str | None:
     """Return an unsent request body only when moving accounts is proven safe."""
     if request_state.previous_response_id is None:
-        if not _websocket_request_text_is_account_neutral_fresh_replay(request_state.request_text):
+        if not _websocket_request_text_is_account_neutral_fresh_replay(
+            request_state.request_text, request_state=request_state
+        ):
             return None
         return request_state.request_text
     return _install_verified_fresh_replay(request_state)
@@ -1146,11 +1156,11 @@ def _websocket_fresh_request_blocks_account_switch(request_state: _WebSocketRequ
 
 
 def _websocket_auth_request_can_switch_account(request_state: _WebSocketRequestState) -> bool:
-    if request_state.file_required_preferred_account:
+    if request_state.file_required_preferred_account or request_state.has_original_inline_item_id:
         return False
     if request_state.previous_response_id is None:
         return request_state.request_text is None or _websocket_request_text_is_account_neutral_fresh_replay(
-            request_state.request_text
+            request_state.request_text, request_state=request_state
         )
     if not (
         request_state.proxy_injected_previous_response_id
@@ -1159,7 +1169,7 @@ def _websocket_auth_request_can_switch_account(request_state: _WebSocketRequestS
     ):
         return False
     return _websocket_request_text_is_account_neutral_fresh_replay(
-        request_state.fresh_upstream_request_text
+        request_state.fresh_upstream_request_text, request_state=request_state
     ) and not _websocket_fresh_request_blocks_account_switch(request_state)
 
 
