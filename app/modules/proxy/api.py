@@ -9063,6 +9063,7 @@ async def _normalize_public_responses_stream(
     # drop unowned output_item lifecycle events so cancelled-request orphans are
     # not attached to the later response.
     pre_created_buffer: list[dict[str, JsonValue]] = []
+    pre_created_discarded = False
 
     def formatted_payloads_with_synthetic_deltas(
         payload: dict[str, JsonValue], raw_block: str | None = None
@@ -9189,6 +9190,17 @@ async def _normalize_public_responses_stream(
         )
         if synthetic_created is not None and synthetic_created_sequence is not None:
             synthetic_created["sequence_number"] = synthetic_created_sequence
+        recover_terminal_output = (
+            pre_created_discarded
+            and not created_emitted
+            and synthetic_created is not None
+            and event_type in {"response.completed", "response.incomplete"}
+        )
+        if recover_terminal_output and synthetic_created is not None:
+            created_sequence = synthetic_created.get("sequence_number")
+            if not isinstance(created_sequence, int) or isinstance(created_sequence, bool):
+                synthetic_created["sequence_number"] = next_sequence_number
+                next_sequence_number += 1
         if not enforce_openai_sdk_contract and event_type in {"error", "response.failed"}:
             terminal_seen = True
             if normalized_payload is parsed_payload:
@@ -9213,16 +9225,16 @@ async def _normalize_public_responses_stream(
                 for formatted_payload in buffered_pre_created_payloads_to_replay(response_id):
                     yield formatted_payload
             elif _should_buffer_public_pre_created_event(event_type):
-                if len(pre_created_buffer) >= _PUBLIC_RESPONSES_PRE_CREATED_BUFFER_LIMIT:
-                    error_kind = contract_violation_kind or "upstream_stream_truncated"
-                    for formatted_payload in _public_response_failed_event_blocks(
-                        error_kind,
-                        include_created=True,
-                        sequence_number=next_sequence_number,
-                    ):
-                        yield formatted_payload
-                    return
-                pre_created_buffer.append(normalized_payload)
+                if not pre_created_discarded:
+                    if len(pre_created_buffer) >= _PUBLIC_RESPONSES_PRE_CREATED_BUFFER_LIMIT:
+                        # Unowned output may belong to a cancelled turn. Keep neither
+                        # an unbounded buffer nor a truncated replay of that turn, but
+                        # let a later owned envelope complete the current request.
+                        pre_created_buffer.clear()
+                        pre_created_discarded = True
+                        logger.warning("Discarding oversized unowned Responses prelude request_id=%s", get_request_id())
+                    else:
+                        pre_created_buffer.append(normalized_payload)
                 continue
             elif event_type in _PUBLIC_RESPONSE_STREAM_TERMINAL_TYPES:
                 if event_type == "error":
@@ -9251,6 +9263,17 @@ async def _normalize_public_responses_stream(
                 yield formatted_payload
             return
 
+        if recover_terminal_output:
+            response = normalized_payload.get("response")
+            if is_json_mapping(response):
+                for owned_event in _terminal_output_lifecycle_events(response):
+                    owned_event["sequence_number"] = next_sequence_number
+                    next_sequence_number += 1
+                    yield format_sse_event(owned_event)
+                normalized_payload = dict(normalized_payload)
+                normalized_payload["sequence_number"] = next_sequence_number
+                next_sequence_number += 1
+
         _collect_output_item_event(normalized_payload, output_items)
         if event_type == "response.output_text.delta":
             seen_text_delta_keys.add(_text_delta_stream_key(normalized_payload))
@@ -9266,8 +9289,13 @@ async def _normalize_public_responses_stream(
             if normalized_payload is parsed_payload and _has_canonical_event_framing(event_block, event_type)
             else None
         )
-        for formatted_payload in formatted_payloads_with_synthetic_deltas(normalized_payload, unmutated_block):
-            yield formatted_payload
+        if recover_terminal_output:
+            # The owned lifecycle above already rendered every supported part.
+            # The legacy text fallback can flatten reasoning content as text.
+            yield format_sse_event(normalized_payload)
+        else:
+            for formatted_payload in formatted_payloads_with_synthetic_deltas(normalized_payload, unmutated_block):
+                yield formatted_payload
         if isinstance(event_type, str) and event_type in _PUBLIC_RESPONSE_STREAM_TERMINAL_TYPES:
             terminal_seen = True
     if terminal_seen:
@@ -9292,6 +9320,14 @@ async def _normalize_public_responses_stream(
     error_kind = contract_violation_kind or (
         "upstream_stream_truncated" if enforce_openai_sdk_contract else "stream_incomplete"
     )
+    if enforce_openai_sdk_contract:
+        logger.warning(
+            "Responses stream missing terminal request_id=%s created=%s discarded_prelude=%s next_sequence=%d",
+            get_request_id(),
+            created_emitted,
+            pre_created_discarded,
+            next_sequence_number,
+        )
     include_created = enforce_openai_sdk_contract and not created_emitted
     for formatted_payload in _public_response_failed_event_blocks(
         error_kind,
@@ -9299,6 +9335,70 @@ async def _normalize_public_responses_stream(
         sequence_number=next_sequence_number if enforce_openai_sdk_contract else None,
     ):
         yield formatted_payload
+
+
+def _terminal_output_lifecycle_events(response: Mapping[str, JsonValue]) -> Iterable[dict[str, JsonValue]]:
+    """Expose only output owned by a late terminal envelope, never orphan deltas."""
+    output = response.get("output")
+    if not isinstance(output, list):
+        return
+    for output_index, item in enumerate(output):
+        if not is_json_mapping(item):
+            continue
+        item_type = item.get("type")
+        initial = dict(item)
+        summary = item.get("summary")
+        if "status" in initial:
+            initial["status"] = "in_progress"
+        if item_type == "message":
+            initial["content"] = []
+        elif item_type in {"function_call", "custom_tool_call"}:
+            initial["arguments" if item_type == "function_call" else "input"] = ""
+        elif item_type == "reasoning" and isinstance(summary, list) and summary:
+            initial["summary"] = []
+            initial.pop("encrypted_content", None)
+            initial.pop("content", None)
+        yield {"type": "response.output_item.added", "output_index": output_index, "item": initial}
+        fields: dict[str, JsonValue] = {"output_index": output_index}
+        if isinstance(item.get("id"), str):
+            fields["item_id"] = item["id"]
+        if item_type == "message":
+            content = item.get("content")
+            for content_index, part in enumerate(content if isinstance(content, list) else []):
+                if not is_json_mapping(part):
+                    continue
+                part_fields = {**fields, "content_index": content_index}
+                text_field = "refusal" if part.get("type") == "refusal" else "text"
+                event_kind = "refusal" if text_field == "refusal" else "output_text"
+                text = part.get(text_field)
+                initial_part = dict(part)
+                if isinstance(text, str):
+                    initial_part[text_field] = ""
+                yield {"type": "response.content_part.added", **part_fields, "part": initial_part}
+                if isinstance(text, str):
+                    yield {"type": f"response.{event_kind}.delta", **part_fields, "delta": text, "logprobs": []}
+                    yield {"type": f"response.{event_kind}.done", **part_fields, text_field: text, "logprobs": []}
+                yield {"type": "response.content_part.done", **part_fields, "part": dict(part)}
+        elif item_type in {"function_call", "custom_tool_call"}:
+            argument_field = "arguments" if item_type == "function_call" else "input"
+            event_kind = "function_call_arguments" if item_type == "function_call" else "custom_tool_call_input"
+            arguments = item.get(argument_field)
+            if isinstance(arguments, str):
+                yield {"type": f"response.{event_kind}.delta", **fields, "delta": arguments}
+                done_fields = {**fields, argument_field: arguments}
+                if item_type == "function_call" and isinstance(item.get("name"), str):
+                    done_fields["name"] = item["name"]
+                yield {"type": f"response.{event_kind}.done", **done_fields}
+        elif item_type == "reasoning" and isinstance(summary, list):
+            for summary_index, part in enumerate(summary):
+                if not is_json_mapping(part) or not isinstance(part.get("text"), str):
+                    continue
+                part_fields = {**fields, "summary_index": summary_index}
+                yield {"type": "response.reasoning_summary_part.added", **part_fields, "part": {**part, "text": ""}}
+                yield {"type": "response.reasoning_summary_text.delta", **part_fields, "delta": part["text"]}
+                yield {"type": "response.reasoning_summary_text.done", **part_fields, "text": part["text"]}
+                yield {"type": "response.reasoning_summary_part.done", **part_fields, "part": dict(part)}
+        yield {"type": "response.output_item.done", "output_index": output_index, "item": dict(item)}
 
 
 def _should_buffer_public_pre_created_event(event_type: str) -> bool:

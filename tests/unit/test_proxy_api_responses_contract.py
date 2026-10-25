@@ -7,6 +7,8 @@ from typing import Any, cast
 
 import anyio
 import pytest
+from openai.types.responses import ResponseStreamEvent
+from pydantic import TypeAdapter
 
 import app.modules.proxy.api as proxy_api_module
 from app.core.openai.models import CompactResponsePayload
@@ -1652,7 +1654,7 @@ async def test_normalize_public_responses_stream_dropped_precreated_delta_does_n
 
 
 @pytest.mark.asyncio
-async def test_normalize_public_responses_stream_emits_created_before_precreated_buffer_overflow_failure() -> None:
+async def test_normalize_public_responses_stream_fails_when_long_prelude_ends_without_envelope() -> None:
     event_count = proxy_api_module._PUBLIC_RESPONSES_PRE_CREATED_BUFFER_LIMIT + 1
     source_blocks = [
         f'data: {{"type":"response.output_text.delta","delta":"orphan {index}"}}\n\n' for index in range(event_count)
@@ -1670,6 +1672,279 @@ async def test_normalize_public_responses_stream_emits_created_before_precreated
     error = response["error"]
     assert isinstance(error, dict)
     assert error["code"] == "upstream_stream_truncated"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prelude_count", [65, 1024])
+@pytest.mark.parametrize("terminal_type", ["response.completed", "response.incomplete"])
+async def test_normalize_public_responses_stream_consumes_owned_terminal_after_long_prelude(
+    prelude_count: int, terminal_type: str
+) -> None:
+    owned_output: list[JsonValue] = [
+        {
+            "type": "message",
+            "id": "msg_owned",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "owned answer", "annotations": []}],
+        },
+        {
+            "type": "function_call",
+            "id": "fc_owned",
+            "call_id": "call_owned",
+            "name": "echo",
+            "arguments": '{"note":"owned"}',
+            "status": "completed",
+        },
+        {
+            "type": "reasoning",
+            "id": "rs_owned",
+            "summary": [{"type": "summary_text", "text": "owned reasoning"}],
+            "encrypted_content": "opaque-owned-state",
+        },
+    ]
+    consumed_terminal = False
+
+    async def source() -> AsyncIterator[str]:
+        nonlocal consumed_terminal
+        for index in range(prelude_count):
+            yield proxy_api_module.format_sse_event(
+                {
+                    "type": "response.output_text.delta",
+                    "sequence_number": index,
+                    "output_index": 0,
+                    "item_id": "msg_orphan",
+                    "delta": "orphan text",
+                }
+            )
+        consumed_terminal = True
+        yield proxy_api_module.format_sse_event(
+            {
+                "type": terminal_type,
+                "sequence_number": prelude_count,
+                "response": {
+                    "id": "resp_owned",
+                    "object": "response",
+                    "status": terminal_type.removeprefix("response."),
+                    "output": owned_output,
+                },
+            }
+        )
+
+    blocks = [block async for block in proxy_api_module._normalize_public_responses_stream(source())]
+    payloads = [p for block in blocks if (p := proxy_api_module._parse_sse_payload(block)) is not None]
+    assert consumed_terminal
+    assert payloads[0]["type"] == "response.created"
+    created_response = payloads[0]["response"]
+    assert isinstance(created_response, dict)
+    assert created_response["id"] == "resp_owned"
+    assert payloads[-1]["type"] == terminal_type
+    terminal_response = payloads[-1]["response"]
+    assert isinstance(terminal_response, dict)
+    assert terminal_response["output"] == owned_output
+    assert not any(p["type"] == "response.failed" for p in payloads)
+    assert "orphan text" not in "".join(blocks)
+    assert "msg_orphan" not in "".join(blocks)
+    added_item_ids = []
+    for payload in payloads:
+        if payload["type"] == "response.output_item.added":
+            item = payload["item"]
+            assert isinstance(item, dict)
+            added_item_ids.append(item["id"])
+    assert added_item_ids == [
+        "msg_owned",
+        "fc_owned",
+        "rs_owned",
+    ]
+    assert [p["delta"] for p in payloads if p["type"] == "response.output_text.delta"] == ["owned answer"]
+    sequence_numbers: list[int] = []
+    for payload in payloads:
+        sequence_number = payload["sequence_number"]
+        assert isinstance(sequence_number, int)
+        sequence_numbers.append(sequence_number)
+    assert all(a < b for a, b in zip(sequence_numbers, sequence_numbers[1:]))
+
+
+@pytest.mark.asyncio
+async def test_normalize_public_responses_stream_waits_for_created_after_long_prelude() -> None:
+    prelude = [
+        proxy_api_module.format_sse_event({"type": "response.output_text.delta", "delta": "orphan"}) for _ in range(96)
+    ]
+    owned = [
+        {
+            "type": "response.created",
+            "response": {"id": "resp_owned", "object": "response", "status": "in_progress", "output": []},
+        },
+        {"type": "response.output_text.delta", "delta": "owned"},
+        {"type": "response.completed", "response": {"id": "resp_owned", "status": "completed", "output": []}},
+    ]
+    blocks = [
+        block
+        async for block in proxy_api_module._normalize_public_responses_stream(
+            _iter_blocks(*prelude, *(proxy_api_module.format_sse_event(p) for p in owned))
+        )
+    ]
+    payloads = [p for block in blocks if (p := proxy_api_module._parse_sse_payload(block)) is not None]
+    assert payloads == owned
+
+
+@pytest.mark.asyncio
+async def test_normalize_public_responses_stream_preserves_failure_after_long_prelude() -> None:
+    prelude = ['data: {"type":"response.output_text.delta","delta":"orphan"}\n\n'] * 96
+    upstream_error = 'data: {"type":"error","error":{"code":"overloaded_error","message":"busy"}}\n\n'
+    blocks = [
+        block
+        async for block in proxy_api_module._normalize_public_responses_stream(_iter_blocks(*prelude, upstream_error))
+    ]
+    payloads = [p for block in blocks if (p := proxy_api_module._parse_sse_payload(block)) is not None]
+    assert payloads[-1]["type"] == "response.failed"
+    response = payloads[-1]["response"]
+    assert isinstance(response, dict)
+    error = response["error"]
+    assert isinstance(error, dict)
+    assert error["code"] == "overloaded_error"
+    assert "orphan" not in "".join(blocks)
+
+
+@pytest.mark.asyncio
+async def test_normalize_public_responses_stream_does_not_swallow_cancellation_after_long_prelude() -> None:
+    finalized = False
+
+    async def source() -> AsyncIterator[str]:
+        nonlocal finalized
+        try:
+            for _ in range(96):
+                yield 'data: {"type":"response.output_text.delta","delta":"orphan"}\n\n'
+            raise asyncio.CancelledError
+        finally:
+            finalized = True
+
+    with pytest.raises(asyncio.CancelledError):
+        _ = [block async for block in proxy_api_module._normalize_public_responses_stream(source())]
+    assert finalized
+
+
+@pytest.mark.asyncio
+async def test_native_codex_stream_keeps_long_prelude_without_public_recovery() -> None:
+    source = ['data: {"type":"response.output_text.delta","delta":"native"}\n\n'] * 96
+    source.append('data: {"type":"response.completed","response":{"id":"resp_native","output":[]}}\n\n')
+    output = [
+        block
+        async for block in proxy_api_module._normalize_public_responses_stream(
+            _iter_blocks(*source), enforce_openai_sdk_contract=False
+        )
+    ]
+    assert output[-1] == "data: [DONE]\n\n"
+    assert [proxy_api_module._parse_sse_payload(block) for block in output[:-1]] == [
+        proxy_api_module._parse_sse_payload(block) for block in source
+    ]
+
+
+@pytest.mark.asyncio
+async def test_late_owned_terminal_preserves_multipart_text_refusal_and_empty_content() -> None:
+    parts: list[JsonValue] = [
+        {"type": "output_text", "text": "first", "annotations": []},
+        {"type": "output_text", "text": "second", "annotations": []},
+        {"type": "refusal", "refusal": "declined"},
+        {"type": "output_text", "text": "", "annotations": []},
+    ]
+    output: list[JsonValue] = [{"type": "message", "id": "msg_owned", "role": "assistant", "content": parts}]
+    terminal = proxy_api_module.format_sse_event(
+        {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_owned",
+                "status": "completed",
+                "output": output,
+            },
+        }
+    )
+    prelude = ['data: {"type":"response.output_text.delta","delta":"orphan"}\n\n'] * 96
+    blocks = [
+        block async for block in proxy_api_module._normalize_public_responses_stream(_iter_blocks(*prelude, terminal))
+    ]
+    events = [p for block in blocks if (p := proxy_api_module._parse_sse_payload(block)) is not None]
+    assert [(p["content_index"], p["delta"]) for p in events if p["type"] == "response.output_text.delta"] == [
+        (0, "first"),
+        (1, "second"),
+        (3, ""),
+    ]
+    assert [(p["content_index"], p["delta"]) for p in events if p["type"] == "response.refusal.delta"] == [
+        (2, "declined")
+    ]
+    assert [p["part"] for p in events if p["type"] == "response.content_part.done"] == parts
+    response = events[-1]["response"]
+    assert isinstance(response, dict)
+    assert response["output"] == output
+
+
+@pytest.mark.asyncio
+async def test_recovered_function_lifecycle_validates_against_sdk_event_schema() -> None:
+    output: list[JsonValue] = [
+        {
+            "type": "function_call",
+            "id": "fc_owned",
+            "call_id": "call_owned",
+            "name": "echo",
+            "arguments": '{"note":"owned"}',
+            "status": "completed",
+        }
+    ]
+    terminal = proxy_api_module.format_sse_event(
+        {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_owned",
+                "status": "completed",
+                "output": output,
+            },
+        }
+    )
+    prelude = ['data: {"type":"response.output_text.delta","delta":"orphan"}\n\n'] * 96
+    blocks = [
+        block async for block in proxy_api_module._normalize_public_responses_stream(_iter_blocks(*prelude, terminal))
+    ]
+    events = [p for block in blocks if (p := proxy_api_module._parse_sse_payload(block)) is not None]
+    adapter = TypeAdapter(ResponseStreamEvent)
+    for event in events[1:-1]:
+        adapter.validate_python(event)
+
+
+@pytest.mark.asyncio
+async def test_recovered_reasoning_content_is_not_reemitted_as_assistant_text() -> None:
+    output: list[JsonValue] = [
+        {
+            "type": "reasoning",
+            "id": "rs_owned",
+            "summary": [],
+            "content": [{"type": "reasoning_text", "text": "private reasoning"}],
+            "encrypted_content": "opaque-owned-state",
+        },
+        {
+            "type": "message",
+            "id": "msg_owned",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "owned answer", "annotations": []}],
+        },
+    ]
+    terminal = proxy_api_module.format_sse_event(
+        {
+            "type": "response.completed",
+            "sequence_number": 96,
+            "response": {"id": "resp_owned", "status": "completed", "output": output},
+        }
+    )
+    prelude = ['data: {"type":"response.output_text.delta","delta":"orphan"}\n\n'] * 96
+    blocks = [
+        block async for block in proxy_api_module._normalize_public_responses_stream(_iter_blocks(*prelude, terminal))
+    ]
+    events = [p for block in blocks if (p := proxy_api_module._parse_sse_payload(block)) is not None]
+    assert [p["delta"] for p in events if p["type"] == "response.output_text.delta"] == ["owned answer"]
+    response = events[-1]["response"]
+    assert isinstance(response, dict)
+    assert response["output"] == output
+    assert all(isinstance(p.get("sequence_number"), int) for p in events)
 
 
 @pytest.mark.asyncio
