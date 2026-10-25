@@ -26,9 +26,10 @@ new retry, account-switch policy, setting, dependency or migration is introduced
 ## Current-main measurements
 
 On Python 3.13, validate + to_payload + compact JSON serialization measured
-102.62 → 122.96 microseconds/op for a one-message request and
-13,473.97 → 14,136.49 microseconds/op for 400 replay items plus 170 tools.
+230.52 → 249.64 microseconds of process CPU/op for a one-message request and
+28,810.77 → 29,544.70 microseconds/op for 400 replay items plus 170 tools.
 Peak traced allocation was 3,954 → 3,954 bytes and 727,454 → 715,735 bytes
-respectively. These same-machine medians are local serialization measurements
-under concurrent test load, not network latency or an SLA. No content is
-retained beyond existing request state.
+respectively. These same-machine medians use 11 interleaved samples in
+alternating order under concurrent pytest load. Process CPU excludes scheduler
+waiting; wall time is noisy. This is not network latency or an SLA. No content
+is retained beyond existing request state.
