@@ -477,7 +477,9 @@ def _prepare_websocket_request_state_for_visible_output_replay(
         _install_fresh_replay_body(
             request_state,
             fresh_request_text,
-            account_neutral=_websocket_request_text_is_account_neutral_fresh_replay(fresh_request_text),
+            account_neutral=_websocket_request_text_is_account_neutral_fresh_replay(
+                fresh_request_text, request_state=request_state
+            ),
             release_owner_pin=(
                 request_state.previous_response_id is None or request_state.proxy_injected_previous_response_id
             ),

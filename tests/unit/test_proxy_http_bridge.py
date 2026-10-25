@@ -47908,10 +47908,12 @@ def test_direct_websocket_inline_item_id_preserves_ownership_and_lite(lite, item
 
 
 @pytest.mark.parametrize("item_kind", ["function_call", "message"])
-def test_http_inline_item_wire_normalization_preserves_recovery_owner(item_kind):
+@pytest.mark.parametrize("replay_kind", ["verified_fresh", "visible_output"])
+def test_http_inline_item_wire_normalization_preserves_recovery_owner(item_kind, replay_kind):
     from app.modules.proxy._service.websocket.helpers import (
         _install_verified_fresh_replay,
         _prepare_websocket_request_state_for_account_switch,
+        _prepare_websocket_request_state_for_visible_output_replay,
         _websocket_auth_request_can_switch_account,
         _websocket_request_text_is_account_neutral_fresh_replay,
     )
@@ -47948,6 +47950,11 @@ def test_http_inline_item_wire_normalization_preserves_recovery_owner(item_kind)
     state.proxy_injected_previous_response_id = True
     state.fresh_upstream_request_text = wire
     state.fresh_upstream_request_is_retry_safe = True
-    assert _install_verified_fresh_replay(state) is None
-    assert _install_verified_fresh_replay(state, require_account_neutral=False) == wire
+    if replay_kind == "visible_output":
+        assert _prepare_websocket_request_state_for_visible_output_replay(state) == wire
+    else:
+        assert _install_verified_fresh_replay(state) is None
+        assert _install_verified_fresh_replay(state, require_account_neutral=False) == wire
+    assert state.has_original_inline_item_id
     assert state.replay_required_account_id == "owner-a"
+    assert not _bind_websocket_request_dispatch_owner(state, account_id="owner-b", exact_request_text=wire)
