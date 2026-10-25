@@ -6,4 +6,5 @@
 - [x] Obtain and address independent code review.
 - [x] Build, seal and test an inactive runtime through official Bifrost.
 - [x] Prepare and test reversible activation.
-- [ ] Verify live state after privileged activation.
+- [x] Verify live state after privileged activation.
+- [ ] Verify continuation of the original Claude Desktop session.

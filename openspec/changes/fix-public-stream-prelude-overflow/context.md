@@ -91,3 +91,11 @@ overflow was the only cause of that incident. Real EOF continues to fail closed;
 the fix does not turn disconnected or failed upstream responses into success.
 Live activation requires the machine owner's sudo password and is tracked
 separately from source and local-pipeline verification.
+
+Live activation completed on 2026-10-25 at 08:35:05 UTC. The running process uses
+the pinned stream runtime; all nine source-module hashes match, readiness is
+healthy, and systemd reports zero restarts. Official Bifrost v2.3.2 retained its
+existing process. One real Anthropic-shaped request through Bifrost and codex-lb
+to GPT returned HTTP 200, text OK and message_stop in 2.459 seconds; both services
+recorded success (11 input tokens, zero cached tokens, five output tokens).
+Continuation of the original failing Desktop session remains to be verified.
