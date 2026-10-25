@@ -37,5 +37,5 @@ Files: app/core/openai/requests.py; existing _service serialization/evidence cal
 - [x] Validate this OpenSpec delta strictly and review the diff independently.
 - [x] Verify the patched implementation against the captured failing payload in isolated runtime.
 - [x] Prepare and independently review verified deployment/rollback with bounded readiness and preserved rollback targets.
-- [ ] Activate the privileged service and verify the affected route after restart; local sudo currently requires an interactive password.
+- [x] Activate the privileged service and verify the affected route after restart; 12 real Claude Code requests in the affected session completed successfully after activation.
 - [x] Commit and update the existing fork PR with exact tests, observations and remaining limits.
