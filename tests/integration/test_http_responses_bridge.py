@@ -14384,7 +14384,7 @@ async def test_retry_http_bridge_precreated_request_releases_pending_lock_before
 
 
 @pytest.mark.asyncio
-async def test_retry_http_bridge_precreated_request_ignores_existing_response_id_entries(app_instance, monkeypatch):
+async def test_retry_http_bridge_precreated_request_preserves_existing_response_owners(app_instance, monkeypatch):
     service = get_proxy_service_for_app(app_instance)
     session = proxy_module._HTTPBridgeSession(
         key=proxy_module._HTTPBridgeSessionKey("prompt_cache", "retry-race-key", None),
@@ -14428,6 +14428,7 @@ async def test_retry_http_bridge_precreated_request_ignores_existing_response_id
         request_text=json.dumps({"type": "response.create", "model": "gpt-5.1", "input": ["retry"]}),
     )
     session.pending_requests.extend([existing_request, retry_request])
+    original_upstream = session.upstream
     replacement_upstream = _RecordingUpstreamWebSocket()
 
     async def fake_reconnect(
@@ -14444,8 +14445,12 @@ async def test_retry_http_bridge_precreated_request_ignores_existing_response_id
 
     monkeypatch.setattr(proxy_module.ProxyService, "_reconnect_http_bridge_session", fake_reconnect)
 
-    assert await service._retry_http_bridge_precreated_request(session) is True
-    assert replacement_upstream.sent_text == [retry_request.request_text]
+    assert await service._retry_http_bridge_precreated_request(session) is False
+    assert session.upstream is original_upstream
+    assert replacement_upstream.sent_text == []
+    assert list(session.pending_requests) == [existing_request, retry_request]
+    assert existing_request.response_id == "resp-existing"
+    assert retry_request.replay_count == 0
 
 
 @pytest.mark.asyncio
