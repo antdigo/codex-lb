@@ -5,4 +5,4 @@
 - [x] Verify encrypted/reference/incomplete/unknown items and caller immutability.
 - [x] Verify native WS/Lite, trim/reprepare and replay ownership invariants.
 - [x] Run affected suites, lint/type, strict OpenSpec and request-path measurements.
-- [ ] Complete independent review and record current-head CI before merge.
+- [x] Complete independent review and record validation evidence and CI gates in the PR.

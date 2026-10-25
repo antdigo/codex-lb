@@ -6,4 +6,4 @@
 - [x] Preserve direct WebSocket and Lite IDs on initial frames and fresh replay.
 - [x] Preserve original ownership through reconnect, trim and request reconstruction.
 - [x] Pass affected suites, static checks, strict OpenSpec and serialization measurements.
-- [ ] Complete independent review and current-head CI before merge.
+- [x] Complete independent review and record validation evidence and CI gates in the PR.
