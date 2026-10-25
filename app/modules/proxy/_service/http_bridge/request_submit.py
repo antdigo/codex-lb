@@ -2595,6 +2595,7 @@ class _HTTPBridgeRequestSubmitMixin:
                             await self._reconnect_http_bridge_session(
                                 session,
                                 request_state=request_state,
+                                discard_pending_request_state=warmup_state,
                                 restart_reader=True,
                                 require_same_account=is_http_bridge_account_neutral_replay(
                                     kind=session.key.affinity_kind,
@@ -3633,6 +3634,26 @@ class _HTTPBridgeRequestSubmitMixin:
             model_class=_extract_model_class(session.request_model) if session.request_model else None,
         )
 
+    async def _prepare_http_bridge_reconnect(
+        self: Any,
+        session: "_HTTPBridgeSession",
+        request_state: _WebSocketRequestState,
+        discard_pending_request_state: _WebSocketRequestState | None,
+    ) -> None:
+        async with session.pending_lock:
+            if any(
+                pending is not request_state and pending is not discard_pending_request_state
+                for pending in session.pending_requests
+            ):
+                raise ProxyResponseError(
+                    502,
+                    openai_error(
+                        "stream_incomplete",
+                        "HTTP responses session bridge cannot reconnect while other requests are pending",
+                    ),
+                )
+            request_state.response_create_sent_at = None
+
     async def _retry_http_bridge_request_on_fresh_upstream(
         self: Any,
         session: "_HTTPBridgeSession",
@@ -3868,17 +3889,12 @@ class _HTTPBridgeRequestSubmitMixin:
                 if len(retryable_requests) != 1:
                     return False
                 request_state = retryable_requests[0]
-                # An accepted lifecycle is replayed only when it is the sole
-                # request on the socket (the terminal path's other-pending
-                # guard, ``_websocket_accepted_replay_candidate``). Reconnecting
-                # it would strand every sibling still bound to the dead
-                # upstream, so both fail closed with ``stream_incomplete`` as
-                # they did before accepted replays existed.
-                if (
-                    request_state.response_id is not None
-                    and not request_state.awaiting_response_created
-                    and any(pending_request is not request_state for pending_request in session.pending_requests)
-                ):
+                # Reconnecting replaces the physical socket for every pending
+                # request, including accepted and draining siblings that are
+                # not themselves retryable. Leave shared-socket failures to
+                # the reader's whole-deque settlement rather than stranding
+                # their old response ids on a replacement connection.
+                if any(pending_request is not request_state for pending_request in session.pending_requests):
                     return False
             # A request that already saw response.created released the session
             # create gate. Its replay must hold the gate again before it can

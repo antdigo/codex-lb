@@ -1983,8 +1983,9 @@ class _HTTPBridgeMixin(
         owner_rebind_affinity: _AffinityPolicy | None = None,
         selection_affinity: _AffinityPolicy | None = None,
         dashboard_settings: DashboardSettings | None = None,
+        discard_pending_request_state: _WebSocketRequestState | None = None,
     ) -> None:
-        request_state.response_create_sent_at = None
+        await self._prepare_http_bridge_reconnect(session, request_state, discard_pending_request_state)
         goal_restart = request_state.affinity_policy.abandon_unavailable_legacy_owner
         if selection_affinity is None and goal_restart:
             selection_affinity = request_state.affinity_policy
