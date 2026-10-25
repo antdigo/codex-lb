@@ -3,7 +3,9 @@
 ## Purpose
 
 Define Responses API compatibility contracts so Codex, OpenCode, and OpenAI-style clients preserve expected behavior.
+
 ## Requirements
+
 ### Requirement: Use prompt_cache_key as OpenAI cache affinity
 For OpenAI-style `/v1/responses`, `/v1/responses/compact`, and chat-completions requests mapped onto Responses, the service MUST treat a non-empty `prompt_cache_key` as the bounded upstream account affinity key for prompt-cache correctness even when a `session_id` header is present. OpenAI-style route wiring MUST NOT upgrade those requests to durable `CODEX_SESSION` affinity by default. This affinity MUST apply even when dashboard `sticky_threads_enabled` is disabled, the service MUST continue forwarding the same `prompt_cache_key` upstream unchanged, and the stored affinity MUST expire after the configured freshness window so older keys can rebalance. The freshness window MUST come from dashboard settings so operators can adjust it without restart.
 
@@ -10896,3 +10898,110 @@ SDK parser failure.
 - **WHEN** the bridge settles the turn
 - **THEN** it emits one terminal `response.failed` event
 - **AND** that terminal event includes a stable `response.id`
+
+### Requirement: Automatic bridge socket replay preserves every pending owner
+
+When an HTTP bridge transport ends while several requests remain pending, automatic pre-created replay MUST NOT replace the shared socket for only one request. This restriction MUST include siblings that already received `response.created` and siblings detached from their downstream consumer but still draining until a terminal event. Refusal MUST occur before replay state mutation, create-gate reclamation, or a replacement send. The reader failure funnel MUST terminally settle every request that remains owned by the failed socket exactly once. A sole eligible pending request MUST retain the existing bounded replay behavior.
+
+Every bridge reconnect entry MUST also reject replacement before account selection or connection mutation when a different request remains pending. A prewarm timeout MAY explicitly discard its own identified warmup request during replacement, but MUST NOT discard any other pending owner.
+
+The prewarm timeout's reconnect MUST serialize its ownership check and replacement against submissions through the session lifecycle lock. A submitter that already owns that lock MUST finish publishing its pending request before the prewarm reconnect evaluates ownership. The reconnect MUST NOT overtake such a submitter between its closed-session check and pending publication.
+
+#### Scenario: Pre-created retry has an accepted sibling
+
+- **GIVEN** an HTTP bridge has an accepted pending response and one retryable request awaiting `response.created`
+- **WHEN** the upstream transport ends
+- **THEN** the bridge does not reconnect and resend the pre-created request alone
+- **AND** both requests receive the existing terminal stream failure and are settled exactly once
+
+#### Scenario: Pre-created retry has a draining sibling
+
+- **GIVEN** an HTTP bridge has one retryable pre-created request and another pending request draining after downstream cancellation
+- **WHEN** the upstream transport ends
+- **THEN** the bridge refuses to replace the shared socket for the pre-created request alone
+- **AND** the draining request is finalized with the other pending request
+
+#### Scenario: Sole pre-created request retains bounded recovery
+
+- **GIVEN** a failed HTTP bridge socket has exactly one eligible pending request
+- **WHEN** its existing replay policy permits recovery
+- **THEN** the bridge may reconnect and resend it within the existing replay bound
+
+#### Scenario: Unsubmitted recovery cannot replace another response's socket
+
+- **GIVEN** an unsubmitted request attempts fresh-upstream recovery while another response remains pending
+- **WHEN** it reaches bridge reconnect
+- **THEN** reconnect fails before account selection or opening another socket
+- **AND** the other response is not migrated to a socket on which it was never sent
+
+#### Scenario: Prewarm timeout has another accepted owner
+
+- **GIVEN** a warmup and another accepted response remain pending on a bridge
+- **WHEN** the warmup times out
+- **THEN** the bridge does not replace the other response's socket for the warmup
+
+#### Scenario: Plain submission is already inside the lifecycle lock
+
+- **GIVEN** a plain submitter owns the lifecycle lock but has not yet published its pending request
+- **WHEN** a prewarm timeout starts recovery
+- **THEN** prewarm recovery waits for the submitter's lifecycle section to finish
+- **AND** it observes the published pending owner and refuses to replace its socket
+
+### Requirement: Output-free accepted public streams recover owned terminal items
+
+When public HTTP Responses normalization has emitted a valid `response.created` envelope but no response output events, and receives a `response.completed` or `response.incomplete` envelope with the same response id and nonempty output, it MUST expose the terminal output through complete output-item and content/tool-argument lifecycle events before the terminal event. It MUST emit each terminal output item exactly once, retain exactly one `response.created`, and use strictly increasing sequence numbers for the recovered lifecycle and terminal after the accepted prelude. It MUST NOT synthesize that complete output lifecycle for a different terminal response id, duplicate previously emitted output, or change native Codex passthrough behavior.
+
+#### Scenario: Creation and metadata precede terminal-only output
+
+- **GIVEN** a public stream emits creation, in-progress, and metadata for response A, with no output events
+- **WHEN** a completed terminal for A contains reasoning, message text, and function-call arguments
+- **THEN** each item is opened before its content and closed before completion
+- **AND** streaming consumers receive message text and function-call arguments once within A's sole lifecycle
+
+#### Scenario: Partial output suppresses full terminal replay
+
+- **GIVEN** the accepted stream already emitted any output event, including a function-argument or reasoning delta
+- **WHEN** its terminal envelope includes the full output
+- **THEN** the service does not synthesize the full output lifecycle again
+
+#### Scenario: Different terminal owner is not recovered
+
+- **GIVEN** a stream accepted response A without output
+- **WHEN** a terminal envelope names response B
+- **THEN** the service does not synthesize B's output-item lifecycle into A
+
+#### Scenario: Native streams preserve upstream events
+
+- **GIVEN** native Codex passthrough disables the public SDK contract
+- **WHEN** an output-free accepted stream receives a full terminal response
+- **THEN** the stream does not gain synthesized item or argument events
+
+#### Scenario: Duplicate terminal and late output do not replay a finished response
+
+- **GIVEN** a public stream has emitted its terminal response and recovered its owned items
+- **WHEN** another completed or incomplete event or a late output event arrives
+- **THEN** the public stream exposes only the first terminal response
+- **AND** no additional output item, text, or tool-argument event is emitted after that terminal
+
+### Requirement: Several created responses cannot claim anonymous output by visibility
+
+When a shared upstream socket has more than one pending request with a response id, a nonterminal anonymous `response.*` output event MUST remain unattributed. The matcher MUST NOT resolve this ambiguity by selecting a visible request, a draining request, or a sibling still waiting for `response.created`. HTTP bridge processing MUST deliver the event to no request queue and MUST retain its existing unmatched-liveness diagnostic. Explicit response ids, single-created-owner routing, anonymous terminal/error matching, and vendor telemetry matching MUST retain their existing behavior.
+
+#### Scenario: One accepted response is draining
+
+- **GIVEN** two accepted responses share a socket and one is draining after downstream cancellation
+- **WHEN** an anonymous output event arrives
+- **THEN** neither request is attributed that event
+- **AND** the visible consumer receives no ambiguous content
+
+#### Scenario: Both accepted responses are draining
+
+- **GIVEN** two accepted responses share a socket and both are draining
+- **WHEN** an anonymous output event arrives
+- **THEN** neither draining request receives event accounting or archive ownership
+
+#### Scenario: A pre-created sibling waits behind two accepted responses
+
+- **GIVEN** two accepted responses and one request awaiting its own creation share a socket
+- **WHEN** an anonymous output event arrives
+- **THEN** the pre-created request receives no content and no request is attributed the event
