@@ -1215,6 +1215,8 @@ class _WebSocketRequestState:
     replay_required_account_id: str | None = None
     require_security_work_authorized: bool = False
     durable_capability_lineage_required: bool = False
+    # Mandatory owner for this turn after pre-submit physical-socket rotation.
+    bridge_age_required_account_id: str | None = None
     file_required_preferred_account: bool = False
     bridge_soft_capacity_reroute_allowed: bool = False
     error_code_override: str | None = None
@@ -1358,6 +1360,9 @@ class _HTTPBridgeSession:
     # Wakes a reader that began an unbounded receive before the first request
     # was enqueued. The reader keeps one receive task alive across wakeups.
     upstream_reader_wakeup: asyncio.Event = field(default_factory=asyncio.Event)
+    # Two bounded scalars per physical connection; no request history retained.
+    physical_opened_at: float | None = None
+    reader_processing: bool = False
     unanchored_reservation_id: str | None = None
     admission_waiter_count: int = 0
     request_service_tier: str | None = None

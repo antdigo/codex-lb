@@ -73,6 +73,11 @@ from app.modules.proxy._service.compact import (
 from app.modules.proxy._service.compact import (
     _sticky_key_from_compact_payload as _sticky_key_from_compact_payload,
 )
+from app.modules.proxy._service.http_bridge.connection_lifetime import (
+    _HTTP_BRIDGE_MAX_IDLE_SOCKET_AGE_SECONDS,
+    _HTTPBridgeAgeReplacementError,
+    _HTTPBridgeAgeRotation,
+)
 from app.modules.proxy._service.http_bridge.helpers import (
     _HTTP_BRIDGE_COOLDOWN_SUPPRESSION_ATTR,
     _HTTP_BRIDGE_EVENTLESS_COOLDOWN_MESSAGE,
@@ -1176,6 +1181,7 @@ class _HTTPBridgeStreamingMixin:
                 cooldown_suppression = getattr(exc, _HTTP_BRIDGE_COOLDOWN_SUPPRESSION_ATTR, False)
                 if (
                     bridge_yielded_any
+                    or isinstance(exc, _HTTPBridgeAgeReplacementError)
                     or api_key_reservation is not None
                     or not getattr(exc, _HTTP_BRIDGE_PRE_SUBMIT_FAILURE_ATTR, False)
                     or getattr(exc, _HTTP_BRIDGE_PREPARED_ANCHOR_ATTR, False)
@@ -1480,6 +1486,7 @@ class _HTTPBridgeStreamingMixin:
         )
         if legacy_anchor_lookup is not None:
             incoming_turn_state_header = _sticky_key_from_turn_state_header(headers)
+        original_age_rotation_key = bridge_session_key
         original_request_unanchored = _http_bridge_request_needs_unanchored_handoff(
             bridge_session_key,
             _sticky_key_from_turn_state_header(headers),
@@ -2489,10 +2496,35 @@ class _HTTPBridgeStreamingMixin:
                 record_account_neutral_replay_rejection(replay_rejection)
             raise owner_unavailable
 
+        age_rotation = None
+        age_session = self._http_bridge_sessions.get(bridge_session_key)
+        if (
+            age_session is not None
+            and age_session.physical_opened_at is not None
+            and clock.monotonic() - age_session.physical_opened_at >= _HTTP_BRIDGE_MAX_IDLE_SOCKET_AGE_SECONDS
+            and bridge_session_key == original_age_rotation_key
+            and bridge_session_key.affinity_kind == "prompt_cache"
+            and bridge_session_key.strength == "soft"
+            and not forwarded_request
+            and not bridge_uses_responses_lite
+            and payload.previous_response_id is None
+            and effective_payload.previous_response_id is None
+            and payload.conversation is None
+            and effective_payload.conversation is None
+            and incoming_turn_state_header is None
+            and incoming_session_header is None
+            and session_header_fallback_key is None
+            and not force_local_recovery_creation
+            and not fresh_replay_excluded_account_ids
+        ):
+            age_rotation = _HTTPBridgeAgeRotation(bridge_session_key, payload)
+        del age_session
+
         while True:
             try:
                 session_or_forward = await self._get_or_create_http_bridge_session(
                     bridge_session_key,
+                    age_rotation=age_rotation,
                     headers=dict(session_creation_headers),
                     affinity=affinity,
                     api_key=api_key,
@@ -2539,6 +2571,11 @@ class _HTTPBridgeStreamingMixin:
                     defer_account_health_writes=request_state.api_key_reservation is not None,
                 )
             except ProxyResponseError as exc:
+                if age_rotation is not None and age_rotation.required_account_id is not None:
+                    # Required owner provenance survives all outer fallback paths.
+                    failure = _HTTPBridgeAgeReplacementError(exc)
+                    setattr(failure, _HTTP_BRIDGE_PRE_SUBMIT_FAILURE_ATTR, True)
+                    raise failure from exc
                 # Session creation failed before the turn was submitted
                 # upstream; record that provenance so the outer wrapper knows
                 # a raw-HTTP replay cannot dispatch the turn twice.
@@ -3376,6 +3413,12 @@ class _HTTPBridgeStreamingMixin:
             elif client_full_resend_fresh_upstream_request_text is not None:
                 request_state.fresh_upstream_request_text = client_full_resend_fresh_upstream_request_text
                 request_state.fresh_upstream_request_is_retry_safe = True
+        if age_rotation is not None and age_rotation.required_account_id is not None:
+            request_state.bridge_age_required_account_id = age_rotation.required_account_id
+            request_state.preferred_account_id = resolve_required_account_id(
+                ("prepared request owner", request_state.preferred_account_id),
+                ("physical socket rotation owner", age_rotation.required_account_id),
+            )
         initial_handoff_session = session
         initial_handoff_scope_id = ensure_request_scope_id() if original_request_unanchored else None
         if initial_handoff_scope_id is not None:
@@ -3394,7 +3437,8 @@ class _HTTPBridgeStreamingMixin:
         )
         request_state.file_required_preferred_account = file_required_preferred_account
         request_state.bridge_soft_capacity_reroute_allowed = (
-            bridge_session_key.strength == "soft"
+            request_state.bridge_age_required_account_id is None
+            and bridge_session_key.strength == "soft"
             and request_state.previous_response_id is None
             and not file_required_preferred_account
         )
@@ -3531,6 +3575,11 @@ class _HTTPBridgeStreamingMixin:
                     default_message="Upstream error",
                 )
                 return
+            if request_state.bridge_age_required_account_id is not None:
+                # All higher-level reroutes/recoveries below may drop soft
+                # affinity. This rotated turn either stays on its required
+                # owner in the central reconnect path or fails before resend.
+                raise _HTTPBridgeAgeReplacementError(exc) from exc
             async with session.pending_lock:
                 request_was_enqueued = request_state in session.pending_requests
             if _http_bridge_can_replace_retired_gate_session(
@@ -4621,7 +4670,10 @@ class _HTTPBridgeStreamingMixin:
                     lifecycle.settlement_owned = True
                 _signal_propagated_responses_service_cleanup_ready()
             except ProxyResponseError as exc:
-                if request_state.bridge_soft_capacity_reroute_allowed:
+                if (
+                    request_state.bridge_soft_capacity_reroute_allowed
+                    or request_state.bridge_age_required_account_id is not None
+                ):
                     raise
                 wait_plan = _http_bridge_capacity_wait_plan(
                     exc, request_deadline=request_deadline, now=clock.monotonic()

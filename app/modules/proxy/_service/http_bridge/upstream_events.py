@@ -2305,13 +2305,17 @@ class _HTTPBridgeUpstreamEventsMixin:
                             account_id=session.account.id,
                             chatgpt_account_id=session.account.chatgpt_account_id,
                         )
-                    await self._process_http_bridge_upstream_text(
-                        session,
-                        message.text,
-                        message=message,
-                        scheduler=scheduler,
-                        clock=clock,
-                    )
+                    session.reader_processing = True
+                    try:
+                        await self._process_http_bridge_upstream_text(
+                            session,
+                            message.text,
+                            message=message,
+                            scheduler=scheduler,
+                            clock=clock,
+                        )
+                    finally:
+                        session.reader_processing = False
                     if await self._retire_http_bridge_after_drain_if_ready(session):
                         break
                     continue
