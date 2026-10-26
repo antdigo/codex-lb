@@ -125,6 +125,7 @@ from app.modules.proxy._service.compact import (
 from app.modules.proxy._service.http_bridge.accepted_replay import (
     _stage_websocket_request_state_for_replay,
 )
+from app.modules.proxy._service.http_bridge.execution import release_http_bridge_execution
 from app.modules.proxy._service.http_bridge.helpers import (
     _active_http_bridge_instance_ring as _active_http_bridge_instance_ring,
 )
@@ -1355,6 +1356,39 @@ async def _process_upstream_websocket_transport_end(
 
 
 class _WebSocketMixin:
+    async def _acquire_request_state_global_response_create_admission(
+        self,
+        request_state: _WebSocketRequestState,
+        *,
+        compact: bool,
+        deadline: float | None,
+    ) -> None:
+        proxy = cast(_WebSocketServiceProtocol, self)
+        admission = proxy._get_work_admission().acquire_response_create(compact=compact)
+        if deadline is None:
+            request_state.response_create_admission = await admission
+            return
+        try:
+            request_state.response_create_admission = await scheduler_for(proxy).wait_for(
+                admission, timeout=max(0.0, deadline - clock_for(proxy).monotonic())
+            )
+        except TimeoutError as exc:
+            raise ProxyResponseError(
+                429,
+                openai_error("response_create_gate_timeout", "HTTP bridge response-create admission timed out"),
+                local_pre_dispatch_refusal=True,
+            ) from exc
+
+    async def _release_request_state_account_response_create_lease(
+        self,
+        request_state: _WebSocketRequestState,
+    ) -> None:
+        proxy = cast(_WebSocketServiceProtocol, self)
+        lease = request_state.account_response_create_lease
+        request_state.account_response_create_lease = None
+        request_state.account_response_create_release = None
+        await proxy._load_balancer.release_account_lease(lease)
+
     async def _touch_active_websocket_thread_affinity(
         self,
         request_state: _WebSocketRequestState,
@@ -6981,6 +7015,7 @@ class _WebSocketMixin:
 
         reservation_release_succeeded = True
         for request_state in remaining:
+            release_http_bridge_execution(request_state)
             try:
                 proxy._cancel_request_state_api_key_reservation_heartbeat(request_state)
             except Exception:

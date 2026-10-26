@@ -727,6 +727,14 @@ async def test_http_bridge_aborted_completed_bookkeeping_settles_reservation(
     )
     reservation = request_state.api_key_reservation
     session = _make_http_bridge_session(deque([request_state]), queued_request_count=1)
+    from app.core.clients.proxy import ProxyResponseError
+    from app.core.clock import REAL_SCHEDULER
+    from app.modules.proxy._service.http_bridge.execution import (
+        acquire_http_bridge_execution,
+        release_http_bridge_execution,
+    )
+
+    await acquire_http_bridge_execution(request_state, session, scheduler=REAL_SCHEDULER, timeout_seconds=1)
 
     bookkeeping_started = asyncio.Event()
 
@@ -745,6 +753,11 @@ async def test_http_bridge_aborted_completed_bookkeeping_settles_reservation(
     monkeypatch.setattr(service, "_finalize_websocket_request_state", finalize_request)
 
     terminal_text = '{"type":"response.completed","response":{"id":"resp-aborted-completed","status":"completed"}}'
+    successor = _make_request_state("queued-after-terminal", response_id=None, awaiting_response_created=True)
+    successor_task = asyncio.create_task(
+        acquire_http_bridge_execution(successor, session, scheduler=REAL_SCHEDULER, timeout_seconds=1)
+    )
+    await asyncio.sleep(0)
     terminal_task = asyncio.create_task(service._process_http_bridge_upstream_text(session, terminal_text))
     await asyncio.wait_for(bookkeeping_started.wait(), timeout=1.0)
     if abort_kind == "exception":
@@ -764,6 +777,13 @@ async def test_http_bridge_aborted_completed_bookkeeping_settles_reservation(
     finalize_request.assert_not_awaited()
     # The downstream waiter is unblocked instead of waiting for idle timeout.
     assert event_queue.get_nowait() is None
+    with pytest.raises(ProxyResponseError) as successor_error:
+        await successor_task
+    assert successor_error.value.payload["error"]["code"] == "response_execution_session_retired"
+    assert request_state.http_bridge_execution_gate is None
+    assert successor.http_bridge_execution_gate is None
+    assert not session.execution_gate.locked()
+    release_http_bridge_execution(request_state)
 
 
 @pytest.mark.asyncio

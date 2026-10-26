@@ -89,6 +89,7 @@ from app.modules.proxy._service.http_bridge.accepted_replay import (
     _claim_websocket_replay_create_gate,
     _http_bridge_accepted_replay_may_exclude_account,
 )
+from app.modules.proxy._service.http_bridge.execution import release_http_bridge_execution
 from app.modules.proxy._service.http_bridge.helpers import (
     _HTTP_BRIDGE_COOLDOWN_SUPPRESSION_ATTR,
     _HTTP_BRIDGE_PRE_SUBMIT_FAILURE_ATTR,
@@ -2612,6 +2613,7 @@ class _HTTPBridgeRequestSubmitMixin:
                                 if warmup_state in session.pending_requests:
                                     session.pending_requests.remove(warmup_state)
                             self._cancel_request_state_api_key_reservation_heartbeat(warmup_state)
+                            release_http_bridge_execution(warmup_state)
                             if gate_acquired:
                                 await _release_websocket_response_create_gate(
                                     warmup_state,
@@ -2707,6 +2709,7 @@ class _HTTPBridgeRequestSubmitMixin:
                 session.admission_waiter_count = max(0, session.admission_waiter_count - 1)
                 request_state.admission_waiter_preregistered = False
             retire_closed_session = session.closed and session.admission_waiter_count == 0
+        release_http_bridge_execution(request_state)
         if (
             request_state.recovery_attempt_fingerprint is not None
             and not request_state.recovery_attempt_claimed
@@ -3008,6 +3011,10 @@ class _HTTPBridgeRequestSubmitMixin:
             # completed handler that wins first keeps its local queue reference;
             # a detach that wins first leaves no queue for that handler to claim.
             request_state.event_queue = None
+        if detached:
+            # A popped terminal belongs to its bookkeeping continuation;
+            # downstream cleanup cannot wake its successor before that owner.
+            release_http_bridge_execution(request_state)
         await _release_websocket_response_create_gate(
             request_state, session.response_create_gate, scheduler=scheduler_for(self)
         )

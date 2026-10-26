@@ -67,6 +67,7 @@ from app.modules.proxy._service.http_bridge.accepted_replay import (
     _http_bridge_accepted_capacity_retry_allowed,
     _stage_websocket_request_state_for_replay,
 )
+from app.modules.proxy._service.http_bridge.execution import release_http_bridge_execution
 from app.modules.proxy._service.http_bridge.helpers import (
     _HTTP_BRIDGE_MISSING_RESPONSE_CREATED_TIMEOUT_DETAIL,
     _await_task_deferring_cancellation,
@@ -2543,6 +2544,11 @@ class _HTTPBridgeUpstreamEventsMixin:
             # downstream detach backstop only settle requests still in
             # pending ownership, so an abort here would otherwise leak the
             # API-key reservation and its heartbeat forever (issue #1594).
+            if any(state.http_bridge_execution_gate is not None for state in claimed_terminal_request_states):
+                # Fence admission before abort settlement can wake a successor.
+                session.closed = True
+                session.upstream_control.reconnect_requested = True
+                session.upstream_control.retire_after_drain = True
             await self._settle_aborted_http_bridge_terminal_states(
                 session,
                 claimed_terminal_request_states,
@@ -2552,6 +2558,9 @@ class _HTTPBridgeUpstreamEventsMixin:
             for claimed_request_state in claimed_terminal_request_states:
                 claimed_request_state.terminal_settlement_phase = None
         finally:
+            for claimed_request_state in claimed_terminal_request_states:
+                if claimed_request_state not in session.pending_requests:
+                    release_http_bridge_execution(claimed_request_state)
             if completed_delivery_scope is not None:
                 completed_delivery_scope.active = False
 

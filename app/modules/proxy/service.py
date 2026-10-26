@@ -176,6 +176,7 @@ from app.modules.proxy._service.compact import (
 )
 from app.modules.proxy._service.file_ops import _FileOpsMixin
 from app.modules.proxy._service.http_bridge import _HTTPBridgeMixin
+from app.modules.proxy._service.http_bridge.execution import acquire_http_bridge_execution
 from app.modules.proxy._service.http_bridge.helpers import (
     _TASK_CANCEL_TIMEOUT_SECONDS as _TASK_CANCEL_TIMEOUT_SECONDS,
 )
@@ -1293,6 +1294,14 @@ class ProxyService(
             timeout_seconds = _http_bridge_admission_timeout_seconds(
                 request_state, timeout_seconds, get_settings(), now=self._clock.monotonic()
             )
+            admission_deadline = self._clock.monotonic() + timeout_seconds
+            await acquire_http_bridge_execution(
+                request_state, bridge_session, scheduler=scheduler, timeout_seconds=timeout_seconds
+            )
+            now = self._clock.monotonic()
+            timeout_seconds = _http_bridge_admission_timeout_seconds(
+                request_state, max(0.0, admission_deadline - now), get_settings(), now=now
+            )
         request_state.response_create_gate = response_create_gate
         request_state.response_create_gate_wait_started_at = self._clock.monotonic()
         if account_id is not None:
@@ -1416,8 +1425,8 @@ class ProxyService(
                 max(0.0, self._clock.monotonic() - request_state.response_create_gate_wait_started_at) * 1000
             )
         try:
-            request_state.response_create_admission = await self._get_work_admission().acquire_response_create(
-                compact=compact
+            await self._acquire_request_state_global_response_create_admission(
+                request_state, compact=compact, deadline=admission_deadline if bridge_session is not None else None
             )
         except BaseException:
             await self._release_request_state_account_response_create_lease(request_state)
@@ -1431,15 +1440,6 @@ class ProxyService(
             request_state.latency_response_create_gate_wait_ms = int(
                 max(0.0, self._clock.monotonic() - request_state.response_create_gate_wait_started_at) * 1000
             )
-
-    async def _release_request_state_account_response_create_lease(
-        self,
-        request_state: "_WebSocketRequestState",
-    ) -> None:
-        lease = request_state.account_response_create_lease
-        request_state.account_response_create_lease = None
-        request_state.account_response_create_release = None
-        await self._load_balancer.release_account_lease(lease)
 
     async def _select_account_with_budget_compatible(self, deadline: float, **kwargs: object) -> AccountSelection:
         affinity_policy = kwargs.pop("affinity_policy", None)

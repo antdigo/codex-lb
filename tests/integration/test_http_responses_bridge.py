@@ -398,6 +398,99 @@ class _FakeBridgeUpstreamWebSocket:
         return None
 
 
+class _SequentialExecutionUpstream(_FakeBridgeUpstreamWebSocket):
+    """A slow accepted response prevents acknowledgement of a second create."""
+
+    def __init__(self) -> None:
+        super().__init__("resp_execution")
+        self.owner_completed = False
+
+    async def emit(self, payload: dict[str, Any]) -> None:
+        await self._messages.put(_FakeUpstreamMessage("text", text=json.dumps(payload)))
+
+    async def send_text(self, text: str) -> None:
+        if not self.sent_text:
+            self.sent_text.append(text)
+            await self.emit(
+                {"type": "response.created", "response": {"id": "resp_execution_owner", "status": "in_progress"}}
+            )
+            await self.emit(
+                {
+                    "type": "response.output_item.added",
+                    "response_id": "resp_execution_owner",
+                    "output_index": 0,
+                    "item": {
+                        "id": "fc_execution",
+                        "type": "function_call",
+                        "call_id": "call_execution",
+                        "name": "run",
+                        "arguments": "",
+                    },
+                }
+            )
+            await self.emit(
+                {
+                    "type": "response.function_call_arguments.delta",
+                    "response_id": "resp_execution_owner",
+                    "item_id": "fc_execution",
+                    "output_index": 0,
+                    "delta": '{"value":',
+                }
+            )
+        elif not self.owner_completed:
+            self.sent_text.append(text)
+        else:
+            await super().send_text(text)
+
+    async def complete_owner(self) -> None:
+        self.owner_completed = True
+        await self.emit(
+            {
+                "type": "response.function_call_arguments.delta",
+                "response_id": "resp_execution_owner",
+                "item_id": "fc_execution",
+                "output_index": 0,
+                "delta": "42}",
+            }
+        )
+        item = {
+            "id": "fc_execution",
+            "type": "function_call",
+            "call_id": "call_execution",
+            "name": "run",
+            "arguments": '{"value":42}',
+            "status": "completed",
+        }
+        await self.emit(
+            {
+                "type": "response.function_call_arguments.done",
+                "response_id": "resp_execution_owner",
+                "item_id": "fc_execution",
+                "output_index": 0,
+                "arguments": '{"value":42}',
+            }
+        )
+        await self.emit(
+            {
+                "type": "response.output_item.done",
+                "response_id": "resp_execution_owner",
+                "output_index": 0,
+                "item": item,
+            }
+        )
+        await self.emit(
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_execution_owner",
+                    "status": "completed",
+                    "output": [item],
+                    "usage": {"input_tokens": 24, "output_tokens": 4, "input_tokens_details": {"cached_tokens": 20}},
+                },
+            }
+        )
+
+
 class _InterruptedCustomToolUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
     """First response completes with an unresolved ``custom_tool_call``."""
 
@@ -1072,6 +1165,38 @@ class _AnonymousPreviousResponseNotFoundAfterCreatedUpstreamWebSocket(_FakeBridg
         super().__init__()
         self.first_request_created = asyncio.Event()
 
+    async def finish_first_request(self) -> None:
+        await self._messages.put(
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps(
+                    {
+                        "type": "response.completed",
+                        "response": {
+                            "id": "resp_bridge_inflight",
+                            "object": "response",
+                            "status": "completed",
+                            "output": [
+                                {
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "content": [{"type": "output_text", "text": "OK"}],
+                                }
+                            ],
+                            "usage": {
+                                "input_tokens": 24,
+                                "output_tokens": 2,
+                                "total_tokens": 26,
+                                "input_tokens_details": {"cached_tokens": 20},
+                                "output_tokens_details": {"reasoning_tokens": 0},
+                            },
+                        },
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+        )
+
     async def send_text(self, text: str) -> None:
         self.sent_text.append(text)
         if len(self.sent_text) == 1:
@@ -1131,36 +1256,6 @@ class _AnonymousPreviousResponseNotFoundAfterCreatedUpstreamWebSocket(_FakeBridg
                     ),
                 )
             )
-            await self._messages.put(
-                _FakeUpstreamMessage(
-                    "text",
-                    text=json.dumps(
-                        {
-                            "type": "response.completed",
-                            "response": {
-                                "id": "resp_bridge_inflight",
-                                "object": "response",
-                                "status": "completed",
-                                "output": [
-                                    {
-                                        "type": "message",
-                                        "role": "assistant",
-                                        "content": [{"type": "output_text", "text": "OK"}],
-                                    }
-                                ],
-                                "usage": {
-                                    "input_tokens": 24,
-                                    "output_tokens": 2,
-                                    "total_tokens": 26,
-                                    "input_tokens_details": {"cached_tokens": 20},
-                                    "output_tokens_details": {"reasoning_tokens": 0},
-                                },
-                            },
-                        },
-                        separators=(",", ":"),
-                    ),
-                )
-            )
             return
 
         response_id = "resp_bridge_after_error"
@@ -1212,6 +1307,28 @@ class _TwoFollowupsPreviousResponseNotFoundUpstreamWebSocket(_FakeBridgeUpstream
     def __init__(self) -> None:
         super().__init__()
         self.first_followup_created = asyncio.Event()
+
+    async def finish_first_followup(self) -> None:
+        await self._messages.put(
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps(
+                    {
+                        "type": "error",
+                        "status": 400,
+                        "error": {
+                            "type": "invalid_request_error",
+                            "code": "previous_response_not_found",
+                            "message": (
+                                "Cannot continue conversation because upstream lost resp_bridge_prev_anchor_a."
+                            ),
+                            "param": "previous_response_id",
+                        },
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+        )
 
     async def send_text(self, text: str) -> None:
         self.sent_text.append(text)
@@ -1355,26 +1472,6 @@ class _TwoFollowupsPreviousResponseNotFoundUpstreamWebSocket(_FakeBridgeUpstream
                     "text",
                     text=json.dumps(
                         {
-                            "type": "error",
-                            "status": 400,
-                            "error": {
-                                "type": "invalid_request_error",
-                                "code": "previous_response_not_found",
-                                "message": (
-                                    "Cannot continue conversation because upstream lost resp_bridge_prev_anchor_a."
-                                ),
-                                "param": "previous_response_id",
-                            },
-                        },
-                        separators=(",", ":"),
-                    ),
-                )
-            )
-            await self._messages.put(
-                _FakeUpstreamMessage(
-                    "text",
-                    text=json.dumps(
-                        {
                             "type": "response.completed",
                             "response": {
                                 "id": "resp_bridge_followup_b",
@@ -1451,6 +1548,26 @@ class _TwoSameAnchorFollowupsPreviousResponseNotFoundUpstreamWebSocket(_FakeBrid
     def __init__(self) -> None:
         super().__init__()
         self.first_followup_created = asyncio.Event()
+
+    async def finish_first_followup(self) -> None:
+        await self._messages.put(
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps(
+                    {
+                        "type": "error",
+                        "status": 400,
+                        "error": {
+                            "type": "invalid_request_error",
+                            "code": "previous_response_not_found",
+                            "message": "Previous response with id 'resp_bridge_prev_anchor_shared' not found.",
+                            "param": "previous_response_id",
+                        },
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+        )
 
     async def send_text(self, text: str) -> None:
         self.sent_text.append(text)
@@ -15474,7 +15591,7 @@ async def test_v1_responses_http_bridge_masks_anonymous_previous_response_not_fo
     app_instance,
     monkeypatch,
 ):
-    _install_bridge_settings(monkeypatch, enabled=True)
+    _install_bridge_settings_with_limits(monkeypatch, enabled=True, admission_wait_timeout_seconds=2.0)
     service = get_proxy_service_for_app(app_instance)
     upstream = _TwoSameAnchorFollowupsPreviousResponseNotFoundUpstreamWebSocket()
     connect_count = 0
@@ -15590,6 +15707,9 @@ async def test_v1_responses_http_bridge_masks_anonymous_previous_response_not_fo
                     },
                 )
             )
+
+            # The next create stays local until this accepted response terminates.
+            await upstream.finish_first_followup()
 
             first_response, second_response = await asyncio.wait_for(
                 asyncio.gather(first, second),
@@ -15869,7 +15989,7 @@ async def test_v1_responses_http_bridge_stream_keeps_session_alive_after_anonymo
     app_instance,
     monkeypatch,
 ):
-    _install_bridge_settings(monkeypatch, enabled=True)
+    _install_bridge_settings_with_limits(monkeypatch, enabled=True, admission_wait_timeout_seconds=2.0)
     upstream = _AnonymousPreviousResponseNotFoundAfterCreatedUpstreamWebSocket()
     connect_count = 0
 
@@ -15977,6 +16097,9 @@ async def test_v1_responses_http_bridge_stream_keeps_session_alive_after_anonymo
                 )
             )
 
+            # The next create stays local until this accepted response terminates.
+            await upstream.finish_first_request()
+
             first_events, second_events = await asyncio.wait_for(
                 asyncio.gather(first, second),
                 timeout=_TEST_SYNC_TIMEOUT_SECONDS,
@@ -16010,7 +16133,7 @@ async def test_v1_responses_http_bridge_stream_matches_previous_response_error_t
     app_instance,
     monkeypatch,
 ):
-    _install_bridge_settings(monkeypatch, enabled=True)
+    _install_bridge_settings_with_limits(monkeypatch, enabled=True, admission_wait_timeout_seconds=2.0)
     upstream = _TwoFollowupsPreviousResponseNotFoundUpstreamWebSocket()
     connect_count = 0
 
@@ -16143,6 +16266,9 @@ async def test_v1_responses_http_bridge_stream_matches_previous_response_error_t
                 )
             )
 
+            # The next create stays local until this accepted response terminates.
+            await upstream.finish_first_followup()
+
             third_events, fourth_events = await asyncio.wait_for(
                 asyncio.gather(third, fourth),
                 timeout=_TEST_SYNC_TIMEOUT_SECONDS,
@@ -16179,7 +16305,7 @@ async def test_v1_responses_http_bridge_stream_masks_anonymous_previous_response
     app_instance,
     monkeypatch,
 ):
-    _install_bridge_settings(monkeypatch, enabled=True)
+    _install_bridge_settings_with_limits(monkeypatch, enabled=True, admission_wait_timeout_seconds=2.0)
     upstream = _TwoSameAnchorFollowupsPreviousResponseNotFoundUpstreamWebSocket()
     connect_count = 0
 
@@ -16299,6 +16425,9 @@ async def test_v1_responses_http_bridge_stream_masks_anonymous_previous_response
                     },
                 )
             )
+
+            # The next create stays local until this accepted response terminates.
+            await upstream.finish_first_followup()
 
             second_events, third_events = await asyncio.wait_for(
                 asyncio.gather(second, third),
@@ -19558,4 +19687,191 @@ async def _exercise_aged_idle_prompt_cache_socket(
         assert len(reservations) == 2
         assert all(
             reservation.api_key_id == api_key_id and reservation.status == "finalized" for reservation in reservations
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/v1/responses", "/backend-api/codex/responses"])
+@pytest.mark.parametrize("authenticated", [False, True])
+@pytest.mark.parametrize("waiter_action", ["timeout", "cancel", "complete", "owner_cancel", "other_socket"])
+async def test_public_http_bridge_waiter_isolated_from_streaming_owner(
+    async_client,
+    app_instance,
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+    authenticated: bool,
+    waiter_action: str,
+) -> None:
+    dashboard = _make_dashboard_settings()
+    _install_proxy_settings(
+        monkeypatch,
+        app_settings=_make_app_settings(enabled=True),
+        dashboard_settings=dashboard,
+        admission_wait_timeout_seconds=0.04 if waiter_action == "timeout" else 2.0,
+    )
+    monkeypatch.setattr(http_bridge_helpers_module, "HTTP_BRIDGE_STUCK_GATE_RETIRE_AFTER_SECONDS", 0.10)
+    account_id = await _import_account(async_client, "execution-owner", "execution-owner@example.com")
+    account = await _get_account(account_id)
+    service = get_proxy_service_for_app(app_instance)
+    upstream = _SequentialExecutionUpstream()
+    connections: list[str] = []
+    accepted = asyncio.Event()
+    waiter_entered = asyncio.Event()
+    admissions = 0
+    original_admit = service._acquire_request_state_response_create_admission
+    original_process = service._process_http_bridge_upstream_text
+    auth_headers: dict[str, str] = {}
+    key_id = None
+    if authenticated:
+        settings_response = await async_client.put("/api/settings", json={"apiKeyAuthEnabled": True})
+        assert settings_response.status_code == 200
+        key = await async_client.post(
+            "/api/api-keys/", json={"name": "execution-isolation", "weeklyTokenLimit": 1000000}
+        )
+        assert key.status_code == 200
+        key_id = key.json()["id"]
+        auth_headers = {"Authorization": f"Bearer {key.json()['key']}"}
+        dashboard.api_key_auth_enabled = True
+
+    async def admit(*args, **kwargs):
+        nonlocal admissions
+        admissions += 1
+        if admissions == 2:
+            waiter_entered.set()
+        await original_admit(*args, **kwargs)
+
+    async def process(session, text, **kwargs):
+        await original_process(session, text, **kwargs)
+        if json.loads(text).get("type") == "response.created":
+            accepted.set()
+
+    async def connect(*args, **kwargs):
+        connections.append(account.id)
+        return upstream if len(connections) == 1 else _FakeBridgeUpstreamWebSocket("resp_independent")
+
+    monkeypatch.setattr(
+        service,
+        "_select_account_with_budget",
+        AsyncMock(return_value=AccountSelection(account=account, error_message=None, error_code=None)),
+    )
+    monkeypatch.setattr(service, "_ensure_fresh_with_budget", AsyncMock(return_value=account))
+    monkeypatch.setattr(proxy_module, "connect_responses_websocket", connect)
+    monkeypatch.setattr(service, "_process_http_bridge_upstream_text", process)
+    monkeypatch.setattr(service, "_acquire_request_state_response_create_admission", admit)
+    body = {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "input": "owner",
+        "prompt_cache_key": "execution-isolation",
+        "stream": True,
+    }
+    owner_task = asyncio.create_task(async_client.post(path, json=body, headers=auth_headers))
+    waiter_task = None
+    waiting = None
+    try:
+        await _wait_for_event(accepted)
+        bridge = next(iter(service._http_bridge_sessions.values()))
+        reader = bridge.upstream_reader
+        waiter_task = asyncio.create_task(
+            async_client.post(
+                path,
+                json={
+                    **body,
+                    "input": "waiter",
+                    "prompt_cache_key": "independent-execution"
+                    if waiter_action == "other_socket"
+                    else "execution-isolation",
+                },
+                headers=auth_headers,
+            )
+        )
+        await _wait_for_event(waiter_entered)
+        if waiter_action == "owner_cancel":
+            owner_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await owner_task
+            waiting = await asyncio.wait_for(waiter_task, timeout=3)
+            error = (
+                waiting.json()["error"]
+                if waiting.status_code != 200
+                else [
+                    json.loads(line[6:])
+                    for line in waiting.text.splitlines()
+                    if line.startswith("data: ") and line[6:] != "[DONE]"
+                ][-1]["response"]["error"]
+            )
+            assert error["code"] == "response_execution_session_retired"
+            assert len(upstream.sent_text) == 1
+            return
+        if waiter_action in {"timeout", "other_socket"}:
+            waiting = await asyncio.wait_for(waiter_task, timeout=3)
+        elif waiter_action == "cancel":
+            waiter_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiter_task
+        assert len(upstream.sent_text) == 1, "Unsent waiters must not enter the upstream acknowledgement watchdog"
+        owner_was_running = not owner_task.done()
+        reader_survived = bridge.upstream_reader is reader and reader is not None and not reader.done()
+    finally:
+        await upstream.complete_owner()
+        if not owner_task.cancelled():
+            owner = await asyncio.wait_for(owner_task, timeout=3)
+        if waiter_task is not None and not waiter_task.done():
+            waiting = await asyncio.wait_for(waiter_task, timeout=3)
+    events = [
+        json.loads(line[6:]) for line in owner.text.splitlines() if line.startswith("data: ") and line[6:] != "[DONE]"
+    ]
+    assert events[-1]["type"] == "response.completed", owner.text
+    assert owner_was_running and reader_survived
+    assert connections == [account.id] * (2 if waiter_action == "other_socket" else 1)
+    if waiter_action == "timeout":
+        assert waiting is not None
+        error = (
+            waiting.json()["error"]
+            if waiting.status_code != 200
+            else [
+                json.loads(line[6:])
+                for line in waiting.text.splitlines()
+                if line.startswith("data: ") and line[6:] != "[DONE]"
+            ][-1]["response"]["error"]
+        )
+        assert error["code"] == "response_execution_wait_timeout"
+    elif waiter_action in {"complete", "other_socket"}:
+        assert waiting is not None and waiting.status_code == 200
+        waiter_events = [
+            json.loads(line[6:])
+            for line in waiting.text.splitlines()
+            if line.startswith("data: ") and line[6:] != "[DONE]"
+        ]
+        assert waiter_events[-1]["type"] == "response.completed"
+    arguments = "".join(event["delta"] for event in events if event["type"] == "response.function_call_arguments.delta")
+    assert arguments == '{"value":42}'
+    successor = await asyncio.wait_for(
+        async_client.post(path, json={**body, "input": "successor"}, headers=auth_headers), timeout=3
+    )
+    successor_events = [
+        json.loads(line[6:])
+        for line in successor.text.splitlines()
+        if line.startswith("data: ") and line[6:] != "[DONE]"
+    ]
+    assert successor_events[-1]["type"] == "response.completed"
+    assert successor_events[-1]["response"]["usage"]["input_tokens_details"]["cached_tokens"] == 20
+    assert connections == [account.id] * (2 if waiter_action == "other_socket" else 1)
+    assert len(upstream.sent_text) == (3 if waiter_action == "complete" else 2)
+    assert all(json.loads(text)["prompt_cache_key"] == "execution-isolation" for text in upstream.sent_text)
+    if key_id is not None:
+        assert await service.drain_persistence_tasks(timeout_seconds=10)
+        async with SessionLocal() as session:
+            reservations = list(
+                (
+                    await session.execute(
+                        select(ApiKeyUsageReservation).where(ApiKeyUsageReservation.api_key_id == key_id)
+                    )
+                ).scalars()
+            )
+        assert len(reservations) == 3
+        assert sorted(reservation.status for reservation in reservations) == (
+            ["finalized", "finalized", "finalized"]
+            if waiter_action in {"complete", "other_socket"}
+            else ["finalized", "finalized", "released"]
         )

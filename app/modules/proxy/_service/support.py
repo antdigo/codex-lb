@@ -1247,6 +1247,7 @@ class _WebSocketRequestState:
     # an ownership signal, so ``None`` leaves configured source routing intact.
     previous_response_owner_account_id: str | None = None
     response_create_gate_acquired: bool = False
+    http_bridge_execution_gate: asyncio.Semaphore | None = None
     response_create_gate: asyncio.Semaphore | None = None
     response_create_admission: AdmissionLease | None = None
     response_create_admission_reacquire_required: bool = False
@@ -1363,6 +1364,7 @@ class _HTTPBridgeSession:
     # Two bounded scalars per physical connection; no request history retained.
     physical_opened_at: float | None = None
     reader_processing: bool = False
+    execution_gate: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(1))
     unanchored_reservation_id: str | None = None
     admission_waiter_count: int = 0
     request_service_tier: str | None = None
