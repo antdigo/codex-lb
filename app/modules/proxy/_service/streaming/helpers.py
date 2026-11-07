@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import sys
 from collections.abc import Callable
 from copy import deepcopy
+from types import AsyncGeneratorType
 from typing import Any, AsyncIterator, Literal, Mapping, cast
 
 from app.core.balancer import PERMANENT_FAILURE_CODES
@@ -37,7 +39,7 @@ from app.core.clients.proxy import transcribe_audio as core_transcribe_audio  # 
 from app.core.clients.proxy_websocket import (
     UpstreamWebSocket,
 )
-from app.core.clock import Clock
+from app.core.clock import Clock, Scheduler
 from app.core.errors import (
     PREVIOUS_RESPONSE_MALFORMED_PARAM_REASON,
     PREVIOUS_RESPONSE_STREAM_INCOMPLETE_MESSAGE,
@@ -65,14 +67,15 @@ from app.core.types import JsonValue
 from app.core.upstream_proxy import ResolvedUpstreamRoute, UpstreamProxyRouteError
 from app.core.upstream_proxy.cache import get_upstream_route_cache
 from app.core.utils.request_id import get_request_id
+from app.core.utils.shared_future import _await_cleanup_deferring_cancellation
 from app.core.utils.sse import CODEX_KEEPALIVE_FRAME as CODEX_KEEPALIVE_FRAME  # noqa: F401
-from app.core.utils.sse import ParsedSseBlock, format_sse_event, parse_sse_data_json
+from app.core.utils.sse import ParsedSseBlock, format_local_sse_event, parse_sse_data_json
 from app.core.utils.time import utcnow as utcnow
 from app.db.models import (
     Account,
     AccountStatus,  # noqa: F401
 )
-from app.modules.api_keys.service import ApiKeyData
+from app.modules.api_keys.service import ApiKeyData, ApiKeyUsageReservationData
 from app.modules.proxy._load_balancer.overload_backoff import (
     UPSTREAM_OVERLOAD_CODES,
     UPSTREAM_SOFT_OVERLOAD_CODES,
@@ -413,6 +416,7 @@ from app.modules.proxy.durable_bridge_coordinator import (
 )
 from app.modules.proxy.helpers import (
     _normalize_error_code,
+    _upstream_error_from_openai,
     classify_upstream_failure,
     is_account_neutral_safety_policy_rejection,
     is_model_scoped_upstream_rejection,
@@ -478,7 +482,7 @@ def _is_background_json_ack(
     return stream is False and _canonical_background_ack_response_id(event_payload, event_type) is not None
 
 
-def _publish_http_response_owner(
+def _accept_http_response_owner(
     proxy: _StreamingServiceProtocol,
     event: OpenAIEvent | None,
     event_payload: dict[str, JsonValue] | None,
@@ -486,19 +490,99 @@ def _publish_http_response_owner(
     account_id: str,
     api_key: ApiKeyData | None,
     session_id: str | None,
-) -> None:
-    if event is None or event.response is None or not event.response.id or event_payload is None:
-        return
+    accepted_response_id: str | None,
+) -> str | None:
+    """Publish an owner and return its ID only for this attempt's first acceptance."""
+    if event is None or event.response is None or not event.response.id:
+        return None
+    response_id_is_local = isinstance(block, ParsedSseBlock) and block.response_id_is_local
+    new_response_id = event.response.id if accepted_response_id is None and not response_id_is_local else None
+    if event_payload is None:
+        return new_response_id
+    if accepted_response_id is not None and event.response.id != accepted_response_id:
+        return new_response_id
     if isinstance(block, ParsedSseBlock) and (block.is_local or block.response_id_is_local):
-        return
+        return new_response_id
     if event_payload.get(SYNTHETIC_TRANSPORT_FAILURE_MARKER):
-        return
+        return new_response_id
     proxy._remember_websocket_previous_response_owner(
         previous_response_id=event.response.id,
         api_key_id=api_key.id if api_key is not None else None,
         account_id=account_id,
         session_id=session_id,
     )
+    return new_response_id
+
+
+def _reject_foreign_http_response_owner(
+    block: str,
+    event_payload: dict[str, JsonValue] | None,
+    accepted_response_id: str,
+    settlement: _StreamSettlement,
+    clock: Clock,
+) -> str | None:
+    """Reject foreign ownership before it can affect attribution or settlement."""
+    if event_payload is None or (isinstance(block, ParsedSseBlock) and block.response_id_is_local):
+        return None
+    event_type = classify_event_type(event_payload)
+    if event_type != "error" and (event_type is None or not event_type.startswith("response.")):
+        return None
+    response = event_payload.get("response")
+    nested_id = response.get("id") if isinstance(response, dict) else None
+    top_id = event_payload.get("response_id")
+    if not (
+        (isinstance(nested_id, str) and nested_id and nested_id != accepted_response_id)
+        or (isinstance(top_id, str) and top_id and top_id != accepted_response_id)
+    ):
+        return None
+    error_code = "upstream_response_owner_mismatch"
+    message = "Responses stream changed response owner after acceptance"
+    settlement.status = "error"
+    settlement.error_code = error_code
+    settlement.error_message = message
+    settlement.record_success = False
+    settlement.account_health_error = False
+    settlement.error = {"message": message}
+    settlement.downstream_visible = True
+    _stamp_terminal(settlement, "response.failed", clock)
+    return format_local_sse_event(response_failed_event(error_code, message, response_id=accepted_response_id))
+
+
+async def _close_http_stream(
+    iterator: AsyncIterator[str] | None, *, scheduler: Scheduler
+) -> asyncio.CancelledError | None:
+    """Join owned transport teardown without replacing settlement or its error."""
+    if iterator is None or (isinstance(iterator, AsyncGeneratorType) and iterator.ag_frame is None):
+        return None
+    close_iterator = getattr(iterator, "aclose", None)
+    if close_iterator is not None:
+        try:
+            return await _await_cleanup_deferring_cancellation(close_iterator(), scheduler=scheduler)
+        except (Exception, asyncio.CancelledError):
+            _facade().logger.warning("Failed to close upstream stream", exc_info=True)
+    return None
+
+
+async def _record_or_defer_owner_recovery_health(
+    proxy: _StreamingServiceProtocol,
+    account: Account,
+    settlement: _StreamSettlement,
+    reservation: ApiKeyUsageReservationData | None,
+    error: UpstreamError | OpenAIError | None,
+    code: str | None,
+) -> None:
+    """Apply continuity health only after its API-key settlement is safe."""
+    if code is None:
+        return
+    if reservation is None:
+        upstream_error = (
+            _upstream_error_from_openai(error) if error is None or isinstance(error, OpenAIError) else error
+        )
+        await proxy._handle_stream_error(account, upstream_error, code)
+        return
+    settlement.error_code = code
+    settlement.account_health_error = True
+    settlement.settlement_order_required = True
 
 
 def _settle_background_ack(
@@ -900,7 +984,7 @@ def _build_rewritten_stream_response_failed_event(
     )
     if error_code in SYNTHETIC_TRANSPORT_FAILURE_CODES:
         rewritten_event_payload = synthetic_transport_failure_event(rewritten_event_payload)
-    rewritten_event_block = format_sse_event(rewritten_event_payload)
+    rewritten_event_block = format_local_sse_event(rewritten_event_payload)
     rewritten_payload = parse_sse_data_json(rewritten_event_block)
     rewritten_event = parse_sse_event(rewritten_event_block)
     rewritten_event_type = _event_type_from_payload(rewritten_event, rewritten_payload)
@@ -920,7 +1004,7 @@ def _stream_transport_failure_event_or_raise(
             openai_error(error_code, error_message),
             failure_phase="upstream",
         )
-    return format_sse_event(synthetic_stream_failure_event(error_code, error_message, response_id=response_id))
+    return format_local_sse_event(synthetic_stream_failure_event(error_code, error_message, response_id=response_id))
 
 
 def _build_stream_incomplete_terminal_event_for_request(

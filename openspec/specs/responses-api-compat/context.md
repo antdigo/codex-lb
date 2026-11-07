@@ -328,3 +328,48 @@ File operations follow the existing pre-visible unary retry policy. The file cli
 For example, an unpinned upload whose account A cannot connect to its proxy can complete through account B, and the resulting file owner pin belongs to B. Finalization of a file pinned to A remains on A. Ambiguous request delivery, body-read failures, and host-wide network failures do not permit cross-account retries.
 
 Finalization may issue several upstream polls within one downstream call. A refused connection on its first poll can still use an eligible fallback account. After a poll has returned `retry` from A, however, a later refused connection must fail the operation on A: the pre-dispatch status of the later request does not undo the earlier poll's account-local progress. This applies even when no file owner pin was found; direct transport polling retains its existing behavior.
+
+## Shared bridge response ownership and terminal recovery
+
+A pending response belongs to the physical socket on which it was submitted. Reconnecting one retryable turn cannot carry an accepted or draining sibling onto the replacement socket. The early retry guard preserves replay state; the common reconnect entry checks pending ownership before account selection. Prewarm timeout identifies only its own disposable probe and holds the lifecycle lock while reconnecting, so a submitter already past its closed-session check finishes publication before recovery evaluates ownership. Other reconnect callers retain their existing lifecycle or response-create gate fencing.
+
+Shared prompt-cache locality cannot identify the owner of an anonymous output frame. When several responses are already created, downstream visibility or cancellation does not disambiguate them. Such a frame retains the unmatched-liveness diagnostic and no request queue or archive owner. Single-created-owner routing, explicit response ids, anonymous errors/terminals and vendor telemetry keep their existing rules.
+
+For example, response A is accepted while B awaits creation on the same socket. If that socket fails, replaying B alone would strand A's response id. Recovery instead declines and the existing reader funnel settles both. Separately, a public response that has emitted creation and metadata but no output can recover complete item/content/tool-argument events from its own authoritative terminal envelope. Recovery requires the same response id, emits no second creation, and assigns increasing generated sequence numbers. Partial streamed output is not replayed by this recovery. Public data after the first terminal is suppressed so duplicate completion or late argument frames cannot duplicate a tool lifecycle. Native passthrough retains its existing normalization behavior.
+
+These changes add no growing buffer or long-lived cache. Reconnect ownership scans run only during recovery; the multiple-created-owner check adds a length comparison to the list the matcher already builds. Public normalization retains one response-id reference and one boolean per stream. A 14-event ordinary-stream benchmark on the implementation host measured 1,066,705 to 1,075,806 CPU ns/stream in a repeat run, with peak traced bytes 13,627 to 13,651; a loaded run measured a 5.4% CPU increase. These are local Python normalizer measurements, not an end-to-end latency guarantee or an allocation-count measurement. No configuration, database schema or native helper protocol change is involved.
+
+## Retirement during canonical registry reuse refresh
+
+The canonical session-key registry reuse branch checks retirement again after its awaited durable lease refresh. An older response may detach during that await without acquiring the registry lock. A newly retiring candidate without a reserved unanchored handoff proceeds through ordinary drain-aware replacement before submission: visible siblings retain their old socket, pending ownership and settlement; client anchors and file/account pins retain their existing owner constraints. A reserved unanchored handoff retains its existing generation authority.
+
+This closes the reproduced refresh window, not all retiring rejections. Retirement after lookup still reaches the pre-dispatch fail-closed fence, and the separate previous-response-alias refresh branch is outside this change. No upstream frame is replayed by the new branch. Limited-key regression cases prove one finalized/released reservation, and the positive unanchored case proves one physical send with zero replay count.
+
+The common path adds a retirement flag check and boolean return with no retained buffers/cache. An isolated helper benchmark with I/O/logging stubbed measured 1,273.96 to 1,382.48 ns CPU per call (+108.52 ns, +8.52%; 11 interleaved samples of 100,000 awaits). These figures are not end-to-end gateway latency. There are no configuration, database schema or native protocol changes and no native rebuild requirement.
+
+## Guarded idle prompt-cache socket lifetime
+
+A canonical soft prompt-cache bridge can replace a completely unowned physical socket at 3000 seconds before sending a new unanchored HTTP request. Physical opening time is distinct from idle last-use time and resets on each successful connection. The scope excludes Codex continuity sessions, original/effective response or conversation anchors, turn/session headers, forwarded requests, Responses-Lite and recovery keys.
+
+For this scope, the original Responses input defines the entire new context; a soft prompt-cache key is a cache hint, not implicit conversation state. The narrow guard accepts complete inline messages, complete function calls and outputs, and reasoning with both ID and encrypted content. Function-call IDs must be uniquely paired with subsequent full outputs. Unknown/reference-only shapes and opaque encrypted function arguments remain ineligible. A full cancelled function output may retain native `status=incomplete`. The policy constructs no projection and sends the canonical prepared input, ciphertext, call IDs and PCK unchanged on the same account.
+
+The old account becomes a request-scoped mandatory owner. The central reconnect boundary enforces it even if an ordinary soft preference is cleared; higher-level reroutes that cannot retain the constraint fail closed before another send. A replacement handshake failure cannot escape through an unpinned raw HTTP fallback. The original request deadline and reservation remain in use.
+
+Age retirement requires an empty literal pending deque, zero queued/admission owners, no handoff/reservation/close owner or reconnect retirement, and no reader still processing a frame. The reader marker includes terminal persistence after a request has been popped. Trylock uncertainty skips rotation. Detachment immediately assigns a cancellation-safe cleanup owner and also enters the existing planned synchronous-close list, so a failed owner lookup cannot strand the socket and a one-session cap can wait for its own predecessor rather than evicting an unrelated session. Both close paths share one resource-close task.
+
+For example, a 3593.4-second-old idle socket receives no second create when the next complete unanchored request arrives: its same-account replacement receives that request once. This does not cover busy bridges, raw downstream WebSockets, late-submit races or transparent replay after accepted model output. The roughly 600-second headroom before the observed one-hour limit is supported by a sample of successful streams, not a bound on future generation duration. Prompt-cache hits after replacement remain upstream-dependent.
+
+Retained state is two small session scalars and one optional account-ID reference per request state. Shape checking uses transient call-ID sets bounded by that input's function-call count. The young-socket path adds a registry/age hint and later owner-marker checks, without an age capability, body traversal, history copy, new database query or long-lived cache. An isolated hint microbenchmark measured about 616 ns/op above an empty-function baseline on the implementation host; this is not an end-to-end latency or allocation-count measurement. There are no configuration, database schema, dependency or native protocol changes.
+
+
+## HTTP bridge execution ownership
+
+Each HTTP bridge serializes upstream execution independently of response-created admission. A subsequent same-socket request waits locally before response.create under the original admission/request budget; its cancellation or wait timeout cannot abort the already executing response. For example, a long tool-argument response A may complete while waiter B returns response_execution_wait_timeout, and C can reuse the warm socket. Account-create admission still releases on response.created. The independent execution handle releases on terminal or fenced cleanup, including prewarm and reader failure. Separate physical sockets keep concurrency; no upstream stream_id capability is assumed.
+
+## Execution admission and stream ownership
+
+[HTTP bridge execution and create admission](http-bridge-admission.md) explains
+the two wait budgets, retained deadlines, account binding and queue lifetime.
+[Stream ownership, lifecycle and cleanup](stream-ownership.md) covers response
+identity, SDK recovery, bounded ordering, teardown and measured processing cost.
+The normative requirements remain in [spec.md](spec.md).

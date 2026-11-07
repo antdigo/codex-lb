@@ -1923,6 +1923,8 @@ def _match_websocket_request_state_for_anonymous_event(
         ]
         if len(created_requests) == 1:
             return created_requests[0]
+        if len(created_requests) > 1:
+            return None
 
     visible_requests = [
         request_state for request_state in pending_requests if _http_bridge_request_counts_against_queue(request_state)

@@ -7,6 +7,7 @@ import math
 import random
 from collections import deque
 from collections.abc import Callable
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, replace
 from typing import Any, Literal, Mapping, cast
 from uuid import uuid4
@@ -88,6 +89,10 @@ from app.modules.proxy._service.http_bridge import helpers as _http_bridge_helpe
 from app.modules.proxy._service.http_bridge.accepted_replay import (
     _claim_websocket_replay_create_gate,
     _http_bridge_accepted_replay_may_exclude_account,
+)
+from app.modules.proxy._service.http_bridge.execution import (
+    release_http_bridge_execution,
+    validate_http_bridge_dispatch_account,
 )
 from app.modules.proxy._service.http_bridge.helpers import (
     _HTTP_BRIDGE_COOLDOWN_SUPPRESSION_ATTR,
@@ -1003,6 +1008,7 @@ class _HTTPBridgeRequestSubmitMixin:
         queue_limit: int,
         recovery_turn_state: str | None = None,
     ) -> None:
+        expected_account_id = session.account.id
         request_scope_id = ensure_request_scope_id()
         owned_unanchored_handoff = session.unanchored_reservation_id == request_scope_id
         try:
@@ -1014,6 +1020,7 @@ class _HTTPBridgeRequestSubmitMixin:
                 request_scope_id=request_scope_id,
                 owned_unanchored_handoff=owned_unanchored_handoff,
                 recovery_turn_state=recovery_turn_state,
+                expected_account_id=expected_account_id,
             )
         finally:
             _release_http_bridge_unanchored_handoff(
@@ -1072,7 +1079,10 @@ class _HTTPBridgeRequestSubmitMixin:
         request_scope_id: str,
         owned_unanchored_handoff: bool,
         recovery_turn_state: str | None = None,
+        expected_account_id: str | None = None,
     ) -> None:
+        if expected_account_id is None:
+            expected_account_id = session.account.id
         clock = clock_for(self)
         # Own admission from submit entry, not from the dispatch registration:
         # a concurrent cooldown-suppressed sibling retires a session no turn
@@ -1790,6 +1800,7 @@ class _HTTPBridgeRequestSubmitMixin:
                 session,
                 request_state=request_state,
                 text_data=text_data,
+                expected_account_id=expected_account_id,
             )
         except BaseException:
             if getattr(session, "unanchored_reservation_id", None) == request_scope_id:
@@ -1872,7 +1883,7 @@ class _HTTPBridgeRequestSubmitMixin:
             await self._acquire_request_state_response_create_admission(
                 request_state,
                 response_create_gate=session.response_create_gate,
-                account_id=session.account.id,
+                account_id=expected_account_id,
                 routing_tunables=routing_tunables,
                 surface="http_bridge",
                 bridge_session=session,
@@ -2199,6 +2210,17 @@ class _HTTPBridgeRequestSubmitMixin:
                                 retry_after_seconds=suppressed_retry_after_seconds,
                             )
                     async with session.pending_lock:
+                        # Detach publishes retirement under this lock while
+                        # retaining its draining owner. Recheck after every
+                        # preparation/persistence await, atomically with
+                        # publication; only the captured handoff may bypass it.
+                        if session.upstream_control.retire_after_drain and not owned_unanchored_handoff:
+                            raise ProxyResponseError(
+                                502,
+                                openai_error("upstream_unavailable", "HTTP responses session bridge is retiring"),
+                                local_pre_dispatch_refusal=True,
+                            )
+                        validate_http_bridge_dispatch_account(session, expected_account_id)
                         session.pending_requests.append(request_state)
                         session.admission_waiter_count = max(0, session.admission_waiter_count - 1)
                         admission_waiter_registered = False
@@ -2428,7 +2450,10 @@ class _HTTPBridgeRequestSubmitMixin:
         *,
         request_state: _WebSocketRequestState,
         text_data: str,
+        expected_account_id: str | None = None,
     ) -> None:
+        if expected_account_id is None:
+            expected_account_id = session.account.id
         clock = clock_for(self)
         settings = _service_get_settings()
         if not session.codex_session or session.prewarmed or request_state.previous_response_id is not None:
@@ -2451,6 +2476,47 @@ class _HTTPBridgeRequestSubmitMixin:
             request_state.prewarm_status = "skipped"
             _record_http_bridge_prewarm_outcome(outcome="skipped")
             return
+        request_deadline = request_state.bridge_request_deadline
+        if request_deadline is None:
+            request_deadline = request_state.started_at + _http_bridge_request_budget_seconds(settings)
+            request_state.bridge_request_deadline = request_deadline
+        try:
+            remaining = request_deadline - clock.monotonic()
+            if remaining <= 0:
+                raise TimeoutError
+            # Every eligible await shares the ordinary request's original
+            # deadline, including settings, lock acquisition and response wait.
+            with scheduler_for(self).fail_after(remaining):
+                await self._prewarm_http_bridge_session_before_deadline(
+                    session,
+                    request_state=request_state,
+                    text_data=text_data,
+                    expected_account_id=expected_account_id,
+                    request_deadline=request_deadline,
+                    prewarm_lock=prewarm_lock,
+                )
+            if clock.monotonic() >= request_deadline:
+                raise TimeoutError
+        except TimeoutError as exc:
+            if clock.monotonic() < request_deadline:
+                raise
+            raise ProxyResponseError(
+                502,
+                openai_error("upstream_request_timeout", "Proxy request budget exhausted"),
+                local_pre_dispatch_refusal=True,
+            ) from exc
+
+    async def _prewarm_http_bridge_session_before_deadline(
+        self: Any,
+        session: "_HTTPBridgeSession",
+        *,
+        request_state: _WebSocketRequestState,
+        text_data: str,
+        expected_account_id: str,
+        request_deadline: float,
+        prewarm_lock: AbstractAsyncContextManager[object],
+    ) -> None:
+        clock = clock_for(self)
         # Build the warm-up outside the lock. It is a pure function of
         # ``text_data``, so the locked body gets the same answer, and this keeps
         # a parse of a possibly large payload off the critical section.
@@ -2505,6 +2571,7 @@ class _HTTPBridgeRequestSubmitMixin:
                 reasoning_effort=request_state.reasoning_effort,
                 api_key_reservation=None,
                 started_at=clock.monotonic(),
+                bridge_request_deadline=request_deadline,
                 thread_affinity_last_touch_at=clock.monotonic(),
                 api_key_reservation_last_touch_at=clock.monotonic(),
                 requested_service_tier=request_state.requested_service_tier,
@@ -2524,7 +2591,7 @@ class _HTTPBridgeRequestSubmitMixin:
                 await self._acquire_request_state_response_create_admission(
                     warmup_state,
                     response_create_gate=session.response_create_gate,
-                    account_id=session.account.id,
+                    account_id=expected_account_id,
                     surface="http_bridge_prewarm",
                     bridge_session=session,
                     dashboard_settings=dashboard_settings,
@@ -2566,6 +2633,19 @@ class _HTTPBridgeRequestSubmitMixin:
                         gate_acquired = False
                         return
                     async with session.pending_lock:
+                        # A handoff authorizes its ordinary turn, never an
+                        # optional warmup on the draining generation. Fence
+                        # retirement atomically with warmup publication.
+                        if session.upstream_control.retire_after_drain:
+                            raise ProxyResponseError(
+                                503,
+                                openai_error(
+                                    "response_execution_session_retired",
+                                    "HTTP bridge retired before prewarm dispatch; retry the request",
+                                ),
+                                local_pre_dispatch_refusal=True,
+                            )
+                        validate_http_bridge_dispatch_account(session, expected_account_id)
                         session.pending_requests.append(warmup_state)
                     request_enqueued = True
                     warmup_send_started = True
@@ -2592,24 +2672,30 @@ class _HTTPBridgeRequestSubmitMixin:
                             # The warmup request has already been sent upstream.  Close/reconnect the
                             # socket while the warmup state is still attached so any late warmup
                             # response cannot be assigned to the next visible request on this session.
-                            await self._reconnect_http_bridge_session(
-                                session,
-                                request_state=request_state,
-                                restart_reader=True,
-                                require_same_account=is_http_bridge_account_neutral_replay(
-                                    kind=session.key.affinity_kind,
-                                    key=session.key.affinity_key,
-                                ),
-                                dashboard_settings=dashboard_settings,
-                            )
+                            async with session.lifecycle_lock:
+                                await self._reconnect_http_bridge_session(
+                                    session,
+                                    request_state=request_state,
+                                    discard_pending_request_state=warmup_state,
+                                    restart_reader=True,
+                                    require_same_account=is_http_bridge_account_neutral_replay(
+                                        kind=session.key.affinity_kind,
+                                        key=session.key.affinity_key,
+                                    ),
+                                    dashboard_settings=dashboard_settings,
+                                )
                         except Exception:
                             session.closed = True
                             raise
                         finally:
+                            release_execution = False
                             async with session.pending_lock:
                                 if warmup_state in session.pending_requests:
                                     session.pending_requests.remove(warmup_state)
+                                    release_execution = True
                             self._cancel_request_state_api_key_reservation_heartbeat(warmup_state)
+                            if release_execution:
+                                release_http_bridge_execution(warmup_state)
                             if gate_acquired:
                                 await _release_websocket_response_create_gate(
                                     warmup_state,
@@ -2644,7 +2730,9 @@ class _HTTPBridgeRequestSubmitMixin:
                     request_enqueued=request_enqueued,
                     counted_in_queue=False,
                 )
-                if is_local_overload_error_code(code):
+                if is_local_overload_error_code(code) or (
+                    exc.local_pre_dispatch_refusal and code == "response_execution_session_retired"
+                ):
                     session.prewarmed = False
                     request_state.prewarm_latency_ms = int(max(0.0, clock.monotonic() - prewarm_started_at) * 1000)
                     request_state.prewarm_status = "skipped"
@@ -2696,15 +2784,22 @@ class _HTTPBridgeRequestSubmitMixin:
         admission_waiter_registered: bool = False,
     ) -> None:
         retire_closed_session = False
+        release_execution = not request_enqueued
         async with session.pending_lock:
             if request_enqueued and request_state in session.pending_requests:
                 session.pending_requests.remove(request_state)
+                release_execution = True
             if counted_in_queue:
                 session.queued_request_count = max(0, session.queued_request_count - 1)
             if admission_waiter_registered or request_state.admission_waiter_preregistered:
                 session.admission_waiter_count = max(0, session.admission_waiter_count - 1)
                 request_state.admission_waiter_preregistered = False
             retire_closed_session = session.closed and session.admission_waiter_count == 0
+        # A published request already popped from pending belongs to its
+        # terminal/reader continuation. Consumer cleanup must not wake the
+        # successor before that owner finishes bookkeeping and fences failures.
+        if release_execution:
+            release_http_bridge_execution(request_state)
         if (
             request_state.recovery_attempt_fingerprint is not None
             and not request_state.recovery_attempt_claimed
@@ -3006,6 +3101,10 @@ class _HTTPBridgeRequestSubmitMixin:
             # completed handler that wins first keeps its local queue reference;
             # a detach that wins first leaves no queue for that handler to claim.
             request_state.event_queue = None
+        if detached:
+            # A popped terminal belongs to its bookkeeping continuation;
+            # downstream cleanup cannot wake its successor before that owner.
+            release_http_bridge_execution(request_state)
         await _release_websocket_response_create_gate(
             request_state, session.response_create_gate, scheduler=scheduler_for(self)
         )
@@ -3633,6 +3732,26 @@ class _HTTPBridgeRequestSubmitMixin:
             model_class=_extract_model_class(session.request_model) if session.request_model else None,
         )
 
+    async def _prepare_http_bridge_reconnect(
+        self: Any,
+        session: "_HTTPBridgeSession",
+        request_state: _WebSocketRequestState,
+        discard_pending_request_state: _WebSocketRequestState | None,
+    ) -> None:
+        async with session.pending_lock:
+            if any(
+                pending is not request_state and pending is not discard_pending_request_state
+                for pending in session.pending_requests
+            ):
+                raise ProxyResponseError(
+                    502,
+                    openai_error(
+                        "stream_incomplete",
+                        "HTTP responses session bridge cannot reconnect while other requests are pending",
+                    ),
+                )
+            request_state.response_create_sent_at = None
+
     async def _retry_http_bridge_request_on_fresh_upstream(
         self: Any,
         session: "_HTTPBridgeSession",
@@ -3868,17 +3987,12 @@ class _HTTPBridgeRequestSubmitMixin:
                 if len(retryable_requests) != 1:
                     return False
                 request_state = retryable_requests[0]
-                # An accepted lifecycle is replayed only when it is the sole
-                # request on the socket (the terminal path's other-pending
-                # guard, ``_websocket_accepted_replay_candidate``). Reconnecting
-                # it would strand every sibling still bound to the dead
-                # upstream, so both fail closed with ``stream_incomplete`` as
-                # they did before accepted replays existed.
-                if (
-                    request_state.response_id is not None
-                    and not request_state.awaiting_response_created
-                    and any(pending_request is not request_state for pending_request in session.pending_requests)
-                ):
+                # Reconnecting replaces the physical socket for every pending
+                # request, including accepted and draining siblings that are
+                # not themselves retryable. Leave shared-socket failures to
+                # the reader's whole-deque settlement rather than stranding
+                # their old response ids on a replacement connection.
+                if any(pending_request is not request_state for pending_request in session.pending_requests):
                     return False
             # A request that already saw response.created released the session
             # create gate. Its replay must hold the gate again before it can

@@ -53,14 +53,18 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from types import AsyncGeneratorType
 
+import anyio
 from fastapi.responses import StreamingResponse
 from starlette.types import Message, Receive, Scope, Send
 
+from app.core.clock import REAL_SCHEDULER, Scheduler
 from app.core.http_protocol import HTTP_DISCONNECTED_STATE
 from app.core.metrics.prometheus import PROMETHEUS_AVAILABLE, stream_terminal_delivery_total
 from app.core.utils.request_id import get_request_id
+from app.core.utils.shared_future import _await_cleanup_deferring_cancellation
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +152,8 @@ class DeliveryTracedStreamingResponse(StreamingResponse):
         surface: str,
         media_type: str = "text/event-stream",
         headers: Mapping[str, str] | None = None,
+        on_close: Callable[[], Awaitable[None]] | None = None,
+        scheduler: Scheduler = REAL_SCHEDULER,
     ) -> None:
         super().__init__(content, media_type=media_type, headers=headers)
         self.surface = surface
@@ -162,6 +168,8 @@ class DeliveryTracedStreamingResponse(StreamingResponse):
         self._terminal_type: str | None = None
         self._terminal_dropped = False
         self._final_sent = False
+        self._on_close = on_close
+        self._scheduler = scheduler
 
     def _observe_body(self, body: bytes) -> bool:
         """Account a body chunk handed to the writer; return whether it completed the terminal block."""
@@ -220,7 +228,35 @@ class DeliveryTracedStreamingResponse(StreamingResponse):
             exc_name = type(exc).__name__
             raise
         finally:
-            self._finish(exc_name=exc_name, cancelled=cancelled)
+            # Exhausted async generators have already run their finalizers.
+            # Keep ordinary delivery without an explicit owner task-free.
+            cleanup_cancellation = None
+            if self._on_close is not None or not (
+                isinstance(self.body_iterator, AsyncGeneratorType) and self.body_iterator.ag_frame is None
+            ):
+                cleanup_cancellation = await _await_cleanup_deferring_cancellation(
+                    self._close_body_and_owner(), scheduler=self._scheduler
+                )
+            self._finish(exc_name=exc_name, cancelled=cancelled or cleanup_cancellation is not None)
+            if cleanup_cancellation is not None and exc_name is None and not cancelled:
+                raise cleanup_cancellation
+
+    async def _close_body_and_owner(self) -> None:
+        # Starlette does not close body_iterator when the writer stops at a
+        # yielded chunk. The explicit owner also covers response.start failing
+        # before an async generator has entered its own try/finally.
+        with anyio.CancelScope(shield=True):
+            close_body = getattr(self.body_iterator, "aclose", None)
+            if close_body is not None:
+                try:
+                    await close_body()
+                except (Exception, asyncio.CancelledError):
+                    logger.warning("Failed to close Responses delivery body", exc_info=True)
+            if self._on_close is not None:
+                try:
+                    await self._on_close()
+                except (Exception, asyncio.CancelledError):
+                    logger.warning("Failed to close Responses delivery owner", exc_info=True)
 
     def _classify(self, *, exc_name: str | None, cancelled: bool) -> str:
         if self._terminal_type is not None:

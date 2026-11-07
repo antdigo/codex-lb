@@ -3,7 +3,9 @@
 ## Purpose
 
 Define Responses API compatibility contracts so Codex, OpenCode, and OpenAI-style clients preserve expected behavior.
+
 ## Requirements
+
 ### Requirement: Use prompt_cache_key as OpenAI cache affinity
 For OpenAI-style `/v1/responses`, `/v1/responses/compact`, and chat-completions requests mapped onto Responses, the service MUST treat a non-empty `prompt_cache_key` as the bounded upstream account affinity key for prompt-cache correctness even when a `session_id` header is present. OpenAI-style route wiring MUST NOT upgrade those requests to durable `CODEX_SESSION` affinity by default. This affinity MUST apply even when dashboard `sticky_threads_enabled` is disabled, the service MUST continue forwarding the same `prompt_cache_key` upstream unchanged, and the stored affinity MUST expire after the configured freshness window so older keys can rebalance. The freshness window MUST come from dashboard settings so operators can adjust it without restart.
 
@@ -10896,3 +10898,488 @@ SDK parser failure.
 - **WHEN** the bridge settles the turn
 - **THEN** it emits one terminal `response.failed` event
 - **AND** that terminal event includes a stable `response.id`
+
+### Requirement: Automatic bridge socket replay preserves every pending owner
+
+When an HTTP bridge transport ends while several requests remain pending, automatic pre-created replay MUST NOT replace the shared socket for only one request. This restriction MUST include siblings that already received `response.created` and siblings detached from their downstream consumer but still draining until a terminal event. Refusal MUST occur before replay state mutation, create-gate reclamation, or a replacement send. The reader failure funnel MUST terminally settle every request that remains owned by the failed socket exactly once. A sole eligible pending request MUST retain the existing bounded replay behavior.
+
+Every bridge reconnect entry MUST also reject replacement before account selection or connection mutation when a different request remains pending. A prewarm timeout MAY explicitly discard its own identified warmup request during replacement, but MUST NOT discard any other pending owner.
+
+The prewarm timeout's reconnect MUST serialize its ownership check and replacement against submissions through the session lifecycle lock. A submitter that already owns that lock MUST finish publishing its pending request before the prewarm reconnect evaluates ownership. The reconnect MUST NOT overtake such a submitter between its closed-session check and pending publication.
+
+#### Scenario: Pre-created retry has an accepted sibling
+
+- **GIVEN** an HTTP bridge has an accepted pending response and one retryable request awaiting `response.created`
+- **WHEN** the upstream transport ends
+- **THEN** the bridge does not reconnect and resend the pre-created request alone
+- **AND** both requests receive the existing terminal stream failure and are settled exactly once
+
+#### Scenario: Pre-created retry has a draining sibling
+
+- **GIVEN** an HTTP bridge has one retryable pre-created request and another pending request draining after downstream cancellation
+- **WHEN** the upstream transport ends
+- **THEN** the bridge refuses to replace the shared socket for the pre-created request alone
+- **AND** the draining request is finalized with the other pending request
+
+#### Scenario: Sole pre-created request retains bounded recovery
+
+- **GIVEN** a failed HTTP bridge socket has exactly one eligible pending request
+- **WHEN** its existing replay policy permits recovery
+- **THEN** the bridge may reconnect and resend it within the existing replay bound
+
+#### Scenario: Unsubmitted recovery cannot replace another response's socket
+
+- **GIVEN** an unsubmitted request attempts fresh-upstream recovery while another response remains pending
+- **WHEN** it reaches bridge reconnect
+- **THEN** reconnect fails before account selection or opening another socket
+- **AND** the other response is not migrated to a socket on which it was never sent
+
+#### Scenario: Prewarm timeout has another accepted owner
+
+- **GIVEN** a warmup and another accepted response remain pending on a bridge
+- **WHEN** the warmup times out
+- **THEN** the bridge does not replace the other response's socket for the warmup
+
+#### Scenario: Plain submission is already inside the lifecycle lock
+
+- **GIVEN** a plain submitter owns the lifecycle lock but has not yet published its pending request
+- **WHEN** a prewarm timeout starts recovery
+- **THEN** prewarm recovery waits for the submitter's lifecycle section to finish
+- **AND** it observes the published pending owner and refuses to replace its socket
+
+### Requirement: Output-free accepted public streams recover owned terminal items
+
+When public HTTP Responses normalization has emitted a valid `response.created` envelope but no response output events, and receives a `response.completed` or `response.incomplete` envelope with the same response id and nonempty output, it MUST expose the terminal output through complete output-item and content/tool-argument lifecycle events before the terminal event. It MUST emit each terminal output item exactly once, retain exactly one `response.created`, and use strictly increasing sequence numbers for the recovered lifecycle and terminal after the accepted prelude. It MUST NOT synthesize that complete output lifecycle for a different terminal response id, duplicate previously emitted output, or change native Codex passthrough behavior.
+
+#### Scenario: Creation and metadata precede terminal-only output
+
+- **GIVEN** a public stream emits creation, in-progress, and metadata for response A, with no output events
+- **WHEN** a completed terminal for A contains reasoning, message text, and function-call arguments
+- **THEN** each item is opened before its content and closed before completion
+- **AND** streaming consumers receive message text and function-call arguments once within A's sole lifecycle
+
+#### Scenario: Partial output suppresses full terminal replay
+
+- **GIVEN** the accepted stream already emitted any output event, including a function-argument or reasoning delta
+- **WHEN** its terminal envelope includes the full output
+- **THEN** the service does not synthesize the full output lifecycle again
+
+#### Scenario: Different terminal owner is not recovered
+
+- **GIVEN** a stream accepted response A without output
+- **WHEN** a terminal envelope names response B
+- **THEN** the service does not synthesize B's output-item lifecycle into A
+
+#### Scenario: Native streams preserve upstream events
+
+- **GIVEN** native Codex passthrough disables the public SDK contract
+- **WHEN** an output-free accepted stream receives a full terminal response
+- **THEN** the stream does not gain synthesized item or argument events
+
+#### Scenario: Duplicate terminal and late output do not replay a finished response
+
+- **GIVEN** a public stream has emitted its terminal response and recovered its owned items
+- **WHEN** another completed or incomplete event or a late output event arrives
+- **THEN** the public stream exposes only the first terminal response
+- **AND** no additional output item, text, or tool-argument event is emitted after that terminal
+
+### Requirement: Several created responses cannot claim anonymous output by visibility
+
+When a shared upstream socket has more than one pending request with a response id, a nonterminal anonymous `response.*` output event MUST remain unattributed. The matcher MUST NOT resolve this ambiguity by selecting a visible request, a draining request, or a sibling still waiting for `response.created`. HTTP bridge processing MUST deliver the event to no request queue and MUST retain its existing unmatched-liveness diagnostic. Explicit response ids, single-created-owner routing, anonymous terminal/error matching, and vendor telemetry matching MUST retain their existing behavior.
+
+#### Scenario: One accepted response is draining
+
+- **GIVEN** two accepted responses share a socket and one is draining after downstream cancellation
+- **WHEN** an anonymous output event arrives
+- **THEN** neither request is attributed that event
+- **AND** the visible consumer receives no ambiguous content
+
+#### Scenario: Both accepted responses are draining
+
+- **GIVEN** two accepted responses share a socket and both are draining
+- **WHEN** an anonymous output event arrives
+- **THEN** neither draining request receives event accounting or archive ownership
+
+#### Scenario: A pre-created sibling waits behind two accepted responses
+
+- **GIVEN** two accepted responses and one request awaiting its own creation share a socket
+- **WHEN** an anonymous output event arrives
+- **THEN** the pre-created request receives no content and no request is attributed the event
+
+### Requirement: Bridge reuse rechecks retirement after lease refresh
+
+When the canonical session-key registry reuse branch awaits durable lease refresh for its existing candidate, it MUST recheck retirement before returning the session to a request that does not own a reserved unanchored handoff. If the session became retiring during refresh, lookup MUST use its existing replacement selection and ownership rules instead of handing that session to the unsubmitted request. Replacement MUST preserve client-supplied `previous_response_id`, original input, API-key scope, file/account pins, and hard-owner restrictions. It MUST NOT replay an already dispatched request or migrate pending siblings to a new socket.
+
+An existing reserved unanchored handoff MUST retain its existing authority to submit on its detached generation. The final pre-dispatch retirement fence MUST remain in force for retirement that begins after lookup returns.
+
+#### Scenario: An older response detaches during refresh
+
+- **GIVEN** a public Responses request is reusing a soft prompt-cache bridge
+- **AND** an older accepted response detaches while lookup awaits durable refresh
+- **WHEN** refresh returns with the bridge marked retiring
+- **THEN** lookup selects a replacement through its normal ownership path
+- **AND** the new request is sent exactly once on the replacement and never on the retiring socket
+
+#### Scenario: Client anchor remains pinned during replacement
+
+- **GIVEN** the incoming request supplies a previous response id owned by an account
+- **WHEN** its candidate bridge becomes retiring during refresh
+- **THEN** replacement preserves that previous response id and requires its owner account
+- **AND** an unavailable required owner fails closed rather than switching accounts or dropping the anchor
+
+#### Scenario: Reserved unanchored handoff retains its lane
+
+- **GIVEN** the lookup reserved an unanchored handoff on a bridge
+- **WHEN** refresh observes that its predecessor is retiring
+- **THEN** lookup preserves that handoff's existing authority and does not silently move the reserved request to another generation
+
+#### Scenario: A visible sibling still owns the retiring socket
+
+- **GIVEN** another accepted visible response remains pending when an older request detaches during refresh
+- **WHEN** lookup replaces the retiring session for an unsubmitted request
+- **THEN** the sibling retains its pending ownership and physical socket without an injected terminal failure
+- **AND** the detached predecessor drains through its existing lifecycle instead of being forcibly closed by replacement
+
+### Requirement: Idle unanchored prompt-cache physical WebSocket lifetime
+For an original self-contained full-resend HTTP request in the canonical soft prompt-cache registry lookup, the proxy MUST rotate a physical upstream socket aged at least 3000 monotonic seconds before submitting that request only when the original and prepared request have no previous-response/conversation/turn/session continuity, the session is not a Codex continuity session, and its complete original message/function-call/function-output/encrypted-reasoning items contain no reference-only or unknown opaque shapes. Every function-call ID MUST have exactly one subsequent full function output; duplicate calls, duplicate outputs, orphan outputs and pending calls MUST make the request ineligible. The proof MUST NOT depend on a durable row or previous input fingerprint: unanchored Responses input defines the new context, while a soft prompt-cache key is only a cache hint.
+The proxy MUST retain original input content, order, tool call IDs, ciphertext and prompt_cache_key, require the old account for replacement, and preserve the original reservation and deadline with one upstream dispatch. The proxy MUST NOT lose that owner restriction through outer HTTP fallback or any subsequent reconnect or reroute. A later recovery that cannot preserve the owner MUST fail closed before another send.
+The age branch MUST NOT detach a generation with any literal pending/draining request, queued or admission owner, reservation, handoff, resource close owner, or reader currently processing/persisting a frame. Uncertain lock acquisition MUST skip rotation. Physical opening time MUST reset on a successful replacement and MUST NOT reset on reuse or durable refresh.
+Forwarded requests, Responses-Lite requests, recovery-key paths and opaque encrypted function arguments MUST remain ineligible. The age policy MUST NOT construct or send a projected history.
+This requirement does not add transparent retry after accepted model output and does not cover a busy bridge or raw downstream WebSocket.
+
+#### Scenario: Hour-old idle bridge receives a fresh complete history
+- GIVEN a soft prompt-cache socket opened 3593.4 seconds ago, idle TTL 3600 and no owners
+- WHEN a complete original unanchored HTTP request arrives
+- THEN the old socket receives no new create, a same-account replacement receives exactly one create with unchanged context/PCK, and the response completes.
+#### Scenario: Old reader persists a popped terminal
+- GIVEN an aged socket with an empty pending deque while its reader persists a terminal
+- WHEN another eligible lookup runs
+- THEN age rotation does not close or cancel that reader.
+
+#### Scenario: Complete cancelled function output
+- GIVEN a full original history contains a function_call_output with a nonempty call_id, full string output, and native status incomplete
+- WHEN the other age and ownership guards pass
+- THEN the proxy MUST accept that complete output for rotation and preserve its status and content verbatim.
+- AND incomplete function calls, reference-only reasoning and unknown opaque item shapes MUST remain ineligible.
+
+#### Scenario: Required replacement owner cannot open a socket
+- GIVEN the age policy detached an eligible socket and retained its account as required
+- WHEN that account is unavailable, selection returns another account, or its replacement handshake fails
+- THEN the proxy MUST fail without sending the request on another account or replaying it through an unpinned raw HTTP fallback.
+
+#### Scenario: No durable or historical prefix record
+- GIVEN a canonical soft-PCK non-Codex socket and a complete unanchored original input with uniquely paired function calls and outputs
+- WHEN no durable row or prior input fingerprint is available and all age/ownership guards pass
+- THEN the proxy MUST permit same-account rotation without rewriting the input.
+
+#### Scenario: Predecessor close holds the only registry slot
+- GIVEN an eligible aged socket occupies the only available registry slot and its close is delayed
+- WHEN the age policy plans its replacement
+- THEN the proxy MUST account for that predecessor as a planned synchronous close, await bounded cleanup outside registry locks, and admit the replacement only after capacity is available.
+- AND the age policy MUST NOT evict unrelated idle sessions merely because its own predecessor close is pending.
+
+#### Scenario: Capacity refusal after opening the replacement
+- GIVEN same-account age replacement succeeded but its first submission is refused by account response-create capacity
+- WHEN a different account is selectable
+- THEN the proxy MUST retain the required owner or fail closed without dispatching the original input to that other account.
+
+#### Scenario: Owner lookup fails after age detachment
+- GIVEN the age policy detached an unowned predecessor and has not reached its planned-close loop
+- WHEN an owner/ring lookup fails or the request is cancelled
+- THEN an independently owned cleanup task MUST close the predecessor exactly once and release its detached capacity entry without closing unrelated sessions.
+
+### Requirement: HTTP bridge execution waits are isolated from active responses
+
+An HTTP bridge MUST execute at most one response at a time on its upstream socket.
+An ordinary subsequent create MUST wait locally within the existing queue limits,
+the pre-response silence budget and the original request deadline. Its execution
+wait MUST NOT consume the short session/global create-admission budget. Wait timeout
+or cancellation MUST affect only the waiting request without upstream send/replay,
+reader cancellation, sibling failure, continuity changes or account penalty.
+Separate sockets MUST retain independent concurrency.
+
+#### Scenario: a healthy predecessor outlives create admission
+- **GIVEN** an ordinary waiter has an original deadline of 100 seconds and create admission is ten seconds
+- **WHEN** the active sibling finishes after 25 seconds
+- **THEN** the waiter MUST still acquire execution and may dispatch once on that same socket
+- **AND** the active sibling MUST complete normally without a replacement socket
+
+#### Scenario: create admission starts after execution ownership
+- **GIVEN** execution waiting consumes six seconds and the original deadline is 100 seconds
+- **WHEN** session/global create admission remains unavailable
+- **THEN** its shared ten-second deadline MUST start when execution is acquired
+- **AND** no create stage may restart that deadline
+
+#### Scenario: retained request deadline still bounds all waits
+- **GIVEN** a retry state retains an earlier absolute request deadline
+- **WHEN** execution or create admission exhausts the remaining time
+- **THEN** it MUST fail locally without extending that deadline or disturbing the executing sibling
+
+#### Scenario: preparatory account waits cannot extend create admission
+- **GIVEN** the original request deadline is ten seconds, retry started_at was reset and execution ownership is acquired at six seconds
+- **WHEN** settings refresh or account lease acquisition remains blocked
+- **THEN** create admission MUST stop at the retained deadline and cancel its preparatory wait
+- **AND** cleanup MUST release only the request's acquired resources
+
+#### Scenario: preparatory work consumes the same create budget
+- **GIVEN** execution is acquired at six seconds and settings refresh completes at nine seconds
+- **WHEN** the retained request deadline is ten seconds and session or global admission is still occupied
+- **THEN** that admission MUST receive only the remaining one second
+- **AND** timeout or external cancellation MUST release the account lease exactly once without releasing another request's gate
+
+#### Scenario: optional prewarm keeps short admission
+- **WHEN** optional prewarm waits for an occupied execution owner
+- **THEN** it MUST retain the short admission wait and existing cleanup semantics
+
+#### Scenario: Optional prewarm execution timeout skips warmup
+- **GIVEN** a healthy accepted owner remains active after optional prewarm exhausts its short execution wait
+- **WHEN** the ordinary request still has its original request budget
+- **THEN** prewarm MUST be skipped and the ordinary request MUST enter its own bounded execution wait
+- **AND** the active owner keeps its permit and no warmup create is sent
+
+#### Scenario: waiter cancellation and retirement preserve isolation
+- **WHEN** a waiting request is cancelled or its owner generation is retired
+- **THEN** it MUST retain the existing bounded cleanup, settlement and retirement fences
+
+#### Scenario: a waiting request times out while its sibling streams
+- **GIVEN** A is accepted and streaming tool arguments on an HTTP bridge
+- **WHEN** B on the same bridge exhausts its bounded execution wait
+- **THEN** B receives an explicit local wait error without an upstream create
+- **AND** A continues to response.completed on the same socket and account
+- **AND** the next request can reuse that socket with its cache key unchanged
+
+#### Scenario: a waiting request is cancelled
+- **GIVEN** A owns execution and B waits locally
+- **WHEN** B is cancelled
+- **THEN** A retains its execution permit, stream and upstream reader
+- **AND** B releases its queue registration and API-key reservation exactly once
+
+### Requirement: HTTP bridge execution ownership survives recovery and cleanup
+
+Execution ownership MUST remain with its request through safe same-session
+recovery. Terminal processing, pre-dispatch failure, cancellation, prewarm timeout
+and reader failure MUST release only their own ownership. Admission MUST be fenced
+before a failed owner wakes a queued successor. Late events MUST NOT target unsent
+waiters. The original request deadline MUST remain the outer bound across execution
+waiting, session/global create admission and recovery.
+
+#### Scenario: global admission cannot extend the retained request deadline
+- **GIVEN** the original deadline is ten seconds and execution waits six seconds
+- **WHEN** the global controller stays occupied for the remaining four seconds
+- **THEN** admission MUST fail at the original request deadline with existing permits released
+
+#### Scenario: the executing request terminates or recovers
+- **WHEN** an owner completes, fails, or performs eligible pre-response recovery
+- **THEN** completion and failure release ownership through their existing cleanup
+- **AND** recovery retains exclusive ownership until that attempt terminates
+- **AND** a queued successor never dispatches onto a retired generation
+
+#### Scenario: prewarm and ordinary requests share execution admission
+- **WHEN** a prewarm executes or times out before an ordinary request
+- **THEN** both paths respect one execution owner and release ownership on cleanup
+- **AND** a successful ordinary request is not blocked by a leaked prewarm permit
+
+#### Scenario: downstream cleanup meets terminal bookkeeping ownership
+- **GIVEN** a terminal continuation has removed A from pending ownership
+- **WHEN** downstream cleanup detaches A while terminal bookkeeping is still running
+- **THEN** B MUST remain blocked until the terminal continuation releases execution
+- **AND** a bookkeeping abort MUST fence the generation before B is awakened
+
+#### Scenario: global admission cannot restart the wait budget
+- **GIVEN** an original HTTP request deadline is ten seconds and execution waits six seconds
+- **WHEN** the global create controller remains occupied beyond the remaining four seconds
+- **THEN** admission MUST fail at the original deadline without dispatching the waiter
+- **AND** existing create/account permits MUST be released through bounded cleanup
+
+### Requirement: HTTP execution admission is independent from create admission
+
+Execution admission MUST NOT change account-create or response-created admission:
+those permits MUST retain their acceptance-time release semantics. Execution state
+MUST be bounded by the existing bridge and queue limits. Direct downstream WebSocket
+behavior MUST remain unchanged.
+
+#### Scenario: response acceptance releases create admission only
+- **WHEN** an HTTP bridge receives response.created for its executing request
+- **THEN** account-create and response-created admission are released
+- **AND** execution remains owned until terminal processing or fenced cleanup
+
+### Requirement: Public stream normalization fences explicit foreign response owners
+A public stream that accepted response A MUST reject an explicit envelope for a
+different response before output backfill, synthetic rendering or forwarding.
+It MUST emit an explicit terminal failure for A without foreign output or replay.
+Native passthrough MUST retain its existing wire behavior.
+
+#### Scenario: Foreign terminal after acceptance
+- **GIVEN** response.created accepted A
+- **WHEN** completed, incomplete or failed names B
+- **THEN** no B text, items, arguments or successful terminal reaches the public consumer
+- **AND** A receives an explicit terminal failure
+
+#### Scenario: Locally generated failures preserve their cause after acceptance
+- **GIVEN** a public stream accepted A and its in-process error wrapper catches a failure without an explicit response owner
+- **WHEN** the wrapper generates a terminal failure
+- **THEN** it MUST terminate A with the original error code, message, param and retry hint
+- **AND** native transport-failure behavior MUST remain unchanged
+- **AND** upstream JSON MUST NOT forge the in-process provenance of that failure
+
+#### Scenario: Generated errors retain provenance through classic and retry layers
+- **WHEN** classic core, service, retry or public normalization synthesizes a failure after acceptance
+- **THEN** serialization MUST preserve trusted in-process provenance of locally added response IDs
+- **AND** local IDs MUST NOT replace the accepted upstream owner in settlement or owner caches
+- **AND** true foreign response IDs MUST NOT overwrite those caches before public rejection
+
+#### Scenario: Public rejection or disconnect closes the owned service iterator
+- **GIVEN** a public account stream passed through its startup probe and rendering wrappers
+- **WHEN** ownership rejection, client disconnect or normal completion ends delivery
+- **THEN** teardown MUST deterministically close the owned service iterator and settle its resources
+- **AND** this MUST hold for an immediate first item and an outstanding startup probe, without relying on garbage collection
+- **AND** active keepalive reads MUST be cancelled and joined before their child iterators are closed
+
+#### Scenario: ASGI writer fails before or during streaming
+- **WHEN** ASGI delivery is disconnected or cancelled during headers, a response event or a keepalive write
+- **THEN** the response lifecycle MUST cancel and join outstanding startup and keepalive reads and close its owned service iterator
+- **AND** cleanup MUST run even when the body generator never started, settle owned resources once and preserve the original delivery outcome and exception
+
+#### Scenario: Classic service teardown closes its owned core iterator
+- **GIVEN** classic streaming entered an owned upstream HTTP response or ephemeral transport context
+- **WHEN** headers or a response-event write disconnects the client and API cleanup closes the service iterator
+- **THEN** the service MUST also close its owned core iterator and upstream context before cleanup returns
+- **AND** closure MUST preserve original terminal/usage outcomes and MUST NOT close a reusable sibling transport
+
+#### Scenario: Exceptions after an accepted terminal preserve its settlement
+- **GIVEN** an owned terminal was accepted with its usage and outcome
+- **WHEN** continued iteration or transport context cleanup raises an exception
+- **THEN** the accepted outcome, usage and request log MUST remain authoritative
+- **AND** pre-terminal failures and intentional terminal failure control flow MUST retain their existing behavior
+
+### Requirement: Public output lifecycle recovery handles owned snapshots consistently
+A public first terminal with owned nonempty output MUST receive complete item and
+content/tool lifecycles when no visible output was replayed. This MUST hold with
+no prelude and with short or oversized discarded indexed preludes. Already
+replayed legacy unindexed visible output MUST NOT be duplicated.
+Owned terminal output items absent from an already streamed indexed lifecycle
+MUST receive their missing lifecycle without replaying existing item content.
+
+#### Scenario: Terminal contains tools after absent or discarded indexed prelude
+- **WHEN** first completed or incomplete contains reasoning, message and function call after zero, one or sixty-five orphan indexed events
+- **THEN** output items open before content/arguments and close before the terminal, with one created envelope
+- **AND** consumers receive message/arguments once and no orphan output
+
+#### Scenario: Terminal adds a message after an already streamed reasoning item
+- **GIVEN** created A and an indexed reasoning item were accepted with their lifecycle
+- **WHEN** A terminates with that reasoning item and a new message, refusal or tool item
+- **THEN** new item/content/arguments lifecycles MUST open before deltas and close before the terminal
+- **AND** existing reasoning, message and tool content MUST NOT be replayed
+- **AND** the actual OpenAI SDK stream consumer MUST accept the complete sequence
+
+#### Scenario: Terminal fills an already opened message
+- **GIVEN** an indexed message was opened with empty content or fewer content parts
+- **WHEN** its owned terminal contains previously absent text or refusal parts
+- **THEN** missing content-part openings MUST precede synthetic deltas and their done events
+- **AND** already visible text or tool arguments MUST NOT be replayed
+
+#### Scenario: Owned item-done snapshot precedes the terminal
+- **WHEN** an owned indexed output_item.done supplies message parts or tool arguments before any matching opening or delta events
+- **THEN** missing item/content/argument lifecycles MUST precede that original done event
+- **AND** that done event MUST be forwarded once and later terminal recovery MUST NOT duplicate its visible content
+
+#### Scenario: Legacy reasoning lacks an output index
+- **GIVEN** owned reasoning summary events have no output index before or after response creation
+- **WHEN** an owned terminal supplies that reasoning and a previously absent message or tool
+- **THEN** missing indexed item/content/argument openings MUST still be repaired for the SDK consumer
+- **AND** previously visible reasoning MUST NOT be replayed or emitted as assistant text
+
+### Requirement: Public item openings respect authoritative output positions
+Public item/content/argument lifecycles MUST NOT reach the SDK at a sparse output
+index before preceding item slots are available. Missing slots MUST come from
+upstream announcements or owned snapshots; the gateway MUST NOT invent placeholder
+items. Deferred output MUST preserve item IDs, original output/content indexes,
+content and argument order within each item, and monotonic public sequence numbers.
+Native passthrough MUST bypass this ordering state.
+
+#### Scenario: Sparse owned item-done precedes the terminal
+- **GIVEN** created A followed by an owned message or tool snapshot at index 1 without an index-0 opening
+- **WHEN** A terminates with authoritative items 0 and 1
+- **THEN** item 0 MUST open before item-1 content or argument events are emitted
+- **AND** account and model-source SDK consumers MUST reach the final response with call IDs, ciphertext and visible content preserved once
+
+#### Scenario: Earlier item arrives while later output is deferred
+- **WHEN** upstream fills the missing earlier opening before the terminal
+- **THEN** eligible deferred output MUST resume without waiting for the whole response
+- **AND** valid interleaved streams whose preceding items already opened MUST continue immediately
+
+#### Scenario: Deferred output is bounded and cleanup-safe
+- **WHEN** a public stream needs to defer sparse output
+- **THEN** it MUST retain at most 64 events and 16 MiB of serialized UTF-8 SSE data, without concatenating delta text or retaining an unbounded text buffer
+- **AND** overflow or an unresolvable successful terminal MUST produce an explicit failure for the accepted owner
+- **AND** an upstream failure MUST retain its original cause, while pending output is discarded
+- **AND** cancellation or completion MUST free deferred state and close the owned input without a background drain task
+
+### Requirement: Legacy text synthesis excludes reasoning content
+Legacy text synthesis MUST emit assistant text only from message output, without
+flattening reasoning into text. Reasoning fields and encrypted content MUST be
+preserved in their original response fields.
+
+#### Scenario: Partial reasoning precedes terminal
+- **GIVEN** accepted reasoning output suppresses full terminal replay
+- **WHEN** terminal reasoning has textual content and ciphertext
+- **THEN** neither reasoning text nor ciphertext is emitted as assistant text
+- **AND** terminal reasoning remains intact
+
+### Requirement: Classic transport ID normalization uses effective Lite capability
+Untrusted or stale metadata-only Lite markers MUST NOT disable subscription
+inline-ID normalization on classic HTTP or compact egress after the marker is
+removed. Trusted incremental WebSocket/forwarded continuity and effective Lite
+tools MUST preserve their existing identity and ciphertext contracts.
+
+#### Scenario: Metadata-only Lite marker reaches classic transport
+- **GIVEN** complete inline message or function call and a Lite marker without recognized Lite tools or trusted continuity
+- **WHEN** classic HTTP or compact serializes the request
+- **THEN** persisted lookup item IDs are removed while call IDs and content remain unchanged
+- **AND** no unsupported Lite marker is forwarded
+
+### Requirement: HTTP bridge publication fences retirement atomically
+A subsequent ordinary request MUST recheck retirement under the same pending
+lock as its queue publication, with no intervening suspension. A draining owner
+MUST retain its identity until fenced settlement and receive no overlapping ordinary send.
+Existing cancellation-only retirement MAY close and settle that generation once
+no visible demand remains; it MUST NOT leak permits or reservations.
+An explicitly authorized detached unanchored handoff MUST retain its exception.
+
+#### Scenario: Owner detaches during request preparation
+- **GIVEN** B passed the early retirement check and suspended before admission
+- **WHEN** A detaches, marks its generation retiring and frees execution while draining
+- **THEN** B is refused before pending publication or upstream send
+- **AND** B releases its own permits and reservation without disturbing A
+
+#### Scenario: Optional prewarm meets a retiring generation
+- **GIVEN** prewarm suspended during settings or preparation and an accepted owner detached meanwhile
+- **WHEN** prewarm reaches pending publication on that retiring generation
+- **THEN** no generate:false frame is sent and its own permits are released
+- **AND** skipping optional prewarm MUST NOT revoke a captured authorized ordinary handoff
+
+#### Scenario: Failed prewarm already belongs to terminal finalization
+- **GIVEN** terminal processing claimed a prewarm request and published its failure before finishing lease cleanup and retirement
+- **WHEN** the prewarm consumer handles that failure or its deadline/cancellation
+- **THEN** consumer cleanup MUST NOT release execution owned by terminal processing
+- **AND** subsequent ordinary input MUST wait until that finalization publishes its retirement fence
+
+### Requirement: Queued HTTP bridge requests retain their original account binding
+An HTTP submit MUST capture its expected bridge account before its first await.
+After execution waiting and atomically at ordinary or prewarm publication, a
+changed account MUST cause an explicit local refusal before another create lease
+or upstream send. Same-account reconnect MUST remain permitted. Refusal MUST
+release only the waiting request's resources and preserve the active owner's
+recovery. Input, file ownership, ciphertext and installation metadata MUST NOT be
+silently reprojected onto the replacement account.
+
+#### Scenario: Accepted owner recovers on another account while a request waits
+- **GIVEN** A owns execution and B is queued outside pending publication
+- **WHEN** safe recovery of A changes the bridge account before B is admitted
+- **THEN** B is refused locally with no stale-account lease or upstream create
+- **AND** this applies to pinned-file and account-neutral B without interrupting A
+
+#### Scenario: Preparation and optional prewarm observe an account replacement
+- **WHEN** the bridge account changes during image preparation or optional warmup settings retrieval
+- **THEN** neither ordinary nor warmup input is sent with the captured account's stale identity
+- **AND** same-account replacement sockets remain eligible

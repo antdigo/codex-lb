@@ -7,7 +7,7 @@ from datetime import timedelta
 from typing import Any
 
 from app.core.clients.proxy import ProxyResponseError
-from app.core.clock import scheduler_for
+from app.core.clock import clock_for, scheduler_for
 from app.core.config.dashboard_overrides import effective_settings
 from app.core.errors import openai_error
 from app.core.metrics.prometheus import (
@@ -29,6 +29,7 @@ from app.modules.proxy._service.http_bridge.helpers import (
     _http_bridge_owner_lookup_unavailable_error_envelope,
     _http_bridge_previous_response_alias_key,
     _http_bridge_request_budget_seconds,
+    _http_bridge_session_has_admission_waiter,
     _http_bridge_turn_state_alias_key,
     _is_missing_durable_bridge_table_error,
     _log_http_bridge_event,
@@ -84,6 +85,42 @@ def _requires_durable_recovery_alias_serialization(session: _HTTPBridgeSession) 
 
 
 class _HTTPBridgeSessionRegistryMixin:
+    def _prune_http_bridge_sessions_locked(self: _HTTPBridgeServiceProtocol) -> list[_HTTPBridgeSession]:
+        now = clock_for(self).monotonic()
+        stale_keys: list[_HTTPBridgeSessionKey] = []
+        for key, session in self._http_bridge_sessions.items():
+            if _http_bridge_session_has_admission_waiter(session):
+                continue
+            if session.handoff_in_progress:
+                continue
+            if session.closed:
+                stale_keys.append(key)
+                continue
+            if getattr(session, "unanchored_reservation_id", None) is not None:
+                continue
+            pending_count = self._http_bridge_pending_count_nowait(session, context="idle_prune")
+            if pending_count is None:
+                continue
+            if pending_count:
+                continue
+            if now - session.last_used_at < session.idle_ttl_seconds:
+                continue
+            stale_keys.append(key)
+        sessions_to_close: list[_HTTPBridgeSession] = []
+        for key in stale_keys:
+            session = self._detach_http_bridge_session_locked(key)
+            if session is not None:
+                _log_http_bridge_event(
+                    "evict_idle",
+                    key,
+                    account_id=session.account.id,
+                    model=session.request_model,
+                    cache_key_family=key.affinity_kind,
+                    model_class=_extract_model_class(session.request_model) if session.request_model else None,
+                )
+                sessions_to_close.append(session)
+        return sessions_to_close
+
     async def prune_idle_http_bridge_sessions(self: Any) -> int:
         """Run the idle sweep off the request path (issue #1354).
 

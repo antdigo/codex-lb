@@ -213,6 +213,19 @@ def sse_block_with_payload(event_block: str, payload: dict[str, JsonValue] | Non
     )
 
 
+def reformat_sse_event(event_block: str, payload: dict[str, JsonValue]) -> str:
+    """Reframe a transformed payload without dropping its carrier provenance."""
+    formatted = format_sse_event(payload)
+    if not isinstance(event_block, ParsedSseBlock):
+        return formatted
+    return ParsedSseBlock(
+        formatted,
+        payload,
+        is_local=event_block.is_local,
+        response_id_is_local=event_block.response_id_is_local,
+    )
+
+
 def parse_sse_data_json_text(text: str) -> dict[str, JsonValue] | None:
     """Parse one ``data:`` value as a JSON object.
 
