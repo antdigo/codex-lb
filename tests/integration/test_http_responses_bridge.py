@@ -19693,7 +19693,9 @@ async def _exercise_aged_idle_prompt_cache_socket(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("path", ["/v1/responses", "/backend-api/codex/responses"])
 @pytest.mark.parametrize("authenticated", [False, True])
-@pytest.mark.parametrize("waiter_action", ["timeout", "cancel", "complete", "owner_cancel", "other_socket"])
+@pytest.mark.parametrize(
+    "waiter_action", ["timeout", "cancel", "complete", "long_wait", "owner_cancel", "other_socket"]
+)
 async def test_public_http_bridge_waiter_isolated_from_streaming_owner(
     async_client,
     app_instance,
@@ -19707,9 +19709,13 @@ async def test_public_http_bridge_waiter_isolated_from_streaming_owner(
         monkeypatch,
         app_settings=_make_app_settings(enabled=True),
         dashboard_settings=dashboard,
-        admission_wait_timeout_seconds=0.04 if waiter_action == "timeout" else 2.0,
+        admission_wait_timeout_seconds=0.04 if waiter_action in {"timeout", "long_wait"} else 2.0,
     )
-    monkeypatch.setattr(http_bridge_helpers_module, "HTTP_BRIDGE_STUCK_GATE_RETIRE_AFTER_SECONDS", 0.10)
+    monkeypatch.setattr(
+        http_bridge_helpers_module,
+        "HTTP_BRIDGE_STUCK_GATE_RETIRE_AFTER_SECONDS",
+        2.0,
+    )
     account_id = await _import_account(async_client, "execution-owner", "execution-owner@example.com")
     account = await _get_account(account_id)
     service = get_proxy_service_for_app(app_instance)
@@ -19737,6 +19743,9 @@ async def test_public_http_bridge_waiter_isolated_from_streaming_owner(
         nonlocal admissions
         admissions += 1
         if admissions == 2:
+            if waiter_action == "timeout":
+                # Give only B a short request deadline; A keeps its full response budget.
+                args[0].bridge_request_deadline = service._clock.monotonic() + 0.04
             waiter_entered.set()
         await original_admit(*args, **kwargs)
 
@@ -19786,6 +19795,9 @@ async def test_public_http_bridge_waiter_isolated_from_streaming_owner(
             )
         )
         await _wait_for_event(waiter_entered)
+        if waiter_action == "long_wait":
+            await asyncio.sleep(0.12)
+            assert not waiter_task.done(), "Ordinary execution waiting must outlive short create admission"
         if waiter_action == "owner_cancel":
             owner_task.cancel()
             with pytest.raises(asyncio.CancelledError):
@@ -19816,7 +19828,7 @@ async def test_public_http_bridge_waiter_isolated_from_streaming_owner(
         await upstream.complete_owner()
         if not owner_task.cancelled():
             owner = await asyncio.wait_for(owner_task, timeout=3)
-        if waiter_task is not None and not waiter_task.done():
+        if waiter_task is not None and not waiter_task.cancelled():
             waiting = await asyncio.wait_for(waiter_task, timeout=3)
     events = [
         json.loads(line[6:]) for line in owner.text.splitlines() if line.startswith("data: ") and line[6:] != "[DONE]"
@@ -19836,7 +19848,7 @@ async def test_public_http_bridge_waiter_isolated_from_streaming_owner(
             ][-1]["response"]["error"]
         )
         assert error["code"] == "response_execution_wait_timeout"
-    elif waiter_action in {"complete", "other_socket"}:
+    elif waiter_action in {"complete", "long_wait", "other_socket"}:
         assert waiting is not None and waiting.status_code == 200
         waiter_events = [
             json.loads(line[6:])
@@ -19857,7 +19869,7 @@ async def test_public_http_bridge_waiter_isolated_from_streaming_owner(
     assert successor_events[-1]["type"] == "response.completed"
     assert successor_events[-1]["response"]["usage"]["input_tokens_details"]["cached_tokens"] == 20
     assert connections == [account.id] * (2 if waiter_action == "other_socket" else 1)
-    assert len(upstream.sent_text) == (3 if waiter_action == "complete" else 2)
+    assert len(upstream.sent_text) == (3 if waiter_action in {"complete", "long_wait"} else 2)
     assert all(json.loads(text)["prompt_cache_key"] == "execution-isolation" for text in upstream.sent_text)
     if key_id is not None:
         assert await service.drain_persistence_tasks(timeout_seconds=10)
@@ -19872,6 +19884,6 @@ async def test_public_http_bridge_waiter_isolated_from_streaming_owner(
         assert len(reservations) == 3
         assert sorted(reservation.status for reservation in reservations) == (
             ["finalized", "finalized", "finalized"]
-            if waiter_action in {"complete", "other_socket"}
+            if waiter_action in {"complete", "long_wait", "other_socket"}
             else ["finalized", "finalized", "released"]
         )

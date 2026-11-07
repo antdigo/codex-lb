@@ -52,7 +52,7 @@ from app.core.upstream_proxy import UpstreamProxyRouteError
 from app.core.utils.request_id import ensure_request_id
 from app.core.utils.retry import backoff_seconds
 from app.core.utils.shared_future import _await_task_deferring_cancellation
-from app.core.utils.sse import format_sse_event
+from app.core.utils.sse import format_local_sse_event, format_sse_event
 from app.db.models import Account
 from app.modules.api_keys.service import ApiKeyData, ApiKeyUsageReservationData
 from app.modules.proxy._load_balancer.overload_backoff import (
@@ -60,6 +60,7 @@ from app.modules.proxy._load_balancer.overload_backoff import (
     record_upstream_burst_rejection,
 )
 from app.modules.proxy._service.observability import (
+    _maybe_log_proxy_request_payload,
     _maybe_log_proxy_request_shape,
     _record_continuity_fail_closed,
     _record_upstream_transport_decision,
@@ -113,6 +114,8 @@ from app.modules.proxy.load_balancer import AccountLease, AccountSelection
 from app.modules.proxy.replay_safety import responses_payload_is_account_neutral_fresh_replay
 from app.modules.proxy.selection_errors import USAGE_LIMIT_REACHED, selection_failure_response
 
+# Locally constructed failures retain provenance even before an owner is known.
+# Generic SSE framing in this module is only for capacity/security advisories.
 _REQUEST_TRANSPORT_HTTP = "http"
 _REQUEST_TRANSPORT_WEBSOCKET = "websocket"
 _HTTP_DOWNSTREAM_TRANSPORT_POLICY_DEFAULT = "smart"
@@ -328,6 +331,38 @@ def _transient_retry_error_code(tex: BaseException) -> str:
 
 
 class _StreamingRetryMixin:
+    def stream_responses(
+        self,
+        payload: ResponsesRequest,
+        headers: Mapping[str, str],
+        *,
+        codex_session_affinity: bool = False,
+        propagate_http_errors: bool = False,
+        openai_cache_affinity: bool = False,
+        api_key: ApiKeyData | None = None,
+        api_key_reservation: ApiKeyUsageReservationData | None = None,
+        suppress_text_done_events: bool = False,
+        request_transport: str = _REQUEST_TRANSPORT_HTTP,
+        client_ip: str | None = None,
+        enforce_openai_sdk_contract: bool = True,
+    ) -> AsyncIterator[str]:
+        proxy = cast(_StreamingServiceProtocol, self)
+        _maybe_log_proxy_request_payload("stream", payload, headers)
+        filtered = _facade().filter_inbound_headers(headers)
+        return proxy._stream_with_retry(
+            payload,
+            filtered,
+            codex_session_affinity=codex_session_affinity,
+            propagate_http_errors=propagate_http_errors,
+            openai_cache_affinity=openai_cache_affinity,
+            api_key=api_key,
+            api_key_reservation=api_key_reservation,
+            suppress_text_done_events=suppress_text_done_events,
+            request_transport=request_transport,
+            client_ip=client_ip,
+            enforce_openai_sdk_contract=enforce_openai_sdk_contract,
+        )
+
     async def _stream_with_retry(
         self,
         payload: ResponsesRequest,
@@ -579,7 +614,7 @@ class _StreamingRetryMixin:
                 error_param=error.param_state if error else None,
             )
             _apply_error_metadata(event["response"]["error"], error)
-            return format_sse_event(event)
+            return format_local_sse_event(event)
 
         async def _flush_pending_post_refresh_penalties() -> None:
             # Consume one queued penalty at a time only after that entry's
@@ -1129,7 +1164,7 @@ class _StreamingRetryMixin:
                         retry_exc = ProxyResponseError(502, openai_error(exc.code, error_message))
                         setattr(retry_exc, _POST_REFRESH_TRANSIENT_EXHAUSTED_ATTR, True)
                         raise retry_exc from exc
-                    yield format_sse_event(
+                    yield format_local_sse_event(
                         response_failed_event(
                             exc.code,
                             error_message,
@@ -1249,7 +1284,7 @@ class _StreamingRetryMixin:
                     conversation_id=conversation_id,
                     client_ip=client_ip,
                 )
-            return format_sse_event(event)
+            return format_local_sse_event(event)
 
         async def _retry_account_model_rejection(
             exc: ProxyResponseError,
@@ -1345,7 +1380,7 @@ class _StreamingRetryMixin:
                             message,
                             response_id=request_id,
                         )
-                        yield format_sse_event(event)
+                        yield format_local_sse_event(event)
                         await proxy._write_request_log(
                             affinity_observation=affinity_observation,
                             account_id=None,
@@ -1407,7 +1442,7 @@ class _StreamingRetryMixin:
                     )
                     if preserve_native_failure_lifecycle:
                         return
-                    yield format_sse_event(_facade()._proxy_request_timeout_event(request_id))
+                    yield format_local_sse_event(_facade()._proxy_request_timeout_event(request_id))
                     return
                 while True:
                     effective_preferred_account_id = resolve_required_account_id(
@@ -1467,7 +1502,7 @@ class _StreamingRetryMixin:
                             )
                             if preserve_native_failure_lifecycle:
                                 return
-                            yield format_sse_event(_facade()._proxy_request_timeout_event(request_id))
+                            yield format_local_sse_event(_facade()._proxy_request_timeout_event(request_id))
                             return
                         event = response_failed_event(
                             error_code,
@@ -1476,7 +1511,7 @@ class _StreamingRetryMixin:
                             response_id=request_id,
                         )
                         _apply_error_metadata(event["response"]["error"], error)
-                        yield format_sse_event(event)
+                        yield format_local_sse_event(event)
                         return
                     account = selection.account
                     current_account_lease = selection.lease
@@ -1523,7 +1558,7 @@ class _StreamingRetryMixin:
                                     error_type=(deferred_error.type if deferred_error else None) or "server_error",
                                     response_id=request_id,
                                 )
-                                yield format_sse_event(event)
+                                yield format_local_sse_event(event)
                                 return
                             capacity_account = deferred_capacity_account
                             capacity_account_id = capacity_account.id
@@ -1551,7 +1586,7 @@ class _StreamingRetryMixin:
                                     error_type=(deferred_error.type if deferred_error else None) or "server_error",
                                     response_id=request_id,
                                 )
-                                yield format_sse_event(event)
+                                yield format_local_sse_event(event)
                                 return
                             account = capacity_account
                             current_account_lease = deferred_capacity_lease
@@ -1666,7 +1701,7 @@ class _StreamingRetryMixin:
                         )
                         if propagate_http_errors:
                             raise ProxyResponseError(status_code, error_payload)
-                        yield format_sse_event(
+                        yield format_local_sse_event(
                             response_failed_event(
                                 USAGE_LIMIT_REACHED,
                                 no_accounts_msg,
@@ -1715,7 +1750,7 @@ class _StreamingRetryMixin:
                                     error_type="rate_limit_error",
                                 ),
                             )
-                        yield format_sse_event(event)
+                        yield format_local_sse_event(event)
                         return
                     if (
                         require_preferred_account
@@ -1743,7 +1778,7 @@ class _StreamingRetryMixin:
                             error_message,
                             response_id=request_id,
                         )
-                        yield format_sse_event(event)
+                        yield format_local_sse_event(event)
                         await proxy._write_request_log(
                             affinity_observation=affinity_observation,
                             account_id=None,
@@ -1790,7 +1825,7 @@ class _StreamingRetryMixin:
                             message,
                             response_id=request_id,
                         )
-                        yield format_sse_event(event)
+                        yield format_local_sse_event(event)
                         await proxy._write_request_log(
                             affinity_observation=affinity_observation,
                             account_id=preferred_account_id,
@@ -1827,7 +1862,7 @@ class _StreamingRetryMixin:
                             message,
                             response_id=request_id,
                         )
-                        yield format_sse_event(event)
+                        yield format_local_sse_event(event)
                         await proxy._write_request_log(
                             affinity_observation=affinity_observation,
                             account_id=None,
@@ -1859,7 +1894,7 @@ class _StreamingRetryMixin:
                         else "server_error",
                         response_id=request_id,
                     )
-                    yield format_sse_event(event)
+                    yield format_local_sse_event(event)
                     await proxy._write_request_log(
                         affinity_observation=affinity_observation,
                         account_id=None,
@@ -1944,7 +1979,7 @@ class _StreamingRetryMixin:
                             message,
                             response_id=request_id,
                         )
-                        yield format_sse_event(event)
+                        yield format_local_sse_event(event)
                         await proxy._write_request_log(
                             affinity_observation=affinity_observation,
                             account_id=preferred_account_id,
@@ -1996,7 +2031,7 @@ class _StreamingRetryMixin:
                         )
                         if preserve_native_failure_lifecycle:
                             return
-                        yield format_sse_event(_facade()._proxy_request_timeout_event(request_id))
+                        yield format_local_sse_event(_facade()._proxy_request_timeout_event(request_id))
                         return
                     try:
                         account = await proxy._ensure_fresh_with_budget(account, timeout_seconds=remaining_budget)
@@ -2026,7 +2061,7 @@ class _StreamingRetryMixin:
                             message,
                             response_id=request_id,
                         )
-                        yield format_sse_event(event)
+                        yield format_local_sse_event(event)
                         return
                     except (RefreshError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
                         selected_account_model_replacement = account.id == account_model_replacement_account_id
@@ -2127,7 +2162,7 @@ class _StreamingRetryMixin:
                                     message,
                                     response_id=request_id,
                                 )
-                                yield format_sse_event(event)
+                                yield format_local_sse_event(event)
                                 return
                             if not exc.transport_error and not selected_account_model_replacement:
                                 # Non-transport, non-permanent RefreshError: release
@@ -2225,7 +2260,7 @@ class _StreamingRetryMixin:
                             message,
                             response_id=request_id,
                         )
-                        yield format_sse_event(event)
+                        yield format_local_sse_event(event)
                         return
                     any_attempt_logged = True
                     settlement = _StreamSettlement()
@@ -2259,7 +2294,7 @@ class _StreamingRetryMixin:
                         )
                         if preserve_native_failure_lifecycle:
                             return
-                        yield format_sse_event(_facade()._proxy_request_timeout_event(request_id))
+                        yield format_local_sse_event(_facade()._proxy_request_timeout_event(request_id))
                         return
                     transient_retries = 0
                     allow_retry_flag = attempt < max_attempts - 1
@@ -2432,7 +2467,7 @@ class _StreamingRetryMixin:
                                     and error_code in SYNTHETIC_TRANSPORT_FAILURE_CODES
                                 ):
                                     try:
-                                        yield format_sse_event(event)
+                                        yield format_local_sse_event(event)
                                     except (asyncio.CancelledError, GeneratorExit):
                                         await _finalize_terminal_settlement_after_downstream_close(
                                             settlement,
@@ -2768,7 +2803,7 @@ class _StreamingRetryMixin:
                                 await _settle_process_network_budget_exhaustion(account, settlement)
                                 if preserve_native_failure_lifecycle:
                                     return
-                                yield format_sse_event(_facade()._proxy_request_timeout_event(request_id))
+                                yield format_local_sse_event(_facade()._proxy_request_timeout_event(request_id))
                                 return
                             transient_retries += 1
                             if (
@@ -2856,7 +2891,7 @@ class _StreamingRetryMixin:
                                 exc.error.get("message") or "Security work authorization is required",
                                 response_id=request_id,
                             )
-                            yield format_sse_event(event)
+                            yield format_local_sse_event(event)
                             return
                         _facade().logger.info(
                             "Retrying on security-work-authorized account request_id=%s account_id=%s",
@@ -2920,7 +2955,7 @@ class _StreamingRetryMixin:
                         await _settle_process_network_budget_exhaustion(account, settlement)
                         if preserve_native_failure_lifecycle:
                             return
-                        yield format_sse_event(_facade()._proxy_request_timeout_event(request_id))
+                        yield format_local_sse_event(_facade()._proxy_request_timeout_event(request_id))
                         return
                     account_model_retry = await _retry_account_model_rejection(
                         exc,
@@ -2965,7 +3000,7 @@ class _StreamingRetryMixin:
                             )
                             if preserve_native_failure_lifecycle:
                                 return
-                            yield format_sse_event(_facade()._proxy_request_timeout_event(request_id))
+                            yield format_local_sse_event(_facade()._proxy_request_timeout_event(request_id))
                             return
                         try:
                             account = await proxy._ensure_fresh_with_budget(
@@ -3063,7 +3098,7 @@ class _StreamingRetryMixin:
                                         message,
                                         response_id=request_id,
                                     )
-                                    yield format_sse_event(event)
+                                    yield format_local_sse_event(event)
                                     return
                                 if not refresh_exc.transport_error:
                                     # Non-transport, non-permanent RefreshError:
@@ -3136,7 +3171,7 @@ class _StreamingRetryMixin:
                                 message,
                                 response_id=request_id,
                             )
-                            yield format_sse_event(event)
+                            yield format_local_sse_event(event)
                             return
                         settlement = _StreamSettlement()
                         effective_attempt_timeout = proxy._remaining_budget_seconds(deadline)
@@ -3168,7 +3203,7 @@ class _StreamingRetryMixin:
                             )
                             if preserve_native_failure_lifecycle:
                                 return
-                            yield format_sse_event(_facade()._proxy_request_timeout_event(request_id))
+                            yield format_local_sse_event(_facade()._proxy_request_timeout_event(request_id))
                             return
                         try:
                             can_try_other_account = (
@@ -3207,7 +3242,7 @@ class _StreamingRetryMixin:
                                 await _settle_process_network_budget_exhaustion(account, settlement)
                                 if preserve_native_failure_lifecycle:
                                     return
-                                yield format_sse_event(_facade()._proxy_request_timeout_event(request_id))
+                                yield format_local_sse_event(_facade()._proxy_request_timeout_event(request_id))
                                 return
                             if settlement.downstream_visible:
                                 failed_response_id = settlement.response_id or request_id
@@ -3232,7 +3267,7 @@ class _StreamingRetryMixin:
                                     account.id,
                                     error_code,
                                 )
-                                yield format_sse_event(event)
+                                yield format_local_sse_event(event)
                                 settlement.record_success = False
                                 settlement.error_code = error_code
                                 settlement.error_message = error_message
@@ -3481,7 +3516,7 @@ class _StreamingRetryMixin:
                                 error_param=error.param_state if error else None,
                             )
                             _apply_error_metadata(event["response"]["error"], error)
-                            yield format_sse_event(event)
+                            yield format_local_sse_event(event)
                             return
                         current_account_penalty_queued = any(
                             failed_account is account
@@ -3571,7 +3606,7 @@ class _StreamingRetryMixin:
                         error_param=error_param,
                     )
                     _apply_error_metadata(event["response"]["error"], error)
-                    yield format_sse_event(event)
+                    yield format_local_sse_event(event)
                     return
                 except RefreshError as exc:
                     if exc.is_permanent:
@@ -3591,9 +3626,9 @@ class _StreamingRetryMixin:
                     event = response_failed_event(
                         "upstream_error",
                         "Proxy streaming failed",
-                        response_id=request_id,
+                        response_id=settlement.response_id or request_id,
                     )
-                    yield format_sse_event(event)
+                    yield format_local_sse_event(event)
                     return
             await _drain_pending_post_refresh_penalty_on_terminal(settlement)
             # When HTTP error propagation is enabled and the last failure was
@@ -3627,7 +3662,7 @@ class _StreamingRetryMixin:
                     preserve_native_failure_lifecycle
                     and last_retryable_stream_error.code in SYNTHETIC_TRANSPORT_FAILURE_CODES
                 ):
-                    yield format_sse_event(event)
+                    yield format_local_sse_event(event)
                 if not any_attempt_logged:
                     await proxy._write_request_log(
                         affinity_observation=affinity_observation,
@@ -3663,7 +3698,7 @@ class _StreamingRetryMixin:
                         error_param=error.param_state if error else None,
                     )
                     _apply_error_metadata(event["response"]["error"], error)
-                    yield format_sse_event(event)
+                    yield format_local_sse_event(event)
                     return
 
             retries_exhausted_msg = "No available accounts after retries"
@@ -3683,7 +3718,7 @@ class _StreamingRetryMixin:
                 retries_exhausted_msg,
                 response_id=request_id,
             )
-            yield format_sse_event(event)
+            yield format_local_sse_event(event)
             if not any_attempt_logged:
                 await proxy._write_request_log(
                     affinity_observation=affinity_observation,

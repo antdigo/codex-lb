@@ -365,3 +365,11 @@ Retained state is two small session scalars and one optional account-ID referenc
 ## HTTP bridge execution ownership
 
 Each HTTP bridge serializes upstream execution independently of response-created admission. A subsequent same-socket request waits locally before response.create under the original admission/request budget; its cancellation or wait timeout cannot abort the already executing response. For example, a long tool-argument response A may complete while waiter B returns response_execution_wait_timeout, and C can reuse the warm socket. Account-create admission still releases on response.created. The independent execution handle releases on terminal or fenced cleanup, including prewarm and reader failure. Separate physical sockets keep concurrency; no upstream stream_id capability is assumed.
+
+## Execution admission and stream ownership
+
+[HTTP bridge execution and create admission](http-bridge-admission.md) explains
+the two wait budgets, retained deadlines, account binding and queue lifetime.
+[Stream ownership, lifecycle and cleanup](stream-ownership.md) covers response
+identity, SDK recovery, bounded ordering, teardown and measured processing cost.
+The normative requirements remain in [spec.md](spec.md).

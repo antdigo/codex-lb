@@ -1095,6 +1095,9 @@ def _sort_keys_recursive(value: JsonValue) -> JsonValue:
 
 
 def _strip_compact_unsupported_fields(payload: MutableJsonObject) -> MutableJsonObject:
+    # Compact has no WebSocket metadata channel. Normalize IDs using the
+    # effective HTTP capability after discarding any incoming Lite marker.
+    payload.pop("client_metadata", None)
     payload = _strip_unsupported_fields(payload)
     normalized_payload = _normalize_responses_input_instructions(payload)
     if is_json_mapping(normalized_payload):
@@ -1105,7 +1108,6 @@ def _strip_compact_unsupported_fields(payload: MutableJsonObject) -> MutableJson
     payload.pop("text", None)
     payload.pop("tools", None)
     payload.pop("tool_choice", None)
-    payload.pop("client_metadata", None)
     payload["parallel_tool_calls"] = False
     return payload
 

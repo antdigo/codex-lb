@@ -93,6 +93,7 @@ from app.core.openai.requests import (
 from app.core.openai.requests import (
     ResponsesCompactRequest,
     ResponsesRequest,
+    _strip_subscription_inline_item_ids,
     validate_compact_input_wire_budget,
 )
 from app.core.openai.requests import (
@@ -2174,6 +2175,15 @@ def _normalize_sse_event_block(event_block: str) -> str:
     return normalized
 
 
+def _stream_event_response_id(payload: dict[str, JsonValue]) -> str | None:
+    response = payload.get("response")
+    nested_id = response.get("id") if isinstance(response, dict) else None
+    if isinstance(nested_id, str) and nested_id:
+        return nested_id
+    top_id = payload.get("response_id")
+    return top_id if isinstance(top_id, str) and top_id else None
+
+
 def _normalize_stream_event_payload(payload: dict[str, JsonValue]) -> dict[str, JsonValue]:
     event_type = payload.get("type")
     if isinstance(event_type, str) and event_type in _SSE_EVENT_TYPE_ALIASES:
@@ -2185,6 +2195,7 @@ def _normalize_stream_event_payload(payload: dict[str, JsonValue]) -> dict[str, 
     # frames (``type == "error"`` or a top-level ``error`` envelope) so delta
     # frames never reach the pydantic adapter.
     if classify_event_type(payload) == "error" or isinstance(payload.get("error"), dict):
+        response_id = _stream_event_response_id(payload) or get_request_id()
         error = parse_error_payload(payload)
         if error is not None:
             detail = error.model_dump(exclude_none=True)
@@ -2192,11 +2203,14 @@ def _normalize_stream_event_payload(payload: dict[str, JsonValue]) -> dict[str, 
                 _normalize_error_code(detail.get("code"), detail.get("type")),
                 detail.get("message", "Upstream websocket error"),
                 error_type=detail.get("type") or "server_error",
-                response_id=get_request_id(),
+                response_id=response_id,
                 error_param=detail.get("param"),
             )
             _copy_quota_error_metadata(event["response"]["error"], detail)
-            return cast(dict[str, JsonValue], event)
+            normalized = cast(dict[str, JsonValue], event)
+            if "response_id" in payload:
+                normalized["response_id"] = payload["response_id"]
+            return normalized
         if event_type == "error":
             message = _extract_upstream_message(payload) or "Upstream websocket error"
             code = payload.get("code")
@@ -2207,23 +2221,27 @@ def _normalize_stream_event_payload(payload: dict[str, JsonValue]) -> dict[str, 
             )
             if not isinstance(code, str) and normalized_code == "error":
                 normalized_code = "upstream_error"
-            return cast(
+            normalized = cast(
                 dict[str, JsonValue],
                 response_failed_event(
                     normalized_code,
                     message,
                     error_type=error_type if isinstance(error_type, str) and error_type != "error" else "server_error",
-                    response_id=get_request_id(),
+                    response_id=response_id,
                 ),
             )
+            if "response_id" in payload:
+                normalized["response_id"] = payload["response_id"]
+            return normalized
     return payload
 
 
 def _format_normalized_stream_event(payload: dict[str, JsonValue], normalized: dict[str, JsonValue]) -> str:
     block = format_sse_event(normalized)
-    # Error normalization creates a local response ID, but upstream activity occurred.
+    # Only an unowned error gets a local ID. Explicit upstream owners remain
+    # untrusted even when the surrounding error envelope was normalized.
     if normalized is not payload and normalized.get("type") == "response.failed":
-        return ParsedSseBlock(block, normalized, response_id_is_local=True)
+        return ParsedSseBlock(block, normalized, response_id_is_local=_stream_event_response_id(payload) is None)
     return block
 
 
@@ -3762,6 +3780,7 @@ async def _stream_responses_with_session(
         effective_connect_timeout,
     )
     http_payload_dict = dict(payload_dict)
+    http_inline_ids_need_normalization = _payload_has_responses_lite_websocket_marker(payload_dict)
     _strip_responses_lite_websocket_client_metadata(http_payload_dict)
     _finalize_responses_lite_reasoning_context(
         http_payload_dict,
@@ -3801,6 +3820,10 @@ async def _stream_responses_with_session(
         )
     )
     payload_dict = websocket_payload_dict if transport == "websocket" else http_payload_dict
+    # The wire copies share input items. Wait for HTTP selection so cleanup
+    # cannot strip identity from a WebSocket attempt that still needs it.
+    if transport == "http" and http_inline_ids_need_normalization:
+        _strip_subscription_inline_item_ids(payload_dict)
     active_native_egress_client = (
         native_egress_client or discover_native_egress_client() if route is None and transport == "http" else None
     )
@@ -4223,6 +4246,8 @@ async def _stream_responses_with_session(
 
         transport = "http"
         payload_dict = http_payload_dict
+        if http_inline_ids_need_normalization:
+            _strip_subscription_inline_item_ids(payload_dict)
         payload_json = (
             json.dumps(payload_dict, ensure_ascii=True, separators=(",", ":"))
             if "upstream_payload" in settings.trace_channels
