@@ -2019,6 +2019,8 @@ class _HTTPBridgeMixin(
             _http_bridge_request_budget_seconds(_service_get_settings()),
             now=clock_for(self).monotonic(),
         )
+        if request_state.bridge_request_deadline is not None:
+            deadline = min(deadline, request_state.bridge_request_deadline)
         try:
             # Callers that reconnect while holding a lock resolve this row
             # before taking it and pass it in. The prewarm timeout recovery is

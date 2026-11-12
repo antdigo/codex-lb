@@ -988,6 +988,7 @@ def _websocket_precreated_retry_error_code(
     event_type: str | None,
     payload: dict[str, JsonValue] | None,
     has_other_pending_requests: bool,
+    allow_connection_lifetime_retry: bool = False,
 ) -> str | None:
     if request_state is None:
         return None
@@ -1031,6 +1032,19 @@ def _websocket_precreated_retry_error_code(
     )
     error_param = _websocket_event_error_param(event_type, payload)
     error_message = _websocket_event_error_message(event_type, payload)
+    if allow_connection_lifetime_retry and error_code == "websocket_connection_limit_reached":
+        # Only an unaccepted, unanchored HTTP turn can start on a fresh socket.
+        # A failed response or a named response may already have executed.
+        if (
+            event_type != "error"
+            or payload is None
+            or payload.get("type") != "error"
+            or request_state.previous_response_id is not None
+            or request_state.hard_continuity_anchor
+            or _websocket_response_id(None, payload) is not None
+        ):
+            return None
+        return error_code
     if _facade()._is_previous_response_not_found_error(
         code=error_code,
         param=error_param,

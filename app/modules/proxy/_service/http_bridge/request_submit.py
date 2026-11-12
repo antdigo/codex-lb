@@ -3895,6 +3895,8 @@ class _HTTPBridgeRequestSubmitMixin:
         )
 
         def request_is_retryable(request_state: _WebSocketRequestState) -> bool:
+            if request_state.bridge_age_required_account_id is not None and request_state.replay_count >= 1:
+                return False
             transport_only_unanchored_replay = bool(
                 request_state.precreated_replay_reason is None
                 and (
@@ -4096,7 +4098,9 @@ class _HTTPBridgeRequestSubmitMixin:
                 request_text = _prepare_websocket_request_state_for_visible_output_replay(request_state)
                 if request_text is None or request_text != candidate_text:
                     return False
-                account_bound_replay = not candidate_portable
+                account_bound_replay = (
+                    not candidate_portable or request_state.bridge_age_required_account_id is not None
+                )
                 require_preferred_reconnect = (
                     account_neutral_recovery or account_bound_replay or request_state.file_required_preferred_account
                 )
@@ -4260,6 +4264,24 @@ class _HTTPBridgeRequestSubmitMixin:
                     await self._release_request_state_account_response_create_lease(request_state)
                     return False
             request_text = self._http_bridge_text_with_account_installation_id(session, request_state, request_text)
+            if request_state.bridge_age_required_account_id is not None:
+                retry_deadline = request_state.bridge_request_deadline
+                if retry_deadline is None:
+                    retry_deadline = request_state.started_at + _http_bridge_request_budget_seconds(
+                        _service_get_settings()
+                    )
+                async with session.pending_lock:
+                    lifetime_retry_owned = (
+                        request_state in session.pending_requests
+                        and request_state.event_queue is not None
+                        and not request_state.draining_until_terminal
+                        and clock.monotonic() < retry_deadline
+                    )
+                if not lifetime_retry_owned:
+                    await _release_websocket_response_create_gate(
+                        request_state, session.response_create_gate, scheduler=scheduler_for(self)
+                    )
+                    return False
             await _send_http_bridge_request_text_with_archive_id(session, request_state, request_text, clock=clock)
             session.last_used_at = clock.monotonic()
             request_state.clean_close_retry_result = True

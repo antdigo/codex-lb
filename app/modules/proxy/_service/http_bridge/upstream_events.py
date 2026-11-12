@@ -2817,6 +2817,7 @@ class _HTTPBridgeUpstreamEventsMixin:
                     has_other_pending_requests=any(
                         pending_request is not matched_request_state for pending_request in session.pending_requests
                     ),
+                    allow_connection_lifetime_retry=True,
                 )
                 reserve_terminal_for_model_capacity_retry = bool(
                     matched_request_state is not None
@@ -3405,6 +3406,7 @@ class _HTTPBridgeUpstreamEventsMixin:
             event_type=event_type,
             payload=payload,
             has_other_pending_requests=has_other_pending_requests,
+            allow_connection_lifetime_retry=True,
         )
         auth_error_code = _websocket_precreated_auth_error_code(
             status_request_state,
@@ -3680,12 +3682,19 @@ class _HTTPBridgeUpstreamEventsMixin:
             and retry_error_code != _ACCOUNT_MODEL_UNSUPPORTED_ERROR_CODE
             and not is_previous_response_not_found_event
         ):
-            await self._handle_or_defer_precreated_stream_health(
-                status_request_state,
-                session.account,
-                {"message": retry_error_message or "Upstream error"},
-                retry_error_code,
-            )
+            if retry_error_code == "websocket_connection_limit_reached" and status_request_state is not None:
+                # A physical connection expired; its account is healthy and
+                # retains ownership of this turn through reconnect/fallback.
+                status_request_state.bridge_age_required_account_id = (
+                    status_request_state.bridge_age_required_account_id or session.account.id
+                )
+            else:
+                await self._handle_or_defer_precreated_stream_health(
+                    status_request_state,
+                    session.account,
+                    {"message": retry_error_message or "Upstream error"},
+                    retry_error_code,
+                )
             # Pre-created anchored requests belong to the owner-pinned branch
             # above; an accepted anchored follow-up with a proxy-injected
             # anchor and a retry-safe fresh body is replayed here exactly as
