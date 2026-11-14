@@ -11041,7 +11041,7 @@ An existing reserved unanchored handoff MUST retain its existing authority to su
 - **AND** the detached predecessor drains through its existing lifecycle instead of being forcibly closed by replacement
 
 ### Requirement: Idle unanchored prompt-cache physical WebSocket lifetime
-For an original self-contained full-resend HTTP request in the canonical soft prompt-cache registry lookup, the proxy MUST rotate a physical upstream socket aged at least 3000 monotonic seconds before submitting that request only when the original and prepared request have no previous-response/conversation/turn/session continuity, the session is not a Codex continuity session, and its complete original message/function-call/function-output/encrypted-reasoning items contain no reference-only or unknown opaque shapes. Every function-call ID MUST have exactly one subsequent full function output; duplicate calls, duplicate outputs, orphan outputs and pending calls MUST make the request ineligible. The proof MUST NOT depend on a durable row or previous input fingerprint: unanchored Responses input defines the new context, while a soft prompt-cache key is only a cache hint.
+For an original self-contained full-resend HTTP request in the canonical soft prompt-cache registry lookup, the proxy MUST rotate a physical upstream socket aged at least 3000 monotonic seconds before submitting that request only when the original and prepared request have no previous-response/conversation/turn/session continuity, the session is not a Codex continuity session, and its complete original message/function-call/function-output/reasoning items contain no reference-only or unknown opaque shapes. Every function-call ID MUST have exactly one subsequent full function output; duplicate calls, duplicate outputs, orphan outputs and pending calls MUST make the request ineligible. The proof MUST NOT depend on a durable row or previous input fingerprint: unanchored Responses input defines the new context, while a soft prompt-cache key is only a cache hint.
 The proxy MUST retain original input content, order, tool call IDs, ciphertext and prompt_cache_key, require the old account for replacement, and preserve the original reservation and deadline with one upstream dispatch. The proxy MUST NOT lose that owner restriction through outer HTTP fallback or any subsequent reconnect or reroute. A later recovery that cannot preserve the owner MUST fail closed before another send.
 The age branch MUST NOT detach a generation with any literal pending/draining request, queued or admission owner, reservation, handoff, resource close owner, or reader currently processing/persisting a frame. Uncertain lock acquisition MUST skip rotation. Physical opening time MUST reset on a successful replacement and MUST NOT reset on reuse or durable refresh.
 Forwarded requests, Responses-Lite requests, recovery-key paths and opaque encrypted function arguments MUST remain ineligible. The age policy MUST NOT construct or send a projected history.
@@ -11057,7 +11057,7 @@ This requirement does not add transparent retry after accepted model output and 
 - THEN age rotation does not close or cancel that reader.
 
 #### Scenario: Complete cancelled function output
-- GIVEN a full original history contains a function_call_output with a nonempty call_id, full string output, and native status incomplete
+- GIVEN a full original history contains a function_call_output with a nonempty call_id, full string or complete native text-array output, and native status incomplete
 - WHEN the other age and ownership guards pass
 - THEN the proxy MUST accept that complete output for rotation and preserve its status and content verbatim.
 - AND incomplete function calls, reference-only reasoning and unknown opaque item shapes MUST remain ineligible.
@@ -11495,3 +11495,31 @@ used by existing post-dispatch recovery policies.
 - GIVEN the transferred waiter attempted response.create on its replacement
 - WHEN the upstream reports an eligible pre-response connection lifetime error
 - THEN the existing bounded same-account post-dispatch recovery policy remains in force.
+
+### Requirement: Idle socket rotation recognizes complete native text carriers
+
+The existing pre-dispatch idle prompt-cache socket-age policy MUST recognize
+a complete function_call_output supplied as a nonempty array of input_text
+parts, each with a string text value. It MUST also recognize a reasoning item
+with a nonempty ID and complete explicit reasoning_text content when
+encrypted_content is absent or null. The reasoning content MUST be a nonempty
+array of reasoning_text parts with nonempty string text values. Existing
+encrypted reasoning and string tool-output eligibility MUST remain unchanged.
+
+Recognition MUST NOT alter, flatten, drop, replace or reorder input, text,
+ciphertext, call IDs, cancellation statuses or cache metadata. Existing tool
+pairing, account ownership, resource ownership, anchor, deadline and Codex-session
+fences MUST remain in force. Unknown/malformed content, empty/reference-only
+reasoning and malformed supplied ciphertext MUST NOT qualify through the new
+rules. This rule MUST NOT authorize replay after response acceptance.
+
+#### Scenario: An idle aged socket receives a mixed complete native history
+- GIVEN an unanchored soft prompt-cache request includes structured text tool output and explicit plaintext plus encrypted reasoning
+- WHEN the original unowned socket exceeds the existing age threshold
+- THEN the same-account replacement receives the canonical input unchanged exactly once
+- AND the aged socket receives no additional response.create.
+
+#### Scenario: Native text content is incomplete or opaque
+- GIVEN a tool-output array or plaintext reasoning contains an unknown part, missing text or a reference-only item
+- WHEN the proxy checks socket-age rotation eligibility
+- THEN the new text-carrier rules do not authorize rotation.
