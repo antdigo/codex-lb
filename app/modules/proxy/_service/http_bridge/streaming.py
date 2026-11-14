@@ -713,6 +713,7 @@ def _http_bridge_can_replace_retired_gate_session(
         and not request_state.payload_conversation_bound
         and request_state.operation_id is None
         and request_state.response_create_attempt_count == 0
+        and not request_state.bridge_execution_replacement_used
         and request_state.replay_count == 0
         and not request_state.draining_until_terminal
         and request_state.http_bridge_execution_gate is None
@@ -3629,6 +3630,7 @@ class _HTTPBridgeStreamingMixin:
                         ("request owner", request_state.preferred_account_id),
                     )
                     request_state.bridge_age_required_account_id = replacement_preferred_account_id
+                    request_state.bridge_execution_replacement_used = True
                     if clock.monotonic() >= request_deadline:
                         raise _HTTPBridgeAgeReplacementError(exc) from exc
                 elif request_state.previous_response_id is not None and replacement_preferred_account_id is None:

@@ -9,6 +9,7 @@ from app.core.errors import openai_error
 from app.modules.proxy import service as proxy_module
 from tests.integration.test_http_responses_bridge import (
     _FakeBridgeUpstreamWebSocket,
+    _FakeUpstreamMessage,
     _get_account,
     _import_account,
     _install_bridge_settings_with_limits,
@@ -32,6 +33,10 @@ pytestmark = pytest.mark.integration
         "prepared",
         "concurrent",
         "cancelled",
+        "retired_during_preparation",
+        "retired_after_admission",
+        "reader_closed_during_preparation",
+        "lifetime_after_send",
     ],
 )
 async def test_public_http_waiter_moves_to_one_same_account_replacement(
@@ -60,6 +65,32 @@ async def test_public_http_waiter_moves_to_one_same_account_replacement(
         auth_headers = {"Authorization": "Bearer " + response.json()["key"]}
     old_socket = _FakeBridgeUpstreamWebSocket("resp_warm")
     replacement_socket = _FakeBridgeUpstreamWebSocket("resp_replacement")
+    if outcome == "lifetime_after_send":
+
+        class LifetimeRejectedSocket(_FakeBridgeUpstreamWebSocket):
+            async def send_text(self, text):
+                self.sent_text.append(text)
+                await self._messages.put(
+                    _FakeUpstreamMessage(
+                        "text",
+                        text=json.dumps(
+                            {
+                                "type": "error",
+                                "status": 400,
+                                "error": {
+                                    "type": "invalid_request_error",
+                                    "code": "websocket_connection_limit_reached",
+                                    "message": (
+                                        "Responses websocket connection limit reached (60 minutes). "
+                                        "Create a new websocket connection to continue."
+                                    ),
+                                },
+                            }
+                        ),
+                    )
+                )
+
+        replacement_socket = LifetimeRejectedSocket("resp_rejected")
     replacement_sockets = [replacement_socket]
     selections, connects = [], []
 
@@ -76,7 +107,18 @@ async def test_public_http_waiter_moves_to_one_same_account_replacement(
 
     async def connect(self, account, headers, **kwargs):
         connects.append(account.id)
-        assert len(connects) <= (3 if outcome == "concurrent" else 2)
+        assert len(connects) <= (
+            3
+            if outcome
+            in (
+                "concurrent",
+                "retired_during_preparation",
+                "retired_after_admission",
+                "reader_closed_during_preparation",
+                "lifetime_after_send",
+            )
+            else 2
+        )
         if len(connects) == 1:
             return old_socket
         if len(connects) == 3:
@@ -125,6 +167,8 @@ async def test_public_http_waiter_moves_to_one_same_account_replacement(
         result = await acquire(state, **kwargs)
         if target is not old and outcome == "late_expired":
             clock.offset += 10000
+        if target is not old and outcome == "retired_after_admission":
+            target.closed = True
         return result
 
     if outcome == "prepared":
@@ -138,6 +182,26 @@ async def test_public_http_waiter_moves_to_one_same_account_replacement(
             return text
 
         monkeypatch.setattr(service, "_inline_http_bridge_image_urls", prepare_snapshot)
+
+    if outcome in ("retired_during_preparation", "reader_closed_during_preparation"):
+        allowed = service._http_bridge_precreated_retry_allowed
+        retired_again = False
+
+        async def close_replacement_during_preparation(session, **kwargs):
+            nonlocal retired_again
+            result = await allowed(session, **kwargs)
+            if session is not old and not retired_again:
+                retired_again = True
+                if outcome == "reader_closed_during_preparation":
+                    await session.upstream._messages.put(_FakeUpstreamMessage("close", close_code=1000))
+                    assert session.upstream_reader is not None
+                    await asyncio.wait_for(asyncio.shield(session.upstream_reader), timeout=5)
+                    assert session.closed
+                else:
+                    session.closed = True
+            return result
+
+        monkeypatch.setattr(service, "_http_bridge_precreated_retry_allowed", close_replacement_during_preparation)
 
     monkeypatch.setattr(service, "_acquire_request_state_response_create_admission", observe)
     requests = [
@@ -171,6 +235,17 @@ async def test_public_http_waiter_moves_to_one_same_account_replacement(
                 request.cancel()
         await asyncio.gather(*requests, return_exceptions=True)
     assert len(old_socket.sent_text) == 1
+    if outcome == "lifetime_after_send":
+        assert response.status_code == 200 and '"type":"response.completed"' in response.text
+        assert connects == [owner.id, owner.id, owner.id]
+        assert len(replacement_sockets) == 2
+        assert all(len(socket.sent_text) == 1 for socket in replacement_sockets)
+        assert all(json.loads(socket.sent_text[0])["input"] == body["input"] for socket in replacement_sockets)
+        assert all(
+            s["preferred_account_id"] == owner.id and not s["fallback_on_preferred_account_unavailable"]
+            for s in selections[1:]
+        )
+        return
     if outcome == "concurrent":
         assert all(r.status_code == 200 and '"type":"response.completed"' in r.text for r in responses)
         assert sum(len(s.sent_text) for s in replacement_sockets) == 2
@@ -190,7 +265,13 @@ async def test_public_http_waiter_moves_to_one_same_account_replacement(
     if outcome == "owner_unavailable":
         assert connects == [owner.id]
         assert not replacement_socket.sent_text
-    elif outcome in ("repeat_retirement", "late_expired"):
+    elif outcome in (
+        "repeat_retirement",
+        "late_expired",
+        "retired_during_preparation",
+        "retired_after_admission",
+        "reader_closed_during_preparation",
+    ):
         assert connects == [owner.id, owner.id]
         assert not replacement_socket.sent_text
     else:

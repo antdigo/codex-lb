@@ -3751,6 +3751,15 @@ class _HTTPBridgeRequestSubmitMixin:
         discard_pending_request_state: _WebSocketRequestState | None,
     ) -> None:
         async with session.pending_lock:
+            if request_state.bridge_execution_replacement_used and request_state.response_create_attempt_count == 0:
+                raise ProxyResponseError(
+                    503,
+                    openai_error(
+                        "response_execution_session_retired",
+                        "HTTP bridge replacement retired before response execution; retry the request",
+                    ),
+                    local_pre_dispatch_refusal=True,
+                )
             if any(
                 pending is not request_state and pending is not discard_pending_request_state
                 for pending in session.pending_requests
@@ -3773,6 +3782,8 @@ class _HTTPBridgeRequestSubmitMixin:
         send_request: bool = True,
         require_same_account: bool = False,
     ) -> bool:
+        if request_state.bridge_execution_replacement_used and request_state.response_create_attempt_count == 0:
+            return False
         clock = clock_for(self)
         require_same_account = require_same_account or is_http_bridge_account_neutral_replay(
             kind=session.key.affinity_kind,

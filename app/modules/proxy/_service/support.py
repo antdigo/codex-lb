@@ -1217,6 +1217,8 @@ class _WebSocketRequestState:
     durable_capability_lineage_required: bool = False
     # Mandatory owner for this turn after pre-submit physical-socket rotation.
     bridge_age_required_account_id: str | None = None
+    # A retired execution waiter has selected its only pre-dispatch replacement.
+    bridge_execution_replacement_used: bool = False
     file_required_preferred_account: bool = False
     bridge_soft_capacity_reroute_allowed: bool = False
     error_code_override: str | None = None
