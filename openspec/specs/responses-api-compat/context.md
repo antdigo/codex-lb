@@ -408,3 +408,10 @@ dispatch checks the original deadline again after those waits. An unavailable
 owner, expired budget, cancellation or a repeated retirement ends the request
 through the existing settlement paths. No schema, dependencies, native helper
 or Bifrost configuration change is required.
+
+Selecting this replacement also consumes the turn's pre-dispatch reconnect
+budget. A close during preparation or after admission cannot open another
+physical socket before the first response.create attempt. A separate
+request-scoped flag fences the common reconnect entry point without spending
+the replay counter: an eligible connection-limit error after an actual send
+still follows the existing bounded same-account recovery policy.
