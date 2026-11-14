@@ -166,6 +166,49 @@ async def test_execution_wait_uses_startup_budget_but_prewarm_stays_short(monkey
 
 
 @pytest.mark.asyncio
+async def test_ordinary_execution_wait_outlives_pre_response_watchdog(monkeypatch):
+    clock = VirtualClock()
+    scheduler = VirtualScheduler(clock)
+    service = proxy_service.ProxyService(cast(Any, SimpleNamespace()), clock=clock, scheduler=scheduler)
+    session = _make_http_bridge_session(deque(), queued_request_count=1)
+    state = _state("long-streaming-predecessor")
+    state.started_at = 0
+    state.bridge_request_deadline = 7200
+    settings = proxy_service.get_settings().model_copy(
+        update={"http_responses_session_bridge_request_budget_seconds": 7200, "stream_idle_timeout_seconds": 7200}
+    )
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
+    await session.execution_gate.acquire()
+    task = asyncio.create_task(
+        service._acquire_request_state_response_create_admission(
+            state, response_create_gate=session.response_create_gate, bridge_session=session
+        )
+    )
+    try:
+        await scheduler.drain()
+        await scheduler.advance(301)
+        assert not task.done(), "An ordinary queued turn must outlive the unrelated 300-second pre-response watchdog"
+        assert state.http_bridge_execution_gate is None
+        assert session.execution_gate.locked()
+        await scheduler.advance(29)
+        session.execution_gate.release()
+        await scheduler.drain()
+        await task
+        assert state.http_bridge_execution_gate is session.execution_gate
+        assert state.response_create_gate_acquired
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, ProxyResponseError):
+            await task
+        if state.response_create_admission is not None:
+            state.response_create_admission.release()
+        release_http_bridge_execution(state)
+        if state.response_create_gate_acquired:
+            session.response_create_gate.release()
+        await scheduler.cancel_owned_tasks()
+
+
+@pytest.mark.asyncio
 async def test_execution_wait_respects_shorter_stream_silence_budget(monkeypatch):
     clock = VirtualClock()
     scheduler = VirtualScheduler(clock)

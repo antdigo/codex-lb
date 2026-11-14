@@ -14261,6 +14261,7 @@ async def test_v1_responses_http_bridge_idle_recovery_hands_reader_to_replacemen
     )
     monkeypatch.setattr(proxy_module, "_HTTP_BRIDGE_STARTUP_KEEPALIVE_GRACE_SECONDS", 0.01)
     monkeypatch.setattr(proxy_module, "_STREAM_KEEPALIVE_MAX_COUNT", 1)
+    monkeypatch.setattr(http_bridge_streaming_module, "_http_bridge_eventless_max_keepalive_count", lambda *_a, **_k: 1)
     account_id = await _import_account(
         async_client,
         "acc_http_bridge_reader_handoff",
@@ -14334,6 +14335,8 @@ async def test_v1_responses_http_bridge_idle_recovery_hands_reader_to_replacemen
     service = get_proxy_service_for_app(app_instance)
     record_retry_circuit_failure = AsyncMock(wraps=service._record_http_bridge_retry_circuit_failure)
     monkeypatch.setattr(service, "_record_http_bridge_retry_circuit_failure", record_retry_circuit_failure)
+    retry_precreated = AsyncMock(wraps=service._retry_http_bridge_precreated_request)
+    monkeypatch.setattr(service, "_retry_http_bridge_precreated_request", retry_precreated)
 
     response = await async_client.post(
         "/v1/responses",
@@ -14350,6 +14353,9 @@ async def test_v1_responses_http_bridge_idle_recovery_hands_reader_to_replacemen
     assert connect_count == 2
     assert upstreams[0].closed is True
     record_retry_circuit_failure.assert_not_awaited()
+    assert await service.drain_persistence_tasks(timeout_seconds=10)
+    retry_precreated.assert_awaited_once()
+    assert retry_precreated.await_args.kwargs.get("restart_reader") is True, "Recovery must hand off the reader"
 
 
 @pytest.mark.asyncio
@@ -19718,7 +19724,7 @@ async def _exercise_aged_idle_prompt_cache_socket(
 @pytest.mark.parametrize("path", ["/v1/responses", "/backend-api/codex/responses"])
 @pytest.mark.parametrize("authenticated", [False, True])
 @pytest.mark.parametrize(
-    "waiter_action", ["timeout", "cancel", "complete", "long_wait", "owner_cancel", "other_socket"]
+    "waiter_action", ["timeout", "cancel", "complete", "long_wait", "past_eventless", "owner_cancel", "other_socket"]
 )
 async def test_public_http_bridge_waiter_isolated_from_streaming_owner(
     async_client,
@@ -19733,12 +19739,12 @@ async def test_public_http_bridge_waiter_isolated_from_streaming_owner(
         monkeypatch,
         app_settings=_make_app_settings(enabled=True),
         dashboard_settings=dashboard,
-        admission_wait_timeout_seconds=0.04 if waiter_action in {"timeout", "long_wait"} else 2.0,
+        admission_wait_timeout_seconds=0.04 if waiter_action in {"timeout", "long_wait", "past_eventless"} else 2.0,
     )
     monkeypatch.setattr(
         http_bridge_helpers_module,
         "HTTP_BRIDGE_STUCK_GATE_RETIRE_AFTER_SECONDS",
-        2.0,
+        0.08 if waiter_action == "past_eventless" else 2.0,
     )
     account_id = await _import_account(async_client, "execution-owner", "execution-owner@example.com")
     account = await _get_account(account_id)
@@ -19819,24 +19825,22 @@ async def test_public_http_bridge_waiter_isolated_from_streaming_owner(
             )
         )
         await _wait_for_event(waiter_entered)
-        if waiter_action == "long_wait":
+        if waiter_action in {"long_wait", "past_eventless"}:
             await asyncio.sleep(0.12)
-            assert not waiter_task.done(), "Ordinary execution waiting must outlive short create admission"
+            assert not waiter_task.done(), "Ordinary execution waiting must outlive create admission and eventless caps"
         if waiter_action == "owner_cancel":
             owner_task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await owner_task
             waiting = await asyncio.wait_for(waiter_task, timeout=3)
-            error = (
-                waiting.json()["error"]
-                if waiting.status_code != 200
-                else [
-                    json.loads(line[6:])
-                    for line in waiting.text.splitlines()
-                    if line.startswith("data: ") and line[6:] != "[DONE]"
-                ][-1]["response"]["error"]
-            )
-            assert error["code"] == "response_execution_session_retired"
+            assert waiting.status_code == 200
+            waiter_events = [
+                json.loads(line[6:])
+                for line in waiting.text.splitlines()
+                if line.startswith("data: ") and line[6:] != "[DONE]"
+            ]
+            assert waiter_events[-1]["type"] == "response.completed"
+            assert connections == [account.id, account.id]
             assert len(upstream.sent_text) == 1
             return
         if waiter_action in {"timeout", "other_socket"}:
@@ -19872,7 +19876,7 @@ async def test_public_http_bridge_waiter_isolated_from_streaming_owner(
             ][-1]["response"]["error"]
         )
         assert error["code"] == "response_execution_wait_timeout"
-    elif waiter_action in {"complete", "long_wait", "other_socket"}:
+    elif waiter_action in {"complete", "long_wait", "past_eventless", "other_socket"}:
         assert waiting is not None and waiting.status_code == 200
         waiter_events = [
             json.loads(line[6:])
@@ -19893,7 +19897,7 @@ async def test_public_http_bridge_waiter_isolated_from_streaming_owner(
     assert successor_events[-1]["type"] == "response.completed"
     assert successor_events[-1]["response"]["usage"]["input_tokens_details"]["cached_tokens"] == 20
     assert connections == [account.id] * (2 if waiter_action == "other_socket" else 1)
-    assert len(upstream.sent_text) == (3 if waiter_action in {"complete", "long_wait"} else 2)
+    assert len(upstream.sent_text) == (3 if waiter_action in {"complete", "long_wait", "past_eventless"} else 2)
     assert all(json.loads(text)["prompt_cache_key"] == "execution-isolation" for text in upstream.sent_text)
     if key_id is not None:
         assert await service.drain_persistence_tasks(timeout_seconds=10)
@@ -19908,6 +19912,6 @@ async def test_public_http_bridge_waiter_isolated_from_streaming_owner(
         assert len(reservations) == 3
         assert sorted(reservation.status for reservation in reservations) == (
             ["finalized", "finalized", "finalized"]
-            if waiter_action in {"complete", "long_wait", "other_socket"}
+            if waiter_action in {"complete", "long_wait", "past_eventless", "other_socket"}
             else ["finalized", "finalized", "released"]
         )

@@ -6,7 +6,6 @@ from app.core.config.settings import Settings
 from app.core.errors import openai_error
 from app.modules.proxy._service.http_bridge.helpers import (
     _http_bridge_admission_timeout_seconds,
-    _http_bridge_eventless_budget_seconds,
     _http_bridge_request_budget_seconds,
 )
 from app.modules.proxy._service.support import _HTTPBridgeSession, _WebSocketRequestState
@@ -40,9 +39,9 @@ async def acquire_http_bridge_execution_before_create(
     execution_timeout = (
         admission_timeout_seconds
         if prewarm
-        else _http_bridge_eventless_budget_seconds(
-            settings, fallback_seconds=_http_bridge_request_budget_seconds(settings)
-        )
+        # A healthy predecessor may stream longer than the pre-response watchdog.
+        # Waiting for its execution permit is bounded by this request's budgets.
+        else min(settings.stream_idle_timeout_seconds, _http_bridge_request_budget_seconds(settings))
     )
     execution_timeout = _http_bridge_admission_timeout_seconds(request_state, execution_timeout, settings, now=now)
     await acquire_http_bridge_execution(request_state, session, scheduler=scheduler, timeout_seconds=execution_timeout)
