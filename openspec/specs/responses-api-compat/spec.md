@@ -11092,7 +11092,10 @@ This requirement does not add transparent retry after accepted model output and 
 
 An HTTP bridge MUST execute at most one response at a time on its upstream socket.
 An ordinary subsequent create MUST wait locally within the existing queue limits,
-the pre-response silence budget and the original request deadline. Its execution
+the configured stream-idle budget and the original request deadline. The ordinary
+execution wait MUST NOT be capped by the pre-response watchdog threshold. Its
+timeout MUST be the minimum of the bridge-request budget, the stream-idle budget
+and the remaining retained absolute request deadline. Its execution
 wait MUST NOT consume the short session/global create-admission budget. Wait timeout
 or cancellation MUST affect only the waiting request without upstream send/replay,
 reader cancellation, sibling failure, continuity changes or account penalty.
@@ -11153,6 +11156,14 @@ Separate sockets MUST retain independent concurrency.
 - **WHEN** B is cancelled
 - **THEN** A retains its execution permit, stream and upstream reader
 - **AND** B releases its queue registration and API-key reservation exactly once
+
+#### Scenario: a healthy predecessor exceeds the pre-response watchdog
+- **GIVEN** the bridge-request and stream-idle budgets are 7200 seconds and the pre-response watchdog is 300 seconds
+- **AND** an accepted predecessor streams for 330 seconds
+- **WHEN** an ordinary request queues behind it with sufficient time before its original deadline
+- **THEN** the waiter MUST remain queued beyond 300 seconds and dispatch once after the predecessor completes
+- **AND** both requests MUST complete on the same socket and account with the cache key unchanged
+- **AND** optional prewarm MUST retain its short admission timeout
 
 ### Requirement: HTTP bridge execution ownership survives recovery and cleanup
 
