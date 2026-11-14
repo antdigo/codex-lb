@@ -134,12 +134,34 @@ def _complete_original_items(payload: ResponsesRequest) -> bool:
             call_id = item.get("call_id")
             if not isinstance(call_id, str) or call_id not in pending_calls:
                 return False
-            if not isinstance(item.get("output"), str):
+            if not isinstance(item.get("output"), str) and not _complete_text_parts(
+                item.get("output"), kind="input_text"
+            ):
                 return False
             pending_calls.remove(call_id)
         elif kind == "reasoning":
-            if any(not isinstance(item.get(field), str) or not item[field] for field in ("id", "encrypted_content")):
+            if not isinstance(item.get("id"), str) or not item["id"]:
+                return False
+            encrypted = item.get("encrypted_content")
+            if encrypted is None:
+                if not _complete_text_parts(item.get("content"), kind="reasoning_text", require_nonempty_text=True):
+                    return False
+            elif not isinstance(encrypted, str) or not encrypted:
                 return False
         else:
             return False
     return not pending_calls
+
+
+def _complete_text_parts(content: object, *, kind: str, require_nonempty_text: bool = False) -> bool:
+    return (
+        isinstance(content, list)
+        and bool(content)
+        and all(
+            isinstance(part, dict)
+            and part.get("type") == kind
+            and isinstance(part.get("text"), str)
+            and (not require_nonempty_text or bool(part["text"]))
+            for part in content
+        )
+    )

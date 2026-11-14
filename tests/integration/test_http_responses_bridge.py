@@ -19360,8 +19360,19 @@ async def test_v1_responses_age_rotation_owns_close_across_early_exit(async_clie
     await _exercise_aged_idle_prompt_cache_socket(async_client, app_instance, monkeypatch, failure, "completed", False)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("durable", [True, False])
+@pytest.mark.parametrize("output_status", ["completed", "incomplete"])
+async def test_v1_responses_rotates_aged_socket_with_complete_native_text_history(
+    async_client, app_instance, monkeypatch, output_status, durable
+):
+    await _exercise_aged_idle_prompt_cache_socket(
+        async_client, app_instance, monkeypatch, "success", output_status, durable, native_text_history=True
+    )
+
+
 async def _exercise_aged_idle_prompt_cache_socket(
-    async_client, app_instance, monkeypatch, replacement, output_status, durable
+    async_client, app_instance, monkeypatch, replacement, output_status, durable, *, native_text_history=False
 ):
     from app.core.clock import RealClock
 
@@ -19536,6 +19547,16 @@ async def _exercise_aged_idle_prompt_cache_socket(
             "status": output_status,
         },
     ]
+    if native_text_history:
+        history[3]["output"] = [{"type": "input_text", "text": "cancelled result"}]
+        history.append(
+            {
+                "type": "reasoning",
+                "id": "reason_plain",
+                "summary": [],
+                "content": [{"type": "reasoning_text", "text": "synthetic explicit reasoning"}],
+            }
+        )
     first = await _collect_sse_events(
         async_client,
         "/v1/responses",
@@ -19675,6 +19696,9 @@ async def _exercise_aged_idle_prompt_cache_socket(
     assert frame["input"][1]["id"] == "reason_native"
     assert frame["input"][2]["call_id"] == frame["input"][3]["call_id"] == "call_native"
     assert frame["input"][3]["status"] == output_status
+    if native_text_history:
+        assert frame["input"][3]["output"] == history[3]["output"]
+        assert frame["input"][4] == history[4]
     current = next(session for session in service._http_bridge_sessions.values() if session.upstream is new_socket)
     assert current.physical_opened_at > clock.monotonic() - 10
     assert current.reader_processing is False

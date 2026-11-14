@@ -116,6 +116,83 @@ async def test_age_rotation_preserves_native_items_and_binds_original_target():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "output", ["", [{"type": "input_text", "text": "complete"}], [{"type": "input_text", "text": ""}]]
+)
+async def test_age_rotation_accepts_complete_native_text_tool_output(output):
+    session = _make_bridge_session()
+    items = [
+        {"type": "function_call", "call_id": "call", "name": "tool", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "call", "output": output, "status": "incomplete"},
+    ]
+    candidate = _candidate(session, items)
+    assert candidate.allows(session, now=4000)
+    assert candidate.payload.input == items
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("encrypted", ["absent", None])
+async def test_age_rotation_accepts_full_plaintext_reasoning_without_rewriting(encrypted):
+    session = _make_bridge_session()
+    item = {
+        "type": "reasoning",
+        "id": "reason_plain",
+        "summary": [],
+        "content": [{"type": "reasoning_text", "text": "complete native text"}],
+    }
+    if encrypted != "absent":
+        item["encrypted_content"] = encrypted
+    candidate = _candidate(session, [item])
+    assert candidate.allows(session, now=4000)
+    assert candidate.payload.input == [item]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "content",
+    [
+        [],
+        [{"type": "input_text"}],
+        [{"type": "input_text", "text": 1}],
+        [{"type": "input_image", "image_url": "https://example.invalid/image"}],
+        [{"type": "tool_reference", "tool_name": "tool"}],
+    ],
+)
+async def test_age_rotation_rejects_incomplete_or_opaque_tool_content(content):
+    session = _make_bridge_session()
+    items = [
+        {"type": "function_call", "call_id": "call", "name": "tool", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "call", "output": content},
+    ]
+    assert not _candidate(session, items).allows(session, now=4000)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"id": ""},
+        {"content": []},
+        {"content": [{"type": "reasoning_text"}]},
+        {"content": [{"type": "reasoning_text", "text": ""}]},
+        {"content": [{"type": "summary_text", "text": "summary only"}]},
+        {"encrypted_content": ""},
+        {"encrypted_content": 7},
+        {"status": "in_progress"},
+    ],
+)
+async def test_age_rotation_rejects_incomplete_or_malformed_plaintext_reasoning(patch):
+    session = _make_bridge_session()
+    item = {
+        "type": "reasoning",
+        "id": "reason_plain",
+        "content": [{"type": "reasoning_text", "text": "complete native text"}],
+        **patch,
+    }
+    assert not _candidate(session, [item]).allows(session, now=4000)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("anchor", ["previous_response_id", "conversation"])
 async def test_age_rotation_rejects_original_anchors(anchor):
     session = _make_bridge_session()
