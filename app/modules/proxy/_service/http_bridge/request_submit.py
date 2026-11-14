@@ -2220,6 +2220,18 @@ class _HTTPBridgeRequestSubmitMixin:
                                 openai_error("upstream_unavailable", "HTTP responses session bridge is retiring"),
                                 local_pre_dispatch_refusal=True,
                             )
+                        # Replacement preparation can outlive its original
+                        # budget while awaiting admission or persistence.
+                        if (
+                            request_state.bridge_age_required_account_id is not None
+                            and request_state.bridge_request_deadline is not None
+                            and clock.monotonic() >= request_state.bridge_request_deadline
+                        ):
+                            raise ProxyResponseError(
+                                502,
+                                openai_error("upstream_request_timeout", "Proxy request budget exhausted"),
+                                local_pre_dispatch_refusal=True,
+                            )
                         validate_http_bridge_dispatch_account(session, expected_account_id)
                         session.pending_requests.append(request_state)
                         session.admission_waiter_count = max(0, session.admission_waiter_count - 1)
