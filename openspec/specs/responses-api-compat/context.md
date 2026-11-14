@@ -390,3 +390,21 @@ consumer or a second transport failure terminates the request.
 This policy does not replay an accepted response after a service-restart close
 (1012). Such a turn may already have generated output or performed tool work.
 Raw downstream WebSocket recovery keeps its existing policy.
+
+## Retirement of an execution waiter
+
+A soft prompt-cache request can still be waiting for execution when an older
+turn's socket closes or starts draining. The local execution fence rejects
+that request before it sends anything. A cleaned, unanchored waiter can move
+once to a bridge for the same account, keeping its prepared context, API-key
+reservation and original deadline. For example, two queued Claude Code calls
+can both complete after the earlier socket retires without sending either call
+twice. An accepted response or a request carrying a continuity anchor does not
+qualify for this rule.
+
+The replacement uses the prepared request snapshot, including any already
+inlined images. Admission and persistence can consume the remaining budget, so
+dispatch checks the original deadline again after those waits. An unavailable
+owner, expired budget, cancellation or a repeated retirement ends the request
+through the existing settlement paths. No schema, dependencies, native helper
+or Bifrost configuration change is required.
