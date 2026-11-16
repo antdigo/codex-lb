@@ -1,4 +1,7 @@
+import asyncio
+import json
 from collections import deque
+from copy import deepcopy
 from typing import Any, cast
 from unittest.mock import Mock
 
@@ -6,10 +9,192 @@ import pytest
 
 from app.core.openai.requests import ResponsesRequest
 from app.modules.proxy._service.http_bridge.connection_lifetime import _HTTPBridgeAgeRotation
-from app.modules.proxy._service.support import _HTTPBridgeSessionKey
+from app.modules.proxy._service.http_bridge.request_submit import _send_http_bridge_request_text_with_archive_id
+from app.modules.proxy._service.http_bridge.streaming import _new_http_operation
+from app.modules.proxy._service.support import _HTTPBridgeSessionKey, _WebSocketRequestState
+from app.modules.proxy.http_operation import ReplayKind
+from tests.simulation.virtual_time import VirtualClock
 from tests.unit.test_http_bridge_idle_leases import _make_bridge_session
 
 pytestmark = pytest.mark.unit
+
+
+def _client_search_history():
+    return [
+        {"role": "user", "content": "discover a synthetic function"},
+        {
+            "type": "tool_search_call",
+            "execution": "client",
+            "call_id": "search_one",
+            "status": "completed",
+            "arguments": {"query": "verify"},
+        },
+        {
+            "type": "tool_search_output",
+            "execution": "client",
+            "call_id": "search_one",
+            "tools": [{"type": "function", "name": "verify", "parameters": {"type": "object"}}],
+        },
+    ]
+
+
+@pytest.mark.parametrize(
+    "tools,eligible",
+    [
+        ([], True),
+        ([{"type": "function", "name": "verify", "parameters": {"type": "object"}}], True),
+        ([{"type": "tool_search", "execution": "client", "parameters": {"type": "object"}}], True),
+        ([{"type": "tool_search", "execution": "server"}], False),
+        ([{"type": "tool_search"}], False),
+        ([{"type": "web_search"}], False),
+        ([{"type": "computer_use_preview"}], False),
+        ([{"type": "function"}], False),
+        ([{"type": "function", "name": "verify", "parameters": "opaque"}], False),
+        ([{"type": "tool_search", "execution": "client", "parameters": "opaque"}], False),
+    ],
+)
+def test_original_tool_catalog_controls_operation_replay_authority(tools, eligible):
+    payload = ResponsesRequest.model_validate(
+        {"model": "gpt-5.4", "instructions": "", "input": _client_search_history()}
+    )
+    frame = dict(payload.to_payload())
+    frame["tools"] = tools
+    operation = _new_http_operation(payload, frame, 100.0)
+    operation.begin_attempt(permit=operation.pending_dispatch, now=1.0, account_id="owner", generation=1)
+    grant = operation.authorize_replay(ReplayKind.TRANSPORT, now=2.0, account_id="owner", complete_input_required=True)
+    assert (grant is not None) is eligible
+    if eligible:
+        assert operation.pending_dispatch is not None
+        assert operation.pending_dispatch.required_account_id == "owner"
+        assert operation.authorize_replay(ReplayKind.CAPACITY, now=3.0, account_id="owner") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("execution,eligible", [("client", True), ("server", False)])
+async def test_wire_created_operation_uses_the_original_client_tool_contract(execution, eligible):
+    session = _make_bridge_session()
+    sent = []
+
+    class Socket:
+        async def send_text(self, text):
+            sent.append(json.loads(text))
+
+    session.upstream = cast(Any, Socket())
+    state = _WebSocketRequestState(
+        request_id="synthetic-discovery-wire",
+        model="gpt-5.4",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=1.0,
+        transport="http",
+        event_queue=asyncio.Queue(),
+    )
+    frame = {
+        "type": "response.create",
+        "model": "gpt-5.4",
+        "instructions": "",
+        "input": _client_search_history(),
+        "tools": [{"type": "tool_search", "execution": execution, "parameters": {"type": "object"}}],
+        "prompt_cache_key": "synthetic-unchanged-cache",
+    }
+    await _send_http_bridge_request_text_with_archive_id(
+        session, state, json.dumps(frame), clock=VirtualClock(monotonic_value=1, epoch_value=1)
+    )
+    operation = state.http_operation
+    assert operation is not None
+    grant = operation.authorize_replay(
+        ReplayKind.TRANSPORT, now=2.0, account_id=session.account.id, complete_input_required=True
+    )
+    assert (grant is not None) is eligible
+    assert len(sent) == 1
+    assert sent[0]["input"] == frame["input"]
+    assert sent[0]["tools"] == frame["tools"]
+    assert sent[0]["prompt_cache_key"] == "synthetic-unchanged-cache"
+
+
+@pytest.mark.asyncio
+async def test_age_rotation_preserves_complete_client_tool_search_history():
+    session = _make_bridge_session()
+    items = _client_search_history()
+    original = deepcopy(items)
+    candidate = _candidate(session, items)
+    assert candidate.allows(session, now=4000)
+    assert candidate.payload.input == original
+    assert items == original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "hosted_call",
+        "hosted_output",
+        "missing_execution",
+        "missing_call_id",
+        "blank_call_id",
+        "unmatched_output",
+        "missing_output",
+        "duplicate_output",
+        "duplicate_call",
+        "cross_kind_output",
+        "cross_kind_call",
+        "in_progress_call",
+        "incomplete_call",
+        "malformed_arguments",
+        "missing_arguments",
+        "missing_tools",
+        "non_list_tools",
+        "hosted_loaded_tool",
+        "unknown_loaded_tool",
+        "missing_function_name",
+        "malformed_function_parameters",
+    ],
+)
+async def test_age_rotation_rejects_unproven_client_tool_search(fault):
+    items = _client_search_history()
+    call, output = items[1:]
+    if fault == "hosted_call":
+        call["execution"] = "server"
+    elif fault == "hosted_output":
+        output["execution"] = "server"
+    elif fault == "missing_execution":
+        del call["execution"]
+    elif fault == "missing_call_id":
+        del call["call_id"]
+    elif fault == "blank_call_id":
+        call["call_id"] = " "
+    elif fault == "unmatched_output":
+        output["call_id"] = "another_search"
+    elif fault == "missing_output":
+        items.pop()
+    elif fault == "duplicate_output":
+        items.append(deepcopy(output))
+    elif fault == "duplicate_call":
+        items.insert(2, deepcopy(call))
+    elif fault == "cross_kind_output":
+        output.update(type="function_call_output", output="different contract")
+    elif fault == "cross_kind_call":
+        call.update(type="function_call", name="verify", arguments="{}")
+    elif fault in {"in_progress_call", "incomplete_call"}:
+        call["status"] = "in_progress" if fault == "in_progress_call" else "incomplete"
+    elif fault == "malformed_arguments":
+        call["arguments"] = "not an object"
+    elif fault == "missing_arguments":
+        del call["arguments"]
+    elif fault == "missing_tools":
+        del output["tools"]
+    elif fault == "non_list_tools":
+        output["tools"] = {"type": "function", "name": "verify"}
+    elif fault in {"hosted_loaded_tool", "unknown_loaded_tool"}:
+        output["tools"] = [{"type": "web_search" if fault == "hosted_loaded_tool" else "unknown"}]
+    elif fault == "missing_function_name":
+        output["tools"] = [{"type": "function", "parameters": {"type": "object"}}]
+    elif fault == "malformed_function_parameters":
+        output["tools"] = [{"type": "function", "name": "verify", "parameters": "opaque"}]
+    session = _make_bridge_session()
+    candidate = _candidate(session, items)
+    assert not candidate.allows(session, now=4000)
 
 
 def _candidate(session, items=None):
@@ -93,6 +278,20 @@ async def test_age_rotation_keeps_every_owned_generation(owner):
 async def test_age_rotation_rejects_incomplete_or_opaque_original_items(item):
     session = _make_bridge_session()
     candidate = _candidate(session, [item])
+    assert not candidate.allows(session, now=4000)
+
+
+@pytest.mark.asyncio
+async def test_age_rotation_allows_own_unsent_pool_head_but_preserves_other_waiters():
+    session = _make_bridge_session()
+    candidate = _candidate(session)
+    session.key = _HTTPBridgeSessionKey("internal_pool_lane", "group.3", None)
+    candidate.key = session.key
+    session.pool_waiter_count = 1
+    assert not candidate.allows(session, now=4000)
+    candidate.own_pool_waiters = 1
+    assert candidate.allows(session, now=4000)
+    session.pool_waiter_count = 2
     assert not candidate.allows(session, now=4000)
 
 
@@ -318,3 +517,37 @@ async def test_age_owner_is_required_at_central_reconnect_even_after_soft_prefer
     assert selection.await_args.kwargs["preferred_account_id"] == session.account.id
     assert selection.await_args.kwargs["fallback_on_preferred_account_unavailable"] is False
     connect.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_independent_pool_lane_rotates_at_safe_physical_boundary():
+    session = _make_bridge_session()
+    candidate = _candidate(session)
+    session.key = _HTTPBridgeSessionKey("internal_pool_lane", "group.3", None)
+    candidate.key = session.key
+    assert candidate.allows(session, now=4000)
+    session.queued_request_count = 1
+    assert not candidate.allows(session, now=4000)
+
+
+@pytest.mark.asyncio
+async def test_header_pool_rotation_requires_independent_complete_input_proof():
+    session = _make_bridge_session()
+    candidate = _candidate(session)
+    session.key = _HTTPBridgeSessionKey("internal_pool_lane", "broad-header.2", None)
+    candidate.key = session.key
+    session.codex_session = True
+    assert not candidate.allows(session, now=4000)
+    candidate.independent_pool_lane = True
+    assert candidate.allows(session, now=4000)
+    candidate.payload = candidate.payload.model_copy(update={"previous_response_id": "exact-owner"})
+    assert not candidate.allows(session, now=4000)
+    candidate.payload = candidate.payload.model_copy(
+        update={
+            "previous_response_id": None,
+            "input": [
+                {"role": "user", "content": [{"type": "input_file", "file_id": "owner-file"}]},
+            ],
+        }
+    )
+    assert not candidate.allows(session, now=4000)

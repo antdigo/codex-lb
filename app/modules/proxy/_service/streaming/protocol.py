@@ -1,12 +1,20 @@
 from __future__ import annotations
 
-from typing import Any, Protocol
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any, Protocol
+
+if TYPE_CHECKING:
+    from app.modules.proxy._service.support import _HTTPBridgeSession, _HTTPBridgeSessionKey
+    from app.modules.proxy.durable_bridge_coordinator import DurableBridgeSessionCoordinator
 
 
 class _StreamingServiceProtocol(Protocol):
     _acquire_account_response_create_lease_or_overload: Any
     _cancel_api_key_reservation_heartbeat_task: Any
     _drain_deferred_account_error_backoffs: Any
+    _durable_bridge: DurableBridgeSessionCoordinator
+    _http_bridge_sessions: Mapping[_HTTPBridgeSessionKey, _HTTPBridgeSession]
+    _http_bridge_detached_sessions: Mapping[int, _HTTPBridgeSession]
     _encryptor: Any
     _ensure_fresh_with_budget: Any
     _get_work_admission: Any

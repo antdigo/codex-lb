@@ -8,6 +8,8 @@ from app.core.clients.proxy import ProxyResponseError
 from app.core.clock import Clock, Scheduler
 from app.core.openai.requests import ResponsesRequest
 from app.db.models import Account
+from app.modules.proxy._service.http_bridge.affinity_pool import PoolCoordinator
+from app.modules.proxy._service.http_bridge.recovery_alias import RecoveryAliasTransfer
 from app.modules.proxy._service.support import _HTTPBridgeSession, _HTTPBridgeSessionKey, _WebSocketRequestState
 from app.modules.proxy.durable_bridge_repository import DurableBridgeAliasRegistrationReceipt
 from app.modules.proxy.load_balancer import AccountSelection
@@ -26,6 +28,7 @@ class _HTTPBridgeServiceProtocol(Protocol):
     _durable_bridge_coordinator: Any
     _http_bridge_owner_client: Any
     _http_bridge_sessions: Any
+    _http_bridge_affinity_pool: PoolCoordinator | None
     _http_bridge_detached_sessions: Any
     _http_bridge_denied_anchor_fences: Any
     _http_bridge_denied_anchor_fence_generation: int
@@ -122,6 +125,7 @@ class _HTTPBridgeServiceProtocol(Protocol):
         turn_state: str,
         *,
         reversible: bool,
+        source_transfer: RecoveryAliasTransfer | None = None,
     ) -> tuple[bool, DurableBridgeAliasRegistrationReceipt | None]: ...
     async def _register_http_bridge_previous_response_id_impl(
         self,
@@ -131,6 +135,7 @@ class _HTTPBridgeServiceProtocol(Protocol):
         input_item_count: int | None = None,
         input_full_fingerprint: str | None = None,
         pending_tool_calls: Mapping[str, str] | None = None,
+        advance_latest: bool = True,
     ) -> bool: ...
     async def _unregister_http_bridge_previous_response_id(
         self,

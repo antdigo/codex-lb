@@ -1,10 +1,11 @@
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClientProvider } from "@tanstack/react-query";
 import { render } from "@testing-library/react";
 import type { ReactElement } from "react";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useAuthStore } from "@/features/auth/hooks/use-auth";
+import { createTestQueryClient } from "@/test/query-client-lifecycle";
 import {
   ADMIN_PERMISSIONS,
   ASSIGNABLE_ROLE_IDS,
@@ -42,7 +43,7 @@ export function signInAsTeamAdmin(overrides: Partial<ReturnType<typeof useAuthSt
 
 /** The render result, plus the client behind it for a test that asserts on what is cached. */
 export function renderAt(ui: ReactElement, initialEntry = "/settings") {
-  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } });
+  const queryClient = createTestQueryClient();
   return {
     ...render(
       <QueryClientProvider client={queryClient}>

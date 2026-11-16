@@ -72,6 +72,7 @@ from app.core.clients.rate_limit_reset_credits import (
     consume_reset_credit,
     fetch_reset_credits,
 )
+from app.core.clients.thread_cache_identity import ThreadCachePolicy
 from app.core.clients.usage import (
     ConsumeRateLimitResetCreditResponse as UpstreamConsumeRateLimitResetCreditResponse,
 )
@@ -1543,6 +1544,7 @@ async def internal_bridge_responses(
         forwarded_affinity_kind=forwarded_request_context.context.original_affinity_kind,
         forwarded_affinity_key=forwarded_request_context.context.original_affinity_key,
         forwarded_file_owner_account_id=forwarded_request_context.context.file_owner_account_id,
+        forwarded_cache_policy=forwarded_request_context.context.cache_policy,
         forwarded_client_ip=forwarded_request_context.context.client_ip,
         # The OpenAI-SDK contract rewrites (drop ``codex.*``, backfill terminal
         # output, synthesize ``response.created``) MUST be applied by the
@@ -4591,6 +4593,11 @@ async def v1_chat_completions(
             scheduler=turn_scheduler,
             clock=turn_clock,
         )
+    except BaseException:
+        await _shared_await_cleanup_deferring_cancellation(
+            _close_responses_stream_best_effort(stream, action="chat startup probe"), scheduler=turn_scheduler
+        )
+        raise
     finally:
         _reset_propagated_capacity_startup_ready(capacity_ready_token)
         _reset_propagated_capacity_startup_wait(capacity_wait_token)
@@ -6317,6 +6324,7 @@ async def _stream_responses(
     forwarded_affinity_kind: str | None = None,
     forwarded_affinity_key: str | None = None,
     forwarded_file_owner_account_id: str | None = None,
+    forwarded_cache_policy: ThreadCachePolicy | None = None,
     forwarded_client_ip: str | None = None,
     enforce_openai_sdk_contract: bool = True,
     native_codex_heartbeat: bool = False,
@@ -6563,6 +6571,7 @@ async def _stream_responses(
                 forwarded_affinity_kind=forwarded_affinity_kind,
                 forwarded_affinity_key=forwarded_affinity_key,
                 forwarded_file_owner_account_id=forwarded_file_owner_account_id,
+                **({"forwarded_cache_policy": forwarded_cache_policy} if forwarded_cache_policy is not None else {}),
                 client_ip=client_ip,
                 enforce_openai_sdk_contract=enforce_openai_sdk_contract,
                 http_bridge_active=bridge_active,
@@ -6622,6 +6631,13 @@ async def _stream_responses(
             _reset_propagated_capacity_startup_ready(capacity_ready_token)
             _reset_propagated_capacity_startup_wait(capacity_wait_token)
     except BaseException:
+        # The route still owns the original iterator until delivery cleanup is
+        # installed. A completed first-item task does not close that iterator
+        # when startup probing is cancelled during the handoff.
+        await _shared_await_cleanup_deferring_cancellation(
+            _close_responses_stream_best_effort(upstream_stream, action="responses startup probe"),
+            scheduler=turn_scheduler,
+        )
         if _responses_origin_may_release_reservation(
             service_cleanup_ready_event=responses_service_cleanup_ready_event,
             owner_forward_dispatched_event=responses_owner_forward_dispatched_event,

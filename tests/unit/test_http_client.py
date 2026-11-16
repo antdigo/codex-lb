@@ -29,7 +29,12 @@ async def _drain_close_tasks() -> None:
 
 
 @pytest.fixture(autouse=True)
-def _isolate_shared_ssl_context() -> Iterator[None]:
+def _isolate_shared_ssl_context(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    # Operator proxy settings must not change which connector a no-proxy test
+    # exercises. Proxy-specific cases provide their own environment explicitly.
+    for key in ("http_proxy", "https_proxy", "all_proxy", "socks_proxy"):
+        monkeypatch.delenv(key, raising=False)
+        monkeypatch.delenv(key.upper(), raising=False)
     # The shared context is a process-wide cache; every test starts from an
     # empty cache so ``_build_ssl_context`` patches take effect per test.
     http_module._reset_shared_ssl_context()

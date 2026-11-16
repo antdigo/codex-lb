@@ -240,7 +240,13 @@ async def test_budget_exhaustion_during_websocket_open_arms_marker() -> None:
     # budgeted opener itself must arm the handshake-denial marker.
     class _StalledOpenHarness(ws_mixin._WebSocketMixin):
         async def _open_upstream_websocket(
-            self, account: Any, headers: Any, *, request_state: Any = None, connect_progress: Any = None
+            self,
+            account: Any,
+            headers: Any,
+            *,
+            request_state: Any = None,
+            thread_cache_identity: Any = None,
+            connect_progress: Any = None,
         ) -> Any:
             del account, headers, request_state
             if connect_progress is not None:
@@ -268,7 +274,13 @@ async def test_process_network_recovery_exhaustion_during_open_arms_marker(
     # the marker like the stalled-open branch.
     class _ConnectFailingOpenHarness(ws_mixin._WebSocketMixin):
         async def _open_upstream_websocket(
-            self, account: Any, headers: Any, *, request_state: Any = None, connect_progress: Any = None
+            self,
+            account: Any,
+            headers: Any,
+            *,
+            request_state: Any = None,
+            thread_cache_identity: Any = None,
+            connect_progress: Any = None,
         ) -> Any:
             del account, headers, request_state
             raise _transport_error(502, "upstream_unavailable", "Request to upstream timed out")
@@ -295,7 +307,13 @@ async def test_exhausted_route_resolution_failure_does_not_arm_marker(
     # evidence without connect provenance and must not deny handshakes.
     class _RouteFailingOpenHarness(ws_mixin._WebSocketMixin):
         async def _open_upstream_websocket(
-            self, account: Any, headers: Any, *, request_state: Any = None, connect_progress: Any = None
+            self,
+            account: Any,
+            headers: Any,
+            *,
+            request_state: Any = None,
+            thread_cache_identity: Any = None,
+            connect_progress: Any = None,
         ) -> Any:
             del account, headers, request_state
             raise _proxy_error(
@@ -485,6 +503,37 @@ async def test_http_bridge_bypassed_while_transport_failure_marker_armed(
     assert chunks == ['data: {"type":"response.completed"}\n\n']
     assert len(retry_calls) == 1
     assert retry_calls[0]["upstream_stream_transport_override"] == "http"
+
+
+@pytest.mark.asyncio
+async def test_http_bridge_downstream_close_joins_owned_bridge_iterator(monkeypatch):
+    service = _bridge_service(monkeypatch, dashboard_transport="default")
+    closed = asyncio.Event()
+    operations = []
+
+    async def bridge(*args, **kwargs):
+        operations.append(kwargs["_operation"])
+        try:
+            yield 'data: {"type":"response.created","response":{"id":"resp_owned"}}\n\n'
+            await asyncio.Event().wait()
+        finally:
+            closed.set()
+
+    monkeypatch.setattr(service, "_stream_via_http_bridge", bridge)
+    stream = service._stream_http_bridge_or_retry(
+        _bridge_payload(),
+        {},
+        codex_session_affinity=True,
+        propagate_http_errors=True,
+        openai_cache_affinity=False,
+        api_key=None,
+        api_key_reservation=None,
+        suppress_text_done_events=False,
+    )
+    await stream.__anext__()
+    await stream.aclose()
+    assert closed.is_set()
+    assert operations[0].publication.value == "closed"
 
 
 @pytest.mark.asyncio

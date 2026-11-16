@@ -58,6 +58,25 @@ def _postgresql_only_skipif_test_ids() -> tuple[str, ...]:
     return tuple(node_ids)
 
 
+def test_runtime_gated_identity_sql_and_benchmark_cases_run_on_postgres() -> None:
+    targets = _postgres_pytest_targets(MAKEFILE.read_text(encoding="utf-8"))
+    for path, names in {
+        "tests/integration/test_live_usage_ingest.py": (
+            "test_postgresql_live_ingest_serializes_identity_membership_through_snapshot_commit",
+            "test_postgresql_live_ingest_waits_for_identity_consolidation_commit",
+            "test_postgresql_live_ingest_recovers_when_current_identity_reconciliation_wins_owner_lock",
+            "test_postgresql_opposite_identity_moves_use_one_sorted_lock_order",
+        ),
+        "tests/integration/test_usage_repository.py": (
+            "test_additional_latest_by_account_postgres_uses_top1_probes",
+            "test_list_quota_keys_postgres_loose_scan_matches_distinct",
+        ),
+        "tests/integration/test_migration_benchmark.py": ("test_benchmark_measures_selected_revisions",),
+    }.items():
+        for name in names:
+            assert path in targets or f"{path}::{name}" in targets, f"Unexecuted PostgreSQL case: {path}::{name}"
+
+
 def test_postgresql_only_skipif_tests_are_registered_in_postgres_pytest_targets() -> None:
     targets = _postgres_pytest_targets(MAKEFILE.read_text(encoding="utf-8"))
     whole_file_targets = {target for target in targets if "::" not in target}

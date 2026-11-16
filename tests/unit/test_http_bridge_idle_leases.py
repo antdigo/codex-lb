@@ -9,7 +9,7 @@ from collections import deque
 from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import AsyncMock
+from unittest.mock import ANY, AsyncMock
 
 import anyio
 import pytest
@@ -26,6 +26,15 @@ from app.modules.proxy.load_balancer import LoadBalancer
 from tests.simulation.virtual_time import VirtualClock, VirtualScheduler
 
 pytestmark = pytest.mark.unit
+
+
+@pytest.fixture(autouse=True)
+def _admission_settings_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        http_bridge_request_submit_module,
+        "_service_get_settings_cache",
+        lambda: SimpleNamespace(get=AsyncMock(return_value=SimpleNamespace())),
+    )
 
 
 class _RecordingVirtualScheduler(VirtualScheduler):
@@ -159,7 +168,9 @@ async def test_next_turn_reacquires_stream_lease(monkeypatch: pytest.MonkeyPatch
         estimated_tokens=0.0,
         api_key_id=None,
         api_key_stream_fair_share_threshold_pct=0,
-        routing_tunables=None,
+        routing_tunables=ANY,
+        concurrency_caps=ANY,
+        stream_reserve_slots=1,
     )
 
 
@@ -200,7 +211,9 @@ async def test_reacquire_carries_turn_usage_budget_estimate() -> None:
         estimated_tokens=expected_tokens,
         api_key_id=None,
         api_key_stream_fair_share_threshold_pct=0,
-        routing_tunables=None,
+        routing_tunables=ANY,
+        concurrency_caps=ANY,
+        stream_reserve_slots=1,
     )
 
 
@@ -396,8 +409,10 @@ async def test_keyed_submit_with_held_lease_never_reads_settings(
 
 
 @pytest.mark.asyncio
-async def test_keyed_submit_resolves_fair_share_before_pending_lock(
+@pytest.mark.parametrize("api_key_id", [None, "key-stall"])
+async def test_submit_resolves_admission_settings_before_pending_lock(
     monkeypatch: pytest.MonkeyPatch,
+    api_key_id: str | None,
 ) -> None:
     """Issue #1971 product path: a stalled settings-cache refresh must stall
     the submit BEFORE it acquires ``session.pending_lock``, so the session's
@@ -406,7 +421,7 @@ async def test_keyed_submit_resolves_fair_share_before_pending_lock(
     stall — cleanup tasks piled up on it for days in production."""
 
     service = proxy_service.ProxyService(cast(Any, nullcontext()))
-    session = _make_bridge_session(api_key_id="key-stall")
+    session = _make_bridge_session(api_key_id=api_key_id)
     lease = _make_lease("l-stall")
     monkeypatch.setattr(service._load_balancer, "acquire_account_lease", AsyncMock(return_value=lease))
     monkeypatch.setattr(service._load_balancer, "release_account_lease", AsyncMock())
@@ -637,7 +652,9 @@ async def test_response_create_admission_failure_releases_reacquired_stream_leas
         estimated_tokens=0.0,
         api_key_id=None,
         api_key_stream_fair_share_threshold_pct=0,
-        routing_tunables=None,
+        routing_tunables=ANY,
+        concurrency_caps=ANY,
+        stream_reserve_slots=1,
     )
     prewarm.assert_awaited_once()
     release_account_lease.assert_awaited_once_with(lease)
@@ -784,7 +801,9 @@ async def test_stale_finalizer_cannot_release_lease_reacquired_for_new_turn(
         estimated_tokens=0.0,
         api_key_id=None,
         api_key_stream_fair_share_threshold_pct=0,
-        routing_tunables=None,
+        routing_tunables=ANY,
+        concurrency_caps=ANY,
+        stream_reserve_slots=1,
     )
     # The admission-failure cleanup settles the lease exactly once.
     release_account_lease.assert_awaited_once_with(lease)
@@ -850,7 +869,9 @@ async def test_prewarm_failure_retires_closed_session_after_last_waiter(
         estimated_tokens=0.0,
         api_key_id=None,
         api_key_stream_fair_share_threshold_pct=0,
-        routing_tunables=None,
+        routing_tunables=ANY,
+        concurrency_caps=ANY,
+        stream_reserve_slots=1,
     )
     release_account_lease.assert_awaited_once_with(lease)
     assert session.admission_waiter_count == 0
@@ -1051,7 +1072,9 @@ async def test_prewarm_cancellation_cannot_interrupt_waiter_cleanup(
         estimated_tokens=0.0,
         api_key_id=None,
         api_key_stream_fair_share_threshold_pct=0,
-        routing_tunables=None,
+        routing_tunables=ANY,
+        concurrency_caps=ANY,
+        stream_reserve_slots=1,
     )
     release_account_lease.assert_awaited_once_with(lease)
     assert session.admission_waiter_count == 0
@@ -1321,3 +1344,226 @@ async def test_retire_without_timeout_still_waits_for_pending_lock() -> None:
     await holder
     assert await asyncio.wait_for(retire_task, timeout=1) is True
     close_bounded.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_warm_ordinary_admission_leaves_eighth_slot_reserved() -> None:
+    mixin = http_bridge_request_submit_module._HTTPBridgeRequestSubmitMixin
+    balancer = LoadBalancer(cast(Any, None))
+    fake_self = SimpleNamespace(_load_balancer=balancer)
+    for _ in range(7):
+        assert await balancer.acquire_account_lease("acc-bridge", kind="stream") is not None
+    ordinary = _make_bridge_session()
+    async with ordinary.pending_lock:
+        with pytest.raises(ProxyResponseError) as error:
+            await mixin._ensure_http_bridge_session_stream_lease_locked(fake_self, ordinary)
+    assert error.value.payload["error"]["code"] == "account_stream_cap"
+    assert (await balancer.account_pressure_snapshot("acc-bridge"))[1] == 7
+
+
+@pytest.mark.asyncio
+async def test_direct_acquire_optional_reserve_preserves_hard_cap_and_legacy_default() -> None:
+    balancer = LoadBalancer(cast(Any, None))
+    for _ in range(7):
+        assert await balancer.acquire_account_lease("acc", kind="stream", stream_reserve_slots=1) is not None
+    assert await balancer.acquire_account_lease("acc", kind="stream", stream_reserve_slots=1) is None
+    assert await balancer.acquire_account_lease("acc", kind="stream") is not None
+    assert await balancer.acquire_account_lease("acc", kind="stream") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("claimed,owner_epoch", [(False, 3), (True, 4), (True, None)])
+async def test_warm_recovery_reserve_cannot_be_bypassed_without_matching_claim(
+    claimed: bool,
+    owner_epoch: int | None,
+) -> None:
+    mixin = http_bridge_request_submit_module._HTTPBridgeRequestSubmitMixin
+    balancer = LoadBalancer(cast(Any, None))
+    for _ in range(7):
+        await balancer.acquire_account_lease("acc-bridge", kind="stream")
+    session = _make_bridge_session()
+    session.durable_session_id = "durable-session"
+    session.durable_owner_epoch = None if owner_epoch is None else 3
+    request = proxy_service._WebSocketRequestState(
+        request_id="req-unproven",
+        model="gpt-5.2",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=1.0,
+        recovery_attempt_claimed=claimed,
+        recovery_attempt_fingerprint="proof",
+        recovery_attempt_session_id="durable-session",
+        recovery_attempt_owner_epoch=owner_epoch,
+    )
+    async with session.pending_lock:
+        with pytest.raises(ProxyResponseError) as error:
+            await mixin._ensure_http_bridge_session_stream_lease_locked(
+                SimpleNamespace(_load_balancer=balancer),
+                session,
+                request_state=request,
+            )
+    assert error.value.payload["error"]["code"] == "account_stream_cap"
+    assert (await balancer.account_pressure_snapshot("acc-bridge"))[1] == 7
+
+
+@pytest.mark.asyncio
+async def test_submit_warm_ordinary_request_refuses_recovery_slot() -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    for _ in range(7):
+        await service._load_balancer.acquire_account_lease("acc-bridge", kind="stream")
+    session = _make_bridge_session()
+    request = proxy_service._WebSocketRequestState(
+        request_id="req-ordinary-cap",
+        model="gpt-5.2",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=1.0,
+        transport="http",
+        skip_request_log=True,
+    )
+    with pytest.raises(ProxyResponseError) as error:
+        await service._submit_http_bridge_request(
+            session,
+            request_state=request,
+            text_data='{"type":"response.create"}',
+            queue_limit=8,
+        )
+    assert error.value.payload["error"]["code"] == "account_stream_cap"
+    assert session.account_lease is None
+    assert session.admission_waiter_count == 0
+
+
+@pytest.mark.asyncio
+async def test_unkeyed_reacquire_snapshot_uses_one_dashboard_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mixin = http_bridge_request_submit_module._HTTPBridgeRequestSubmitMixin
+    settings_get = AsyncMock(
+        return_value=SimpleNamespace(
+            proxy_account_stream_limit=12,
+            proxy_account_stream_recovery_reserve=2,
+            proxy_account_lease_ttl_seconds=321.0,
+        )
+    )
+    monkeypatch.setattr(
+        http_bridge_request_submit_module, "_service_get_settings_cache", lambda: SimpleNamespace(get=settings_get)
+    )
+    threshold, tunables, caps, reserve = await mixin._http_bridge_reacquire_snapshot(
+        SimpleNamespace(),
+        _make_bridge_session(),
+    )
+    settings_get.assert_awaited_once()
+    assert threshold == 0
+    assert tunables.lease_ttl_seconds == 321.0
+    assert caps.stream_limit == 12
+    assert reserve == 2
+
+
+@pytest.mark.asyncio
+async def test_claimed_journal_metadata_does_not_authorize_warm_reserve_bypass() -> None:
+    mixin = http_bridge_request_submit_module._HTTPBridgeRequestSubmitMixin
+    balancer = LoadBalancer(cast(Any, None))
+    for _ in range(7):
+        await balancer.acquire_account_lease("acc-bridge", kind="stream")
+    session = _make_bridge_session()
+    session.durable_session_id = "durable-session"
+    session.durable_owner_epoch = 3
+    request = proxy_service._WebSocketRequestState(
+        request_id="req-unreachable-claim",
+        model="gpt-5.2",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=1.0,
+        recovery_attempt_claimed=True,
+        recovery_attempt_fingerprint="proof",
+        recovery_attempt_session_id="durable-session",
+        recovery_attempt_owner_epoch=3,
+    )
+    with pytest.raises(ProxyResponseError):
+        await mixin._ensure_http_bridge_session_stream_lease_locked(
+            SimpleNamespace(_load_balancer=balancer),
+            session,
+            request_state=request,
+        )
+
+
+@pytest.mark.asyncio
+async def test_http_reconnect_uses_authoritative_reattach_selection_for_eighth_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from datetime import datetime, timezone
+
+    from tests.unit.test_load_balancer_concurrency import (
+        _make_account,
+        _repo_factory,
+        _StubAccountsRepository,
+        _StubUsageRepository,
+        _usage_row,
+    )
+
+    account = _make_account("acc-bridge")
+    now = int(datetime.now(tz=timezone.utc).timestamp())
+    accounts = _StubAccountsRepository([account])
+    usage = _StubUsageRepository(
+        primary={account.id: _usage_row(22, account.id, window="primary", reset_at=now + 300)},
+        secondary={account.id: _usage_row(23, account.id, window="secondary", reset_at=now + 3600)},
+    )
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    service._load_balancer = LoadBalancer(lambda: _repo_factory(accounts, usage))
+    for index in range(7):
+        await service._load_balancer.acquire_account_lease(
+            account.id, kind="stream", api_key_id="key-hot" if index < 4 else "key-other"
+        )
+    session = _make_bridge_session(api_key_id="key-hot")
+    session.account = account
+    request = proxy_service._WebSocketRequestState(
+        request_id="req-real-reattach",
+        model="gpt-5.2",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=time.monotonic(),
+        transport="http",
+        skip_request_log=True,
+        api_key=proxy_service.ApiKeyData(
+            id="key-hot",
+            name="bridge-key",
+            key_prefix="sk-bridge",
+            allowed_models=None,
+            enforced_model=None,
+            enforced_reasoning_effort=None,
+            enforced_service_tier=None,
+            expires_at=None,
+            is_active=True,
+            created_at=datetime.now(tz=timezone.utc),
+            last_used_at=None,
+            account_assignment_scope_enabled=False,
+            assigned_account_ids=[],
+        ),
+    )
+    monkeypatch.setattr(
+        proxy_service,
+        "get_settings_cache",
+        lambda: SimpleNamespace(
+            get=AsyncMock(
+                return_value=SimpleNamespace(
+                    prefer_earlier_reset_accounts=False,
+                    prefer_earlier_reset_window="secondary",
+                    routing_strategy="usage_weighted",
+                    proxy_api_key_fair_share_congestion_threshold_pct=80,
+                )
+            )
+        ),
+    )
+    replacement = SimpleNamespace(send_text=AsyncMock(), close=AsyncMock(), response_header=lambda _name: None)
+    monkeypatch.setattr(service, "_ensure_fresh_with_budget", AsyncMock(return_value=account))
+    monkeypatch.setattr(service, "_open_upstream_websocket_with_budget", AsyncMock(return_value=replacement))
+    await service._reconnect_http_bridge_session(session, request_state=request, require_same_account=True)
+    assert session.account_lease is not None
+    assert session.account.id == account.id
+    assert session.upstream is replacement
+    assert (await service._load_balancer.account_pressure_snapshot(account.id))[1] == 8
+    assert await service._load_balancer.acquire_account_lease(account.id, kind="stream") is None

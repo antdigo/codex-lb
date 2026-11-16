@@ -912,6 +912,7 @@ async def test_warmup_runs_parallel_with_max_five_accounts(async_client, monkeyp
 
     in_flight_compact_calls = 0
     peak_compact_calls = 0
+    first_batch_full = asyncio.Event()
 
     async def _fake_ensure_fresh(self, account, *, force=False, timeout_seconds=None):
         del self, force, timeout_seconds
@@ -923,8 +924,11 @@ async def test_warmup_runs_parallel_with_max_five_accounts(async_client, monkeyp
 
         in_flight_compact_calls += 1
         peak_compact_calls = max(peak_compact_calls, in_flight_compact_calls)
+        if in_flight_compact_calls == 5:
+            first_batch_full.set()
         try:
-            await asyncio.sleep(0.05)
+            # Hold the first batch until all five slots execute concurrently.
+            await asyncio.wait_for(first_batch_full.wait(), timeout=5)
             return CompactResponsePayload.model_validate(
                 {
                     "object": "response.compact",

@@ -544,7 +544,9 @@ async def test_http_bridge_stream_waits_only_while_completed_delivery_is_active(
     terminal_outcome: str,
 ) -> None:
     caplog.set_level(logging.INFO, logger="app.modules.proxy.service")
-    service = proxy_service.ProxyService(cast(Any, SimpleNamespace()))
+    clock = VirtualClock(monotonic_value=1.0)
+    scheduler = VirtualScheduler(clock)
+    service = proxy_service.ProxyService(cast(Any, SimpleNamespace()), clock=clock, scheduler=scheduler)
     queue_waiting = asyncio.Event()
     terminal_claimed = asyncio.Event()
     release_terminal = asyncio.Event()
@@ -588,6 +590,9 @@ async def test_http_bridge_stream_waits_only_while_completed_delivery_is_active(
             raise RuntimeError("terminal persistence failed")
         return True
 
+    # Exercise the actual circuit adapter without unrelated SQL scheduling
+    # determining whether the 1ms queue timer starts before terminal ownership.
+    monkeypatch.setattr(service._durable_bridge, "lookup_retry_circuit", AsyncMock(return_value=None))
     finalize_request = AsyncMock()
     monkeypatch.setattr(service, "_submit_http_bridge_request", fake_submit_http_bridge_request)
     monkeypatch.setattr(service, "_register_http_bridge_previous_response_id", block_after_terminal_claim)
@@ -616,53 +621,67 @@ async def test_http_bridge_stream_waits_only_while_completed_delivery_is_active(
             )
         ]
 
-    stream_task = asyncio.create_task(consume_stream())
-    await asyncio.wait_for(queue_waiting.wait(), timeout=1.0)
-    terminal_text = '{"type":"response.completed","response":{"id":"resp-terminal-race","status":"completed"}}'
-    terminal_task = asyncio.create_task(service._process_http_bridge_upstream_text(session, terminal_text))
-    await asyncio.wait_for(terminal_claimed.wait(), timeout=1.0)
-    assert request_state.completed_delivery_scope is not None
-    assert request_state.completed_delivery_scope.active is True
-    assert await service._detach_http_bridge_request(session, request_state=request_state) is False
-    assert request_state.event_queue is None
-    await asyncio.sleep(0.02)
-    assert not stream_task.done()
+    try:
+        stream_task = scheduler.create_task(consume_stream())
+        await scheduler.drain()
+        assert queue_waiting.is_set(), stream_task.result() if stream_task.done() else "queue reader did not start"
+        terminal_text = '{"type":"response.completed","response":{"id":"resp-terminal-race","status":"completed"}}'
+        terminal_task = scheduler.create_task(service._process_http_bridge_upstream_text(session, terminal_text))
+        await scheduler.drain()
+        assert terminal_claimed.is_set(), terminal_task.result() if terminal_task.done() else "terminal was not claimed"
+        assert request_state.completed_delivery_scope is not None
+        assert request_state.completed_delivery_scope.active is True
+        assert await service._detach_http_bridge_request(session, request_state=request_state) is False
+        assert request_state.event_queue is None
+        await scheduler.advance(0.02)
+        assert not stream_task.done()
 
-    release_terminal.set()
-    if terminal_outcome == "completed":
-        await asyncio.wait_for(terminal_task, timeout=1.0)
-    else:
-        with pytest.raises(RuntimeError, match="terminal persistence failed"):
-            await asyncio.wait_for(terminal_task, timeout=1.0)
-    event_blocks = await asyncio.wait_for(stream_task, timeout=1.0)
+        release_terminal.set()
+        await scheduler.drain()
+        assert terminal_task.done(), "terminal ownership did not finish after release"
+        if terminal_outcome == "completed":
+            await terminal_task
+        else:
+            with pytest.raises(RuntimeError, match="terminal persistence failed"):
+                await terminal_task
+        # Once the failed terminal producer releases its claim, two real idle
+        # periods (on virtual time) must terminate the still-empty consumer queue.
+        await scheduler.advance(0.002)
+        assert stream_task.done(), "stream stalled after completed-delivery ownership ended"
+        event_blocks = await stream_task
 
-    event_types = [
-        payload["type"]
-        for event_block in event_blocks
-        if isinstance(payload := proxy_service.parse_sse_data_json(event_block), dict)
-    ]
-    if terminal_outcome == "completed":
-        assert event_types[-1] == "response.completed"
-        assert event_types.count("response.completed") == 1
-        assert "response.failed" not in event_types
-        finalize_request.assert_awaited_once()
-    else:
-        assert event_types[-1] == "response.failed"
-        assert "stream_idle_timeout" in "".join(event_blocks)
-        finalize_request.assert_not_awaited()
-    assert request_state.completed_delivery_scope is not None
-    assert request_state.completed_delivery_scope.active is False
-    assert parse_sse_data_json_text.call_count == 1
-    assert parse_sse_event_payload.call_count == 1
-    suppression_messages = [
-        record.getMessage()
-        for record in caplog.records
-        if "HTTP bridge stream idle timeout suppressed during completed delivery" in record.getMessage()
-    ]
-    assert len(suppression_messages) == 1
-    assert "request_id=req-terminal-race" in suppression_messages[0]
-    assert "response_id=resp-terminal-race" in suppression_messages[0]
-    assert "elapsed_seconds=" in suppression_messages[0]
+        event_types = [
+            payload["type"]
+            for event_block in event_blocks
+            if isinstance(payload := proxy_service.parse_sse_data_json(event_block), dict)
+        ]
+        if terminal_outcome == "completed":
+            assert event_types[-1] == "response.completed"
+            assert event_types.count("response.completed") == 1
+            assert "response.failed" not in event_types
+            finalize_request.assert_awaited_once()
+        else:
+            assert event_types[-1] == "response.failed"
+            assert "stream_idle_timeout" in "".join(event_blocks)
+            finalize_request.assert_not_awaited()
+        assert request_state.completed_delivery_scope is not None
+        assert request_state.completed_delivery_scope.active is False
+        assert parse_sse_data_json_text.call_count == 1
+        assert parse_sse_event_payload.call_count == 1
+        suppression_messages = [
+            record.getMessage()
+            for record in caplog.records
+            if "HTTP bridge stream idle timeout suppressed during completed delivery" in record.getMessage()
+        ]
+        assert len(suppression_messages) == 1
+        assert "request_id=req-terminal-race" in suppression_messages[0]
+        assert "response_id=resp-terminal-race" in suppression_messages[0]
+        assert "elapsed_seconds=" in suppression_messages[0]
+    finally:
+        release_terminal.set()
+        await scheduler.cancel_owned_tasks()
+        assert not scheduler.owned_tasks
+        assert not service._background_cleanup_tasks
 
 
 def _attach_reservation_with_heartbeat(
@@ -694,10 +713,12 @@ async def _assert_heartbeat_finished(heartbeat_task: asyncio.Task[None]) -> None
 
 
 @pytest.mark.parametrize("abort_kind", ["exception", "cancellation"])
+@pytest.mark.parametrize("controlled_http", [False, True])
 @pytest.mark.asyncio
 async def test_http_bridge_aborted_completed_bookkeeping_settles_reservation(
     monkeypatch: pytest.MonkeyPatch,
     abort_kind: str,
+    controlled_http: bool,
 ) -> None:
     """Issue #1594: an abort after the completed pending pop must still settle.
 
@@ -727,6 +748,16 @@ async def test_http_bridge_aborted_completed_bookkeeping_settles_reservation(
     )
     reservation = request_state.api_key_reservation
     session = _make_http_bridge_session(deque([request_state]), queued_request_count=1)
+    if controlled_http:
+        from app.modules.proxy.http_operation import OperationController
+
+        request_state.http_operation = OperationController(None)
+        request_state.response_create_attempt = request_state.http_operation.begin_attempt(
+            permit=request_state.http_operation.pending_dispatch,
+            now=1,
+            account_id=session.account.id,
+            generation=session.connection_generation,
+        )
     from app.core.clients.proxy import ProxyResponseError
     from app.core.clock import REAL_SCHEDULER
     from app.modules.proxy._service.http_bridge.execution import (
@@ -741,7 +772,13 @@ async def test_http_bridge_aborted_completed_bookkeeping_settles_reservation(
     async def abort_bookkeeping(*args: Any, **kwargs: Any) -> bool:
         del args, kwargs
         assert request_state not in session.pending_requests
-        assert request_state.terminal_settlement_phase == "claimed"
+        if controlled_http:
+            from app.modules.proxy._service.support import _http_operation_owner_key
+
+            assert request_state.http_operation is not None
+            assert not request_state.http_operation.allows_compensation(_http_operation_owner_key(request_state))
+        else:
+            assert request_state.terminal_settlement_phase == "claimed"
         bookkeeping_started.set()
         if abort_kind == "exception":
             raise RuntimeError("continuity bookkeeping failed")
@@ -768,7 +805,13 @@ async def test_http_bridge_aborted_completed_bookkeeping_settles_reservation(
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(terminal_task, timeout=1.0)
 
-    release_reservation.assert_awaited_once_with(reservation)
+    if controlled_http:
+        release_reservation.assert_awaited_once()
+        assert release_reservation.await_args is not None
+        assert release_reservation.await_args.args == (reservation,)
+        assert release_reservation.await_args.kwargs["operation"] is request_state.http_operation
+    else:
+        release_reservation.assert_awaited_once_with(reservation)
     assert request_state.api_key_reservation is None
     assert request_state.terminal_settlement_phase is None
     await _assert_heartbeat_finished(heartbeat_task)

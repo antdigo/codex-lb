@@ -437,6 +437,16 @@ def _facade() -> Any:
     return sys.modules["app.modules.proxy.service"]
 
 
+def _reported_usage_tokens(usage: ResponseUsage | None) -> tuple[int | None, int | None, int | None, int | None]:
+    """Keep absent physical-attempt usage unknown at the persistence boundary."""
+    return (
+        usage.input_tokens if usage else None,
+        usage.output_tokens if usage else None,
+        usage.input_tokens_details.cached_tokens if usage and usage.input_tokens_details else None,
+        usage.output_tokens_details.reasoning_tokens if usage and usage.output_tokens_details else None,
+    )
+
+
 def _canonical_background_ack(
     event_payload: dict[str, JsonValue] | None,
     event_type: str | None,

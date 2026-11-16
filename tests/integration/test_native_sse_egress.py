@@ -7,6 +7,7 @@ import os
 import socket
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 from urllib.parse import urlsplit
@@ -378,8 +379,22 @@ async def test_native_proxy_reports_public_event_size_failure(
     assert str(limit) in cast(str, error["message"])
 
 
+@pytest.fixture
+def body_phase_head_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep cold helper setup out of tests measuring body activity."""
+    original = SubprocessNativeEgressClient.request
+
+    async def request(
+        self: SubprocessNativeEgressClient, request: native_module.NativeEgressRequest
+    ) -> native_module.NativeEgressResponse:
+        return await original(self, replace(request, response_head_timeout_seconds=5.0))
+
+    monkeypatch.setattr(SubprocessNativeEgressClient, "request", request)
+
+
 @pytest.mark.asyncio
 async def test_native_proxy_reports_public_idle_timeout(
+    body_phase_head_budget,
     native_worker: SubprocessNativeEgressClient,
     routed: bool,
 ) -> None:
@@ -416,6 +431,7 @@ async def _collect(events: AsyncIterator[str]) -> list[str]:
 
 @pytest.mark.asyncio
 async def test_partial_body_activity_outlives_native_idle_interval(
+    body_phase_head_budget,
     native_worker: SubprocessNativeEgressClient,
     routed: bool,
 ) -> None:

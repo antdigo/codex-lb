@@ -514,14 +514,7 @@ def test_a_preserved_number_is_bounded_and_a_boolean_is_not_touched() -> None:
 
 
 def test_an_account_scoped_property_name_is_kept_where_it_moves_the_answer() -> None:
-    """Measured, and narrower than it looks.
-
-    ``_contains_account_scoped_tool_state`` walks every declaration's subtree
-    *except* a ``function`` tool's own ``parameters``, which it skips at the
-    root. So the same property name moves the answer under ``tool_search`` and
-    does not under ``function``. The names are kept in both places because the
-    rule is one line and the asymmetry is production's, not the corpus's.
-    """
+    """Client function and client-search schemas are inert, with reference keys retained."""
 
     declaration = {"type": "object", "properties": {"file_id": {"type": "string"}, "acme_ticket": {"type": "string"}}}
     body = _realistic_body()
@@ -535,9 +528,15 @@ def test_an_account_scoped_property_name_is_kept_where_it_moves_the_answer() -> 
         assert "file_id" in properties, index
         assert "acme_ticket" not in properties, index
     assert rebuilt["tools"][0]["parameters"]["required"] == ["file_id"]
-    # The asymmetry, measured through production rather than asserted in prose.
-    assert _contains_account_scoped_tool_state(rebuilt["tools"][2]) is True
+    # Client declarations agree; hosted and unknown declarations stay owner-sensitive.
+    assert _contains_account_scoped_tool_state(rebuilt["tools"][2]) is False
     assert _contains_account_scoped_tool_state(rebuilt["tools"][0]) is False
+
+
+@pytest.mark.parametrize("kind", ["code_interpreter", "unknown_hosted_tool"])
+def test_hosted_and_unknown_declarations_keep_reference_keys_owner_sensitive(kind: str) -> None:
+    declaration = {"type": kind, "parameters": {"type": "object", "properties": {"file_id": {"type": "string"}}}}
+    assert _contains_account_scoped_tool_state(declaration) is True
 
 
 def test_item_ids_are_replaced_not_removed_so_the_history_evidence_survives() -> None:
@@ -1334,3 +1333,144 @@ def test_mutation_an_undeclared_extra_file_fails_the_sync_gate(
 
     with pytest.raises(AssertionError):
         gate.test_files_on_disk_and_provenance_rows_agree_in_both_directions()
+
+
+def test_client_discovery_rebuild_preserves_pairing_without_operator_content() -> None:
+    from app.core.openai.requests import ResponsesRequest
+    from app.modules.proxy.input_contract import _complete_original_items
+
+    name = "private_operator_lookup"
+    body = {
+        "model": "gpt-5.4",
+        "instructions": "private instructions",
+        "input": [
+            {
+                "type": "tool_search_call",
+                "call_id": "private-discovery",
+                "execution": "client",
+                "status": "completed",
+                "arguments": {"private_query": ["/home/private/operator", 918273]},
+            },
+            {
+                "type": "tool_search_output",
+                "call_id": "private-discovery",
+                "execution": "client",
+                "status": "completed",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": name,
+                        "description": "operator secret",
+                        "parameters": {"type": "object", "properties": {}},
+                    }
+                ],
+            },
+            {"type": "function_call", "call_id": "private-call", "name": name, "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "private-call", "output": "private result"},
+        ],
+    }
+    rebuilt, _ = sanitize_body(body)
+    assert _complete_original_items(ResponsesRequest.model_validate(rebuilt))
+    assert rebuilt["input"][0]["call_id"] == rebuilt["input"][1]["call_id"]
+    assert rebuilt["input"][1]["tools"][0]["name"] == rebuilt["input"][2]["name"]
+    assert not any(marker in json.dumps(rebuilt) for marker in (name, "/home/private", "operator secret", "918273"))
+    assert sanitize_body(rebuilt)[0] == rebuilt
+
+
+def test_discovery_tool_names_stay_stable_after_sorted_json_serialization() -> None:
+    tool = {"type": "function", "name": "private_loaded_name", "parameters": {"type": "object"}}
+    body = {
+        "tools": [tool],
+        "model": "gpt-5.4",
+        "instructions": "private",
+        "input": [
+            {"type": "function_call", "name": "private_loaded_name", "call_id": "private-call", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "private-call", "output": "private"},
+        ],
+    }
+    once, _ = sanitize_body(body)
+    twice, redactions = sanitize_body(json.loads(json.dumps(once, sort_keys=True)))
+    assert twice == once
+    assert redactions == []
+
+
+@pytest.mark.parametrize("field", ["encrypted_arguments", "unknown_owner"])
+def test_discovery_rebuild_refuses_unreviewed_call_fields(field: str) -> None:
+    body = {
+        "model": "gpt-5.4",
+        "input": [
+            {"type": "tool_search_call", "call_id": "call", "execution": "client", "arguments": {}, field: "private"}
+        ],
+    }
+    with pytest.raises(UnsanitisableBodyError):
+        sanitize_body(body)
+
+
+def _discovery_classifier_body() -> dict[str, Any]:
+    return {
+        "model": "gpt-5.4",
+        "instructions": "synthetic",
+        "input": [
+            {
+                "type": "tool_search_call",
+                "execution": "client",
+                "call_id": "synthetic-search",
+                "arguments": {},
+                "status": "completed",
+            },
+            {
+                "type": "tool_search_output",
+                "execution": "client",
+                "call_id": "synthetic-search",
+                "status": "completed",
+                "tools": [{"type": "function", "name": "synthetic_loaded_function", "parameters": {"type": "object"}}],
+            },
+        ],
+    }
+
+
+@pytest.mark.parametrize("field", ["name", "call_id"])
+@pytest.mark.parametrize("value", [None, "", "  ", "missing"])
+def test_discovery_rebuild_preserves_rejection_for_invalid_names_and_identifiers(field, value):
+    from app.core.openai.requests import ResponsesRequest
+    from app.modules.proxy.input_contract import _complete_original_items
+    from app.modules.proxy.replay_safety import responses_payload_is_account_neutral_fresh_replay
+
+    body = _discovery_classifier_body()
+    targets = [body["input"][1]["tools"][0]] if field == "name" else body["input"]
+    for target in targets:
+        if value == "missing":
+            target.pop(field)
+        else:
+            target[field] = value
+    assert not _complete_original_items(ResponsesRequest.model_validate(body))
+    assert not responses_payload_is_account_neutral_fresh_replay(body)
+    rebuilt, _ = sanitize_body(body)
+    assert not _complete_original_items(ResponsesRequest.model_validate(rebuilt))
+    assert not responses_payload_is_account_neutral_fresh_replay(rebuilt)
+    assert sanitize_body(json.loads(json.dumps(rebuilt, sort_keys=True))) == (rebuilt, [])
+
+
+@pytest.mark.parametrize("defer_loading", [False, True])
+def test_discovery_rebuild_preserves_supported_deferred_function_definitions(defer_loading):
+    from app.core.openai.requests import ResponsesRequest
+    from app.modules.proxy.input_contract import _complete_original_items
+    from app.modules.proxy.replay_safety import responses_payload_is_account_neutral_fresh_replay
+
+    body = _discovery_classifier_body()
+    body["input"][1]["tools"][0]["defer_loading"] = defer_loading
+    assert _complete_original_items(ResponsesRequest.model_validate(body))
+    assert responses_payload_is_account_neutral_fresh_replay(body)
+    rebuilt, _ = sanitize_body(body)
+    assert rebuilt["input"][1]["tools"][0]["defer_loading"] is defer_loading
+    assert _complete_original_items(ResponsesRequest.model_validate(rebuilt))
+    assert responses_payload_is_account_neutral_fresh_replay(rebuilt)
+    assert sanitize_body(json.loads(json.dumps(rebuilt, sort_keys=True))) == (rebuilt, [])
+
+
+@pytest.mark.parametrize("defer_loading", [None, 0, 1, "true", {}, []])
+def test_discovery_rebuild_refuses_non_boolean_deferred_loading(defer_loading):
+    body = _discovery_classifier_body()
+    body["input"][1]["tools"][0]["defer_loading"] = defer_loading
+    with pytest.raises(UnsanitisableBodyError):
+        sanitize_body(body)

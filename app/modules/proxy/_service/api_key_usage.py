@@ -31,10 +31,14 @@ from app.modules.api_keys.service import (
 from app.modules.proxy._service.support import (
     _ApiKeyReservationTouchState,
     _consume_api_key_reservation_heartbeat_result,
+    _http_operation_owner_key,
+    _http_operation_terminal_decision,
     _signal_propagated_responses_service_cleanup_ready,
     _StreamSettlement,
     _WebSocketRequestState,
 )
+from app.modules.proxy.http_operation import OperationController, OperationDecision, ResourceKey, SettlementResource
+from app.modules.proxy.operation_effects import execute_resource, execute_resource_now
 from app.modules.proxy.repo_bundle import ProxyRepoFactory
 
 logger = logging.getLogger("app.modules.proxy.service")
@@ -152,21 +156,46 @@ class _ApiKeyUsageMixin:
     async def _release_websocket_reservation(
         self,
         reservation: ApiKeyUsageReservationData | None,
+        *,
+        operation: OperationController | None = None,
+        decision: OperationDecision | None = None,
     ) -> None:
         if reservation is None:
             return
         proxy = cast(_ApiKeyUsageServiceProtocol, self)
-        with anyio.CancelScope(shield=True):
-            async with proxy._repo_factory() as repos:
-                service = _service_api_keys_service()(repos.api_keys)
-                await service.release_usage_reservation(reservation.reservation_id)
+
+        async def release() -> None:
+            with anyio.CancelScope(shield=True):
+                async with proxy._repo_factory() as repos:
+                    service = _service_api_keys_service()(repos.api_keys)
+                    await service.release_usage_reservation(reservation.reservation_id)
+
+        await execute_resource(
+            operation,
+            decision,
+            ResourceKey(SettlementResource.RESERVATION, reservation.reservation_id),
+            release,
+        )
 
     async def _release_websocket_request_state_reservation(
         self,
         request_state: _WebSocketRequestState,
     ) -> None:
-        self._cancel_request_state_api_key_reservation_heartbeat(request_state)
-        await self._release_websocket_reservation(request_state.api_key_reservation)
+        execute_resource_now(
+            request_state.http_operation,
+            _http_operation_terminal_decision(request_state, compensation=True),
+            ResourceKey(SettlementResource.HEARTBEAT, _http_operation_owner_key(request_state)),
+            self._cancel_request_state_api_key_reservation_heartbeat,
+            request_state,
+        )
+        if request_state.http_operation is not None:
+            await self._release_websocket_reservation(
+                request_state.api_key_reservation,
+                operation=request_state.http_operation,
+                decision=_http_operation_terminal_decision(request_state, compensation=True),
+            )
+        else:
+            await self._release_websocket_reservation(request_state.api_key_reservation)
         request_state.api_key_reservation = None
         lifecycle = request_state.deferred_account_backoff_lifecycle
         if lifecycle is not None:
@@ -506,6 +535,8 @@ class _ApiKeyUsageMixin:
         request_id: str,
         *,
         wait_for_settlement: bool = False,
+        operation: OperationController | None = None,
+        decision: OperationDecision | None = None,
     ) -> bool:
         """Settle stream reservation. Returns True if settled."""
         if api_key is None or api_key_reservation is None:
@@ -592,6 +623,8 @@ class _ApiKeyUsageMixin:
             # but the tracker must still own retrying release if both attempts
             # fail after ownership has transferred from the request finalizer.
             release_on_failure=True,
+            operation=operation,
+            decision=decision,
         )
         if wait_for_settlement:
             # Ordering-sensitive callers (websocket account-health paths) must
@@ -621,12 +654,18 @@ class _ApiKeyUsageMixin:
         api_key_reservation: ApiKeyUsageReservationData,
         request_id: str,
         release_on_failure: bool = True,
+        operation: OperationController | None = None,
+        decision: OperationDecision | None = None,
     ) -> None:
         proxy = cast(_ApiKeyUsageServiceProtocol, self)
         proxy._background_cleanup_tasks.add(cast(asyncio.Task[None], task))
 
         async def _release_after_failed_settlement() -> None:
-            await self._release_unsettled_stream_api_key_usage(
+            await execute_resource(
+                operation,
+                decision,
+                ResourceKey(SettlementResource.RESERVATION, api_key_reservation.reservation_id),
+                self._release_unsettled_stream_api_key_usage,
                 api_key=api_key,
                 api_key_reservation=api_key_reservation,
                 request_id=request_id,

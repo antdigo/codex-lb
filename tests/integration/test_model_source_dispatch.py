@@ -36,6 +36,7 @@ from tests.integration.model_source_helpers import (
     _enable_api_key_auth,
     stub_source_upstreams,
 )
+from tests.simulation.virtual_time import VirtualClock
 
 pytestmark = pytest.mark.integration
 
@@ -835,12 +836,20 @@ async def test_client_leaving_after_the_stall_window_is_a_stall_abandonment(
 ) -> None:
     """(c) headers delayed past the evidence window, then the client leaves -> ``source_stall_abandoned``."""
 
-    monkeypatch.setattr(dispatch_module, "STALL_EVIDENCE_SECONDS", 0.3)
+    clock = VirtualClock(monotonic_value=100.0)
+    monkeypatch.setattr(proxy_api, "clock_for", lambda _owner: clock)
     await _enable_api_key_auth(async_client)
     state = _StubState()
     delay_headers = asyncio.Event()
+    opened = asyncio.Event()
+    handler = _sse_handler(state, before_hold=[_created(), _completed(_USAGE)], delay_headers=delay_headers)
+
+    async def observed_open(request: web.Request) -> web.StreamResponse:
+        opened.set()
+        return await handler(request)
+
     base_url = await source_upstream(
-        _sse_handler(state, before_hold=[_created(), _completed(_USAGE)], delay_headers=delay_headers),
+        observed_open,
         handler_cancellation=True,
         shutdown_timeout=1.0,
     )
@@ -857,11 +866,17 @@ async def test_client_leaving_after_the_stall_window_is_a_stall_abandonment(
         body=json.dumps(_request_body(model)).encode(),
     )
     runner = asyncio.create_task(stream.run())
-    await asyncio.sleep(0.6)
-    stream.disconnect()
-    await asyncio.wait_for(runner, timeout=10)
-    await _drain(async_client)
-    delay_headers.set()
+    try:
+        await asyncio.wait_for(opened.wait(), timeout=10)
+        clock.advance(dispatch_module.STALL_EVIDENCE_SECONDS + 1)
+        stream.disconnect()
+        await asyncio.wait_for(runner, timeout=10)
+        await _drain(async_client)
+    finally:
+        delay_headers.set()
+        if not runner.done():
+            runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
 
     rows = await _source_rows(source_id)
     assert [(row.status, row.error_code) for row in rows] == [("cancelled", "source_stall_abandoned")]
@@ -1339,9 +1354,12 @@ async def test_success_terminal_the_public_wrapper_rewrites_into_a_failure_is_an
 async def test_typed_event_trailing_a_rewritten_terminal_keeps_the_error_and_the_release(
     async_client, source_upstream
 ) -> None:
-    """The source keeps emitting a typed event after the ``response.completed`` the wrapper rewrote into
-    ``response.failed invalid_json``; the client-visible terminal is latched, so the trailing frame does not turn the
-    attempt into a ``success`` settled at the estimate."""
+    """Public normalization drops the typed tail after rewriting malformed completion into failure.
+
+    The failed terminal remains authoritative for settlement: the limited key
+    is released and the attempt is an error even though the source sent a delta
+    after its malformed success terminal.
+    """
 
     await _enable_api_key_auth(async_client)
     state = _StubState()
@@ -1372,11 +1390,22 @@ async def test_typed_event_trailing_a_rewritten_terminal_keeps_the_error_and_the
         text = "".join([chunk async for chunk in response.aiter_text()])
 
     assert "response.failed" in text and "invalid_json" in text
-    assert text.index("response.failed") < text.index('"late"')
+    events = [json.loads(line[6:]) for line in text.splitlines() if line.startswith("data: ") and line[6:] != "[DONE]"]
+    event_types = [event["type"] for event in events]
+    assert event_types.count("response.failed") == 1
+    assert event_types[-1] == "response.failed"
+    assert "response.completed" not in event_types
+    assert "response.output_text.delta" not in event_types
+    assert all(event.get("delta") != "late" for event in events)
+    assert events[-1]["response"]["id"] == "resp_dispatch_1"
+    assert events[-1]["response"]["error"]["code"] == "invalid_json"
     reservations = await _reservations(key_id)
     assert [reservation.status for reservation in reservations] == ["released"]
     rows = await _source_rows(source_id)
     assert [(row.status, row.error_code) for row in rows] == [("error", "model_source_response_invalid")]
+    assert rows[0].input_tokens is None and rows[0].output_tokens is None
+    assert rows[0].request_id == "resp_dispatch_1"
+    assert len(state.requests) == 1
     assert get_source_bulkhead().in_flight(source_id) == 0
 
 

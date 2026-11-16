@@ -104,6 +104,25 @@ class DurableBridgeAliasRegistration(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class DurableBridgeAliasSourceFence:
+    """Exact predecessor released by a verified local stale-anchor recovery.
+
+    Release clears the lease owner but retains account, process and epoch. A
+    new claim, account invalidation or moved alias must invalidate this proof.
+    The key kind itself never authorizes an alias transfer.
+    """
+
+    session_id: str
+    api_key_scope: str
+    instance_id: str
+    owner_epoch: int
+    owner_process_epoch: str
+    account_id: str
+    canonical_kind: str
+    canonical_key: str
+
+
+@dataclass(frozen=True, slots=True)
 class DurableBridgeAliasRegistrationReceipt:
     """Rollback data for a continuity alias published before dispatch."""
 
@@ -145,7 +164,7 @@ def _encode_pending_tool_calls(response_id: str, value: Mapping[str, str] | None
     if value is None:
         return None
     return json.dumps(
-        {"response_id": response_id, "calls": dict(sorted(value.items()))},
+        {"version": 2, "response_id": response_id, "calls": dict(sorted(value.items()))},
         separators=(",", ":"),
     )
 
@@ -157,7 +176,9 @@ def _decode_pending_tool_calls(response_id: str | None, value: str | None) -> di
         payload = json.loads(value)
     except (TypeError, ValueError):
         return None
-    if not isinstance(payload, dict) or payload.get("response_id") != response_id:
+    # Older writers could omit parallel client discovery; their call list
+    # cannot grant completeness authority after the contract is corrected.
+    if not isinstance(payload, dict) or payload.get("version") != 2 or payload.get("response_id") != response_id:
         return None
     calls = payload.get("calls")
     if not isinstance(calls, dict):
@@ -978,6 +999,16 @@ class DurableBridgeRepository:
     async def get_session_by_id(self, session_id: str) -> DurableBridgeSessionSnapshot | None:
         row = await self._session.get(HttpBridgeSessionRecord, session_id)
         return _to_snapshot(row)
+
+    async def has_alias(self, *, alias_kind: str, alias_value: str) -> bool:
+        """Cross-scope existence is rejection evidence, never owner authority."""
+        statement = select(
+            exists().where(
+                HttpBridgeSessionAlias.alias_kind == alias_kind,
+                HttpBridgeSessionAlias.alias_hash == durable_bridge_hash(alias_value),
+            )
+        )
+        return bool(await self._session.scalar(statement))
 
     async def resolve_alias(
         self,
@@ -3977,6 +4008,7 @@ class DurableBridgeRepository:
         owner_epoch: int,
         turn_state: str,
         lease_ttl_seconds: float,
+        source_fence: DurableBridgeAliasSourceFence | None = None,
     ) -> DurableBridgeAliasRegistrationReceipt:
         """Publish a pre-dispatch turn alias with enough state for exact rollback."""
 
@@ -4034,6 +4066,44 @@ class DurableBridgeRepository:
             )
             previous_alias_owner_epoch = None
             previous_alias_account_id = None
+            if source_fence is not None:
+                source = await self._session.scalar(
+                    select(HttpBridgeSessionRecord)
+                    .where(HttpBridgeSessionRecord.id == source_fence.session_id)
+                    .with_for_update()
+                )
+                if not (
+                    source_fence.session_id != session_id
+                    and source_fence.api_key_scope == api_key_scope
+                    and source_fence.instance_id == instance_id
+                    and previous_alias_session_id == source_fence.session_id
+                    and is_http_bridge_account_neutral_replay(
+                        kind=target.session_key_kind, key=target.session_key_value
+                    )
+                    and source is not None
+                    and source.api_key_scope == source_fence.api_key_scope
+                    and source.account_id == source_fence.account_id
+                    and source.owner_epoch == source_fence.owner_epoch
+                    and source.owner_process_epoch == source_fence.owner_process_epoch
+                    and source.session_key_kind == source_fence.canonical_kind
+                    and source.session_key_value == source_fence.canonical_key
+                    and source.owner_instance_id is None
+                    and source.state == HttpBridgeSessionState.CLOSED
+                ):
+                    await self._session.rollback()
+                    return DurableBridgeAliasRegistrationReceipt(
+                        status=DurableBridgeAliasRegistration.ALIAS_PROTECTED,
+                        session_id=session_id,
+                        api_key_scope=api_key_scope,
+                        alias_kind=alias_kind,
+                        alias_value=turn_state,
+                        instance_id=instance_id,
+                        owner_epoch=owner_epoch,
+                        previous_alias_session_id=previous_alias_session_id,
+                        previous_alias_owner_epoch=None,
+                        previous_alias_account_id=None,
+                        previous_latest_turn_state=previous_latest_turn_state,
+                    )
             if previous_alias_session_id is not None:
                 previous_alias_owner = (
                     await self._session.execute(
@@ -4060,6 +4130,7 @@ class DurableBridgeRepository:
                     kind=target.session_key_kind,
                     key=target.session_key_value,
                 ),
+                expected_source_session_id=source_fence.session_id if source_fence is not None else None,
             )
             if not registered:
                 await self._session.rollback()
@@ -4212,6 +4283,7 @@ class DurableBridgeRepository:
         alias_value: str,
         api_key_scope: str,
         target_account_neutral_replay: bool | None = None,
+        expected_source_session_id: str | None = None,
     ) -> bool:
         dialect = self._session.get_bind().dialect.name
         now = utcnow()
@@ -4247,7 +4319,14 @@ class DurableBridgeRepository:
             )
         )
         conflict_where = None
-        if target_account_neutral_replay is True:
+        if expected_source_session_id is not None:
+            # Exact CAS is deliberately separate from the legacy kind-based
+            # rebind policy. A moved or deleted predecessor cannot be replaced.
+            conflict_where = and_(
+                HttpBridgeSessionAlias.session_id == expected_source_session_id,
+                HttpBridgeSessionAlias.alias_value == alias_value,
+            )
+        elif target_account_neutral_replay is True:
             conflict_where = or_(
                 HttpBridgeSessionAlias.session_id == session_id,
                 existing_target_is_replaceable_recovery,

@@ -10,7 +10,7 @@ from collections.abc import Awaitable, Callable, Coroutine, Mapping
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Literal, NoReturn, Protocol, cast
+from typing import TYPE_CHECKING, Any, Literal, NoReturn, Protocol, cast
 
 import anyio
 
@@ -43,6 +43,17 @@ from app.modules.api_keys.service import (
 from app.modules.proxy.affinity import _AffinityPolicy
 from app.modules.proxy.affinity_observation import AffinityObservation
 from app.modules.proxy.helpers import _normalize_error_code, _parse_openai_error
+from app.modules.proxy.http_operation import (
+    OperationController,
+    OperationDecision,
+    TerminalObservation,
+)
+from app.modules.proxy.http_operation import (
+    ResponseCreateAttempt as _HTTPBridgeResponseCreateAttempt,
+)
+from app.modules.proxy.input_contract import (
+    CLIENT_CALL_OUTPUT_TYPES as _PENDING_TOOL_CALL_OUTPUT_ITEM_TYPE_BY_CALL_TYPE,
+)
 from app.modules.proxy.load_balancer import (
     AccountLease,
     AccountSelection,
@@ -50,6 +61,11 @@ from app.modules.proxy.load_balancer import (
 )
 from app.modules.proxy.tool_call_dedupe import ToolCallDedupeKey
 from app.modules.proxy.work_admission import AdmissionLease
+
+if TYPE_CHECKING:
+    from app.modules.proxy._service.http_bridge.continuation import ContinuationBinding
+    from app.modules.proxy._service.http_bridge.pool_routing import PoolRequestContext
+    from app.modules.proxy._service.http_bridge.recovery_alias import RecoveryAliasTransfer
 
 logger = logging.getLogger(__name__)
 
@@ -74,11 +90,6 @@ _TTFT_TOOL_DELTA_EVENT_TYPES = frozenset(
 _TTFT_REASONING_EVENT_TYPES = frozenset(
     {"response.reasoning_summary_text.delta", "response.reasoning_summary_text.done"}
 )
-_PENDING_TOOL_CALL_OUTPUT_ITEM_TYPE_BY_CALL_TYPE = {
-    "function_call": "function_call_output",
-    "custom_tool_call": "custom_tool_call_output",
-    "apply_patch_call": "apply_patch_call_output",
-}
 _PENDING_TOOL_CALL_ITEM_TYPES = frozenset(_PENDING_TOOL_CALL_OUTPUT_ITEM_TYPE_BY_CALL_TYPE)
 _PENDING_TOOL_CALL_OUTPUT_ITEM_TYPES = frozenset(_PENDING_TOOL_CALL_OUTPUT_ITEM_TYPE_BY_CALL_TYPE.values())
 _TTFT_OUTPUT_ITEM_TYPES = _PENDING_TOOL_CALL_ITEM_TYPES - {"function_call"}
@@ -108,6 +119,7 @@ _HARD_HTTP_BRIDGE_AFFINITY_KINDS = frozenset(
         "internal_unanchored_parallel",
         "internal_model_parallel",
         "internal_request_parallel",
+        "internal_pool_lane",
     }
 )
 _ACCOUNT_SELECTION_RECOVERY_MIN_SLEEP_SECONDS = 1.0
@@ -962,20 +974,6 @@ class _DeferredKeyedStreamHealthPenalty:
     code: str
 
 
-@dataclass(eq=False, slots=True)
-class _HTTPBridgeResponseCreateAttempt:
-    ordinal: int
-    disarmed: bool = False
-    response_observed: bool = False
-    # A non-terminal response event (a deferred-reasoning prelude, for
-    # example) proves the attempt was answered midstream even when ordinary
-    # event accounting was deliberately skipped. A later terminal failure
-    # frame must then not be charged as a pre-response strike.
-    non_terminal_response_observed: bool = False
-    retry_circuit_failure_recorded: bool = False
-    retry_circuit_failure_settled: anyio.Event | None = None
-
-
 @dataclass(frozen=True, slots=True)
 class _HTTPBridgeRetryCircuitAttemptSelection:
     kind: Literal["absent", "eligible", "recorded", "settled", "ineligible"]
@@ -1023,6 +1021,10 @@ class _WebSocketRequestState:
     # send. Retries replace this value so admission wait and prior attempts do
     # not age a fresh send into the eventless owner deadline.
     response_create_sent_at: float | None = None
+    http_operation: OperationController | None = None
+    http_pool_context: PoolRequestContext | None = None
+    http_recovery_alias_transfer: RecoveryAliasTransfer | None = None
+    http_projection_required: bool = False
     response_create_attempt_count: int = 0
     response_create_attempt: _HTTPBridgeResponseCreateAttempt | None = None
     bridge_queue_wait_started_at: float | None = None
@@ -1255,6 +1257,7 @@ class _WebSocketRequestState:
     response_create_admission_reacquire_required: bool = False
     account_response_create_lease: AccountLease | None = None
     account_response_create_release: Callable[[AccountLease | None], Coroutine[Any, Any, None]] | None = None
+    account_response_create_release_task: asyncio.Task[None] | None = None
     websocket_stream_lease: AccountLease | None = None
     affinity_policy: _AffinityPolicy = field(default_factory=_AffinityPolicy)
     affinity_observation: AffinityObservation | None = None
@@ -1365,6 +1368,9 @@ class _HTTPBridgeSession:
     upstream_reader_wakeup: asyncio.Event = field(default_factory=asyncio.Event)
     # Two bounded scalars per physical connection; no request history retained.
     physical_opened_at: float | None = None
+    connection_generation: int = 0
+    cache_identity_mode: str = "shared"
+    pool_waiter_count: int = 0
     reader_processing: bool = False
     execution_gate: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(1))
     unanchored_reservation_id: str | None = None
@@ -1382,6 +1388,7 @@ class _HTTPBridgeSession:
     downstream_turn_state: str | None = None
     downstream_turn_state_aliases: set[str] = field(default_factory=set)
     previous_response_ids: set[str] = field(default_factory=set)
+    continuation_bindings: dict[str, ContinuationBinding] = field(default_factory=dict)
     # The live session keeps only its current denial tombstone.  Historical
     # ids remain in the process-local fence ledger while prepared requests pin
     # them, so this carrier cannot grow with every denied sibling anchor.
@@ -1404,6 +1411,7 @@ class _HTTPBridgeSession:
     # ``last_completed_response_id`` at every setter.
     last_completed_response_account_id: str | None = None
     last_completed_input_prefix_fingerprint: str | None = None
+    last_completed_output_identities: tuple[str, ...] = ()
     last_pending_tool_calls: dict[str, str] = field(default_factory=dict)
     durable_session_id: str | None = None
     durable_owner_epoch: int | None = None
@@ -1455,6 +1463,7 @@ class _HTTPBridgeSession:
         access_token_expires_at: float | None,
     ) -> None:
         """Replace account-bound transport state as one in-memory operation."""
+        self.connection_generation += 1
         self.account = account
         self.headers = headers
         self.upstream = upstream
@@ -1673,6 +1682,31 @@ def _websocket_should_defer_reasoning_prelude(
     return request_state.response_event_count <= 1
 
 
+def _http_operation_owner_key(request_state: _WebSocketRequestState) -> str:
+    # Repreparation can retain a public request id while owning a different
+    # reservation/queue. Each adapter state has one stable settlement owner.
+    return f"{request_state.request_id}:{id(request_state)}"
+
+
+def _http_operation_terminal_decision(
+    request_state: _WebSocketRequestState,
+    *,
+    compensation: bool = False,
+    successful: bool = False,
+) -> OperationDecision | None:
+    operation = request_state.http_operation
+    if operation is None:
+        return None
+    return operation.decide(
+        TerminalObservation(
+            request_state.response_create_attempt,
+            _http_operation_owner_key(request_state),
+            successful=successful,
+            compensation=compensation,
+        )
+    )
+
+
 def _pop_websocket_deferred_reasoning_downstream_texts(request_state: _WebSocketRequestState | None) -> list[str]:
     if request_state is None or not request_state.deferred_reasoning_downstream_texts:
         return []
@@ -1683,6 +1717,8 @@ def _pop_websocket_deferred_reasoning_downstream_texts(request_state: _WebSocket
 
 def _clear_websocket_deferred_reasoning_downstream_texts(request_state: _WebSocketRequestState | None) -> None:
     if request_state is not None:
+        if request_state.http_operation is not None:
+            request_state.http_operation.discard_buffer()
         request_state.deferred_reasoning_downstream_texts = []
 
 
@@ -1795,7 +1831,7 @@ def _websocket_request_is_accepted_lifecycle_only(request_state: _WebSocketReque
     """
     if request_state.response_id is None or request_state.awaiting_response_created:
         return False
-    if not 1 <= request_state.response_event_count <= 2:
+    if request_state.http_operation is None and not 1 <= request_state.response_event_count <= 2:
         return False
     if request_state.downstream_visible or request_state.upstream_model_output_seen:
         return False

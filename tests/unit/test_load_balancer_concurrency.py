@@ -627,24 +627,44 @@ async def test_select_account_100_concurrent_calls_avoid_serial_persist_latency(
 
     original_persist = LoadBalancer._persist_selection_state
 
-    async def slow_persist(self: LoadBalancer, *args: Any, **kwargs: Any) -> set[str]:
-        await asyncio.sleep(0.01)
-        return await original_persist(self, *args, **kwargs)
+    all_persisting = asyncio.Event()
+    release_persistence = asyncio.Event()
+    active_persistence = 0
+    persistence_calls = 0
 
-    monkeypatch.setattr(LoadBalancer, "_persist_selection_state", slow_persist)
+    async def blocked_persist(self: LoadBalancer, *args: Any, **kwargs: Any) -> set[str]:
+        nonlocal active_persistence, persistence_calls
+        active_persistence += 1
+        persistence_calls += 1
+        if active_persistence == 100:
+            all_persisting.set()
+        try:
+            await release_persistence.wait()
+            return await original_persist(self, *args, **kwargs)
+        finally:
+            active_persistence -= 1
+
+    monkeypatch.setattr(LoadBalancer, "_persist_selection_state", blocked_persist)
 
     balancer = LoadBalancer(lambda: _repo_factory(accounts_repo, usage_repo))
+    selections = [asyncio.create_task(balancer.select_account()) for _ in range(100)]
+    try:
+        # Persistence must not hold the shared selection lock. All requests
+        # must reach it before any can finish; the timeout is a deadlock guard,
+        # not a throughput assertion depending on the host's CPU scheduling.
+        await asyncio.wait_for(all_persisting.wait(), timeout=5.0)
+        assert active_persistence == 100
+        assert not balancer._runtime_lock.locked()
+        assert all(not selection.done() for selection in selections)
+    finally:
+        release_persistence.set()
+        results = await asyncio.gather(*selections, return_exceptions=True)
 
-    start = time.perf_counter()
-    results = await asyncio.gather(*(balancer.select_account() for _ in range(100)))
-    elapsed = time.perf_counter() - start
-
-    # The injected persist delay is 10ms per state, and each selection persists
-    # two states. A fully serialized implementation would therefore take about
-    # 2.0s for 100 selections. Allow extra scheduler slack for shared CI
-    # runners, but still require a comfortably sub-serialized runtime.
-    assert elapsed < 1.25, f"Expected <1.25s for 100 concurrent selections, got {elapsed:.3f}s"
-    assert all(result.account is not None for result in results)
+    assert persistence_calls == 100
+    assert active_persistence == 0
+    for result in results:
+        assert not isinstance(result, BaseException)
+        assert result.account is not None
 
 
 @pytest.mark.asyncio

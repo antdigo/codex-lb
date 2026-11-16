@@ -32,23 +32,26 @@ def _unused_local_port() -> int:
 
 
 async def _wait_until_ready(server: _RunningServer) -> None:
-    async with httpx.AsyncClient(timeout=0.2) as client:
-        for _ in range(100):
+    last_result = "no health response"
+    startup_deadline = time.monotonic() + 10.0
+    async with httpx.AsyncClient(trust_env=False, timeout=0.2) as client:
+        while time.monotonic() < startup_deadline:
             if server.process.returncode is not None:
                 output = await server.process.stdout.read() if server.process.stdout is not None else b""
                 raise AssertionError(f"fixture server exited early: {output.decode(errors='replace')}")
             try:
                 response = await client.get(f"{server.http_url}/internal/drain/status")
+                last_result = f"HTTP {response.status_code}: {response.text[:300]}"
                 if response.status_code == 200:
                     return
-            except httpx.HTTPError:
-                pass
+            except httpx.HTTPError as exc:
+                last_result = f"{type(exc).__name__}: {exc}"
             await asyncio.sleep(0.02)
-    raise AssertionError("fixture server did not become ready")
+    raise AssertionError(f"fixture server did not become ready: {last_result}")
 
 
 async def _wait_until_draining(server: _RunningServer) -> dict[str, str]:
-    async with httpx.AsyncClient(timeout=0.2) as client:
+    async with httpx.AsyncClient(trust_env=False, timeout=0.2) as client:
         for _ in range(100):
             # SIGTERM can land between the poll's connect and its response, so a
             # transport error here means "not draining yet", not a test failure.
@@ -114,7 +117,7 @@ async def test_sigterm_delivers_terminal_before_close_and_rejects_late_websocket
         drain_timeout_seconds=2.0,
         completion_delay_seconds=0.25,
     ) as server:
-        async with connect(server.websocket_url) as websocket:
+        async with connect(server.websocket_url, proxy=None) as websocket:
             await websocket.send(json.dumps({"type": "response.create"}))
             created = json.loads(await websocket.recv())
             assert created["type"] == "response.created"
@@ -124,7 +127,7 @@ async def test_sigterm_delivers_terminal_before_close_and_rejects_late_websocket
             assert checks["in_flight"] == "1"
 
             with pytest.raises(InvalidStatus):
-                async with connect(server.websocket_url):
+                async with connect(server.websocket_url, proxy=None):
                     pytest.fail("late WebSocket admission unexpectedly succeeded")
 
             terminal = json.loads(await websocket.recv())
@@ -139,7 +142,7 @@ async def test_sigterm_delivers_terminal_before_close_and_rejects_late_websocket
 @pytest.mark.asyncio
 async def test_sigterm_bounds_stuck_websocket_turn() -> None:
     async with _run_server(mode="stuck", drain_timeout_seconds=0.25) as server:
-        async with connect(server.websocket_url) as websocket:
+        async with connect(server.websocket_url, proxy=None) as websocket:
             await websocket.send(json.dumps({"type": "response.create"}))
             created = json.loads(await websocket.recv())
             assert created["type"] == "response.created"
@@ -186,7 +189,7 @@ async def test_prestop_commits_deadline_before_sigterm_and_cannot_reopen() -> No
         mode="controlled_complete",
         drain_timeout_seconds=2.0,
     ) as server:
-        async with connect(server.websocket_url) as websocket:
+        async with connect(server.websocket_url, proxy=None) as websocket:
             await websocket.send(json.dumps({"type": "response.create"}))
             assert json.loads(await websocket.recv())["type"] == "response.created"
 
@@ -204,7 +207,7 @@ async def test_prestop_commits_deadline_before_sigterm_and_cannot_reopen() -> No
                 stderr=asyncio.subprocess.STDOUT,
             )
 
-            async with httpx.AsyncClient(timeout=0.5) as client:
+            async with httpx.AsyncClient(trust_env=False, timeout=0.5) as client:
                 checks = await _wait_until_draining(server)
                 assert checks["shutdown_committed"] == "true"
                 assert checks["in_flight"] == "1"
@@ -214,7 +217,7 @@ async def test_prestop_commits_deadline_before_sigterm_and_cannot_reopen() -> No
             assert stop_response.status_code == 409
 
             with pytest.raises(InvalidStatus):
-                async with connect(server.websocket_url):
+                async with connect(server.websocket_url, proxy=None):
                     pytest.fail("late WebSocket admission unexpectedly succeeded")
 
             await websocket.send("complete")

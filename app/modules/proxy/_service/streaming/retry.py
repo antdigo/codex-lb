@@ -27,10 +27,9 @@ from app.core.clients.proxy import (
 )
 from app.core.clients.thread_cache_identity import (
     ThreadCacheIdentity,
+    ThreadCachePolicy,
     cache_scope_payload_overhead_bytes,
-)
-from app.core.clients.thread_cache_identity import (
-    effective_thread_cache_identity_mode as _effective_thread_cache_identity_mode,
+    resolve_thread_cache_policy,
 )
 from app.core.clock import REAL_CLOCK, REAL_SCHEDULER, Clock, Scheduler, clock_for, scheduler_for
 from app.core.config.dashboard_overrides import with_dashboard_overrides
@@ -66,6 +65,7 @@ from app.modules.proxy._service.observability import (
     _record_upstream_transport_decision,
     record_http_bridge_routing,
 )
+from app.modules.proxy._service.streaming.operation_handoff import stream_operation_attempt
 from app.modules.proxy._service.streaming.protocol import _StreamingServiceProtocol
 from app.modules.proxy._service.support import (
     _ACCOUNT_MODEL_UNSUPPORTED_ERROR_CODE,
@@ -109,7 +109,8 @@ from app.modules.proxy.helpers import (
     is_upstream_burst_rejection,
     is_upstream_model_capacity_error,
 )
-from app.modules.proxy.http_continuation import http_continuation_signal
+from app.modules.proxy.http_continuation import http_continuation_signal, reject_raw_projected_continuation
+from app.modules.proxy.http_operation import OperationController
 from app.modules.proxy.load_balancer import AccountLease, AccountSelection
 from app.modules.proxy.replay_safety import responses_payload_is_account_neutral_fresh_replay
 from app.modules.proxy.selection_errors import USAGE_LIMIT_REACHED, selection_failure_response
@@ -380,6 +381,8 @@ class _StreamingRetryMixin:
         upstream_stream_transport_override: str | None = None,
         client_ip: str | None = None,
         enforce_openai_sdk_contract: bool = True,
+        http_operation: OperationController | None = None,
+        cache_policy: ThreadCachePolicy | None = None,
     ) -> AsyncIterator[str]:
         proxy = cast(_StreamingServiceProtocol, self)
         scheduler = scheduler_for(proxy)
@@ -395,10 +398,30 @@ class _StreamingRetryMixin:
         # can move this generator to another task (ContextVars follow tasks).
         resilience = bind_resilience_toggles(settings, startup_settings=base_settings)
         concurrency_caps = _facade().effective_account_concurrency_caps(settings)
-        deadline = start + _facade()._stream_request_budget_seconds(
-            base_settings,
-            request_transport=request_transport,
+        deadline = (
+            http_operation.deadline
+            if http_operation is not None and http_operation.deadline is not None
+            else start + _facade()._stream_request_budget_seconds(base_settings, request_transport=request_transport)
         )
+        if request_transport == _REQUEST_TRANSPORT_HTTP and payload.previous_response_id is not None:
+            try:
+                await scheduler.wait_for(
+                    reject_raw_projected_continuation(
+                        payload.previous_response_id,
+                        coordinator=proxy._durable_bridge,
+                        sessions=(
+                            *proxy._http_bridge_sessions.values(),
+                            *proxy._http_bridge_detached_sessions.values(),
+                        ),
+                    ),
+                    timeout=max(0.0, deadline - clock.monotonic()),
+                )
+            except TimeoutError as exc:
+                raise ProxyResponseError(
+                    504,
+                    openai_error("upstream_request_timeout", "Original HTTP deadline exhausted"),
+                    local_pre_dispatch_refusal=True,
+                ) from exc
         prefer_earlier_reset = settings.prefer_earlier_reset_accounts
         # Resolved once per request: the API-key override wins, then the fleet
         # value. ``shared`` is a strict no-op downstream. The fleet value is read
@@ -407,9 +430,11 @@ class _StreamingRetryMixin:
         # proxy on ``shared`` while ``GET /api/settings`` reported the environment
         # value as effective. ``DASHBOARD_MODE_SETTINGS`` puts the column back on
         # top where it belongs -- dashboard over environment over default.
-        thread_cache_identity_mode, thread_cache_identity_from_key = _effective_thread_cache_identity_mode(
-            api_key, with_dashboard_overrides(base_settings)
-        )
+        cache_policy = (
+            http_operation.initial.cache_policy if http_operation is not None else cache_policy
+        ) or resolve_thread_cache_policy(api_key, with_dashboard_overrides(base_settings))
+        thread_cache_identity_mode = cache_policy.mode
+        thread_cache_identity_from_key = cache_policy.from_key
         upstream_transport_policy_label = "explicit" if upstream_stream_transport_override is not None else "configured"
         upstream_transport_sticky = _http_downstream_request_is_sticky(payload, headers)
         preserve_native_failure_lifecycle = not enforce_openai_sdk_contract and _is_native_codex_request(headers)
@@ -1021,7 +1046,18 @@ class _StreamingRetryMixin:
                     tool_call_dedupe=tool_call_dedupe,
                     enforce_openai_sdk_contract=enforce_openai_sdk_contract,
                     thread_cache_identity=ThreadCacheIdentity(thread_cache_identity_mode, account.id),
+                    **({"http_operation": http_operation} if http_operation is not None else {}),
                 )
+                if http_operation is not None:
+                    inner_stream = stream_operation_attempt(
+                        inner_stream,
+                        http_operation,
+                        account_id=account.id,
+                        clock=clock,
+                        scheduler=scheduler,
+                        required_account_id=rewritten_file_account_id or payload_replay_required_account_id,
+                        model=payload.model,
+                    )
                 try:
                     try:
                         async for line in inner_stream:
@@ -2347,7 +2383,18 @@ class _StreamingRetryMixin:
                                 tool_call_dedupe=tool_call_dedupe,
                                 enforce_openai_sdk_contract=enforce_openai_sdk_contract,
                                 thread_cache_identity=ThreadCacheIdentity(thread_cache_identity_mode, account.id),
+                                **({"http_operation": http_operation} if http_operation is not None else {}),
                             )
+                            if http_operation is not None:
+                                inner_stream = stream_operation_attempt(
+                                    inner_stream,
+                                    http_operation,
+                                    account_id=account.id,
+                                    clock=clock,
+                                    scheduler=scheduler,
+                                    required_account_id=rewritten_file_account_id or payload_replay_required_account_id,
+                                    model=payload.model,
+                                )
                             try:
                                 try:
                                     async for line in inner_stream:

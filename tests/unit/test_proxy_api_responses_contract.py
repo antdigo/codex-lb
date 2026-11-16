@@ -2360,6 +2360,58 @@ async def test_normalize_public_responses_stream_appends_response_failed_on_inva
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("enforce_public_contract", [True, False], ids=["public-cutoff", "native-tail"])
+async def test_public_normalizer_drops_typed_tail_after_rewritten_failure(enforce_public_contract: bool) -> None:
+    """A malformed terminal ends public output; native passthrough retains its typed tail."""
+    source: list[dict[str, JsonValue]] = [
+        {
+            "type": "response.created",
+            "sequence_number": 0,
+            "response": {"id": "resp_cutoff", "object": "response", "status": "in_progress", "output": []},
+        },
+        {
+            "type": "response.output_item.added",
+            "sequence_number": 1,
+            "output_index": 0,
+            "item": {"id": "msg_cutoff", "type": "message", "role": "assistant", "content": []},
+        },
+        {"type": "response.completed", "sequence_number": 2, "response": None},
+        {
+            "type": "response.output_text.delta",
+            "sequence_number": 3,
+            "item_id": "msg_cutoff",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "late",
+        },
+    ]
+    blocks = [
+        block
+        async for block in proxy_api_module._normalize_public_responses_stream(
+            _iter_blocks(*(format_sse_event(event) for event in source)),
+            enforce_openai_sdk_contract=enforce_public_contract,
+        )
+    ]
+    events = [payload for block in blocks if (payload := proxy_api_module._parse_sse_payload(block)) is not None]
+    event_types = [event["type"] for event in events]
+    assert event_types == (
+        ["response.created", "response.output_item.added", "response.failed"]
+        if enforce_public_contract
+        else ["response.created", "response.output_item.added", "response.failed", "response.output_text.delta"]
+    )
+    response = events[2]["response"]
+    assert isinstance(response, dict)
+    error = response["error"]
+    assert isinstance(error, dict)
+    assert error["code"] == "invalid_json"
+    if enforce_public_contract:
+        assert response["id"] == "resp_cutoff"
+        assert all(event.get("delta") != "late" for event in events)
+    else:
+        assert events[-1]["delta"] == "late"
+
+
+@pytest.mark.asyncio
 async def test_normalize_public_responses_stream_preserves_initial_error_details() -> None:
     blocks = [
         block

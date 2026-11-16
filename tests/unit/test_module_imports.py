@@ -19,7 +19,8 @@ def test_dependencies_import_in_fresh_process() -> None:
         env=env,
         capture_output=True,
         text=True,
-        timeout=10,
+        # Keep a finite deadlock guard while allowing cold imports under CI CPU contention.
+        timeout=30,
     )
 
     assert result.returncode == 0, result.stderr

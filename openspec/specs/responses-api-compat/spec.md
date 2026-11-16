@@ -10486,7 +10486,7 @@ their unrelated fields do not participate in effort authorization.
 
 An HTTP bridge request MAY move from an unavailable continuity owner to another account only after a typed pre-visible `continuity_owner_unavailable` account-selection result, which the HTTP bridge maps to `previous_response_owner_unavailable`, and positive durable proof that the request contains the complete retained input history. A missing durable owner is not a selector result and MUST fail closed without replay. The durable row MUST provide a positive input-item count and full fingerprint, and the corresponding raw prefix of the incoming list-shaped input MUST match both before any projection occurs.
 
-After the raw prefix proof, the service MUST construct a deterministic plaintext projection by omitting `reasoning`, `web_search_call`, `tool_search_call`, and `tool_search_output` items and removing upstream `id` fields from every retained input item. Retained `internal_chat_message_metadata_passthrough` MUST contain only a nonblank string `turn_id` when present. The projected suffix after the projected prefix MUST contain a completed assistant `output_text` or `refusal` boundary with nonblank content followed by nonblank fresh text or valid fresh file/image input. The suffix MAY contain multiple intervening turns only when every non-final user-input sequence is followed by another completed assistant boundary and the final sequence ends in fresh input. Direct intrinsic calls MAY precede an assistant boundary only when terminal completed or failed outputs settle every represented call in order. A call at the end of the verified raw prefix MAY be settled by its matching output at the start of the suffix. A direct-call/output sequence alone MUST NOT prove completeness because the persisted metadata does not identify omitted parallel calls. A matching prefix followed only by new user input, empty content, tool-call-only output, in-progress or partial retained output, duplicate, unmatched, or unresolved calls, or misordered call output MUST fail closed.
+After the raw prefix proof, the service MUST construct a deterministic plaintext projection by omitting `reasoning` and completed owner-bound `web_search_call` bookkeeping. Validated portable client `tool_search_call`/`tool_search_output` pairs and their loaded definitions MUST remain in their original order; hosted, unknown, malformed or account-owned discovery that cannot be proven portable MUST prevent recovery rather than be silently omitted. The projection MUST remove upstream `id` fields from every retained input item. Retained `internal_chat_message_metadata_passthrough` MUST contain only a nonblank string `turn_id` when present. The projected suffix after the projected prefix MUST contain a completed assistant `output_text` or `refusal` boundary with nonblank content followed by nonblank fresh text or valid fresh file/image input. The suffix MAY contain multiple intervening turns only when every non-final user-input sequence is followed by another completed assistant boundary and the final sequence ends in fresh input. Direct intrinsic calls MAY precede an assistant boundary only when terminal completed or failed outputs settle every represented call in order. A call at the end of the verified raw prefix MAY be settled by its matching output at the start of the suffix. A direct-call/output sequence alone MUST NOT prove completeness because the persisted metadata does not identify omitted parallel calls. A matching prefix followed only by new user input, empty content, tool-call-only output, in-progress or partial retained output, duplicate, unmatched, or unresolved calls, or misordered call output MUST fail closed.
 
 The service MUST validate the complete projected request after removing `previous_response_id`; it MUST reject nonblank conversation or prompt handles, remaining encrypted content, compaction, opaque account-scoped file/container/vector handles, nonportable file schemes, hosted, MCP, program-mediated, or unknown call or tool-choice state, unknown top-level fields, unknown or malformed top-level reasoning configuration, malformed message/content shapes, and tool outputs without exactly one matching intrinsic call. Assistant messages MUST contain only supported output parts, while user, system, and developer messages MUST contain only supported input parts. Inline data images and HTTP(S) file/image content MAY remain eligible. Eligible declared tools, tool choices, and retained direct calls MUST be shape-validated, account-neutral, and self-contained. Web-search filters, context size, and approximate location MUST use only the recognized nested fields and value types. An apply-patch call MUST use exactly one representation: a recognized structured `operation` with its exact discriminated fields, a nonblank legacy `patch`, or a nonblank legacy `input`.
 
@@ -10510,10 +10510,10 @@ For an eligible replay, the service MUST remove `previous_response_id`, strip ev
 
 #### Scenario: Verified resend contains owner-bound reasoning
 
-- **GIVEN** a verified full resend contains encrypted reasoning, server-assigned item IDs, and completed web or tool-search bookkeeping
+- **GIVEN** a verified full resend contains encrypted reasoning, server-assigned item IDs, completed web bookkeeping, and validated portable client discovery
 - **AND** its retained assistant and direct-tool content is otherwise complete and portable
 - **WHEN** required-owner selection returns typed `continuity_owner_unavailable` before output
-- **THEN** the bridge omits the reasoning and search bookkeeping and strips upstream item identities
+- **THEN** the bridge omits reasoning and completed owner-bound web bookkeeping, preserves the portable client discovery and loaded definitions, and strips upstream item identities
 - **AND** no encrypted content or upstream item identity is sent to account B
 - **AND** the validated plaintext projection is submitted once on account B
 
@@ -11041,9 +11041,9 @@ An existing reserved unanchored handoff MUST retain its existing authority to su
 - **AND** the detached predecessor drains through its existing lifecycle instead of being forcibly closed by replacement
 
 ### Requirement: Idle unanchored prompt-cache physical WebSocket lifetime
-For an original self-contained full-resend HTTP request in the canonical soft prompt-cache registry lookup, the proxy MUST rotate a physical upstream socket aged at least 3000 monotonic seconds before submitting that request only when the original and prepared request have no previous-response/conversation/turn/session continuity, the session is not a Codex continuity session, and its complete original message/function-call/function-output/reasoning items contain no reference-only or unknown opaque shapes. Every function-call ID MUST have exactly one subsequent full function output; duplicate calls, duplicate outputs, orphan outputs and pending calls MUST make the request ineligible. The proof MUST NOT depend on a durable row or previous input fingerprint: unanchored Responses input defines the new context, while a soft prompt-cache key is only a cache hint.
+For an original self-contained full-resend HTTP request in the canonical soft prompt-cache registry lookup or a proven independent affinity-pool lane, the proxy MUST rotate a physical upstream socket aged at least 3000 monotonic seconds before submitting that request only when the original and prepared request have no specific previous-response/conversation/turn continuity and its complete original message/function-call/function-output/reasoning items contain no reference-only or unknown opaque shapes. A broad session or thread header used only for pool group/locality MUST NOT classify that independent physical lane as a Codex continuity session. Genuine Codex continuity sessions, exact anchors and delta-only input MUST retain their existing protection. Every function-call ID MUST have exactly one subsequent full function output; duplicate calls, duplicate outputs, orphan outputs and pending calls MUST make the request ineligible. The proof MUST NOT depend on a durable row or previous input fingerprint: unanchored Responses input defines the new context, while a soft prompt-cache key is only a cache hint.
 The proxy MUST retain original input content, order, tool call IDs, ciphertext and prompt_cache_key, require the old account for replacement, and preserve the original reservation and deadline with one upstream dispatch. The proxy MUST NOT lose that owner restriction through outer HTTP fallback or any subsequent reconnect or reroute. A later recovery that cannot preserve the owner MUST fail closed before another send.
-The age branch MUST NOT detach a generation with any literal pending/draining request, queued or admission owner, reservation, handoff, resource close owner, or reader currently processing/persisting a frame. Uncertain lock acquisition MUST skip rotation. Physical opening time MUST reset on a successful replacement and MUST NOT reset on reuse or durable refresh.
+The age branch MUST NOT detach a generation with any literal pending/draining request, queued or admission owner, another operation's pool pin, reservation, handoff, resource close owner, or reader currently processing/persisting a frame. Only the current unsent complete independent pool head's own resource pin MAY be discounted; other queued exact-anchor owners MUST retain their generation. Uncertain lock acquisition MUST skip rotation. Physical opening time MUST reset on a successful replacement and MUST NOT reset on reuse or durable refresh.
 Forwarded requests, Responses-Lite requests, recovery-key paths and opaque encrypted function arguments MUST remain ineligible. The age policy MUST NOT construct or send a projected history.
 This requirement does not add transparent retry after accepted model output and does not cover a busy bridge or raw downstream WebSocket.
 
@@ -11534,3 +11534,280 @@ rules. This rule MUST NOT authorize replay after response acceptance.
 - GIVEN a tool-output array or plaintext reasoning contains an unknown part, missing text or a reference-only item
 - WHEN the proxy checks socket-age rotation eligibility
 - THEN the new text-carrier rules do not authorize rotation.
+
+### Requirement: HTTP operation lifecycle has one owner
+The HTTP bridge MUST separate operation, attempt, continuity lane and physical connection identities. Only one controller MUST authorize effects and terminal settlement for each operation. Events from obsolete attempts or connection generations MUST NOT mutate the active operation.
+#### Scenario: Late old generation output
+- **GIVEN** a pre-publication attempt was replaced
+- **WHEN** an event arrives from its old generation
+- **THEN** the event cannot publish content or settle the replacement
+#### Scenario: A dispatch authorization cannot be reused
+- **GIVEN** an initial or replacement attempt has a controller-issued dispatch authorization
+- **WHEN** the authorization is stale, already consumed, expired, cancelled or inconsistent with the actual owner policy
+- **THEN** the sole physical send boundary refuses the send before response.create crosses the socket
+#### Scenario: Interrupted terminal effects resume under one owner
+- **GIVEN** normal terminal settlement has completed only some resource effects
+- **WHEN** cancellation or an adapter exception requires compensation
+- **THEN** compensation resumes the remaining effects under the same operation authority
+- **AND** completed reservation effects cannot charge twice
+- **AND** retained failed-attempt circuit evidence can still settle independently
+
+### Requirement: Affinity pooling preserves continuity
+A replica MUST support up to seven compatible ordinary lanes per affinity/account/API/model/tier group, subject to existing account and physical limits. Specific response and turn anchors MUST select their exact lane; conflicting specific anchors MUST fail closed.
+An exact pool-origin continuation MUST retain the existing verified, operation-fenced full-resend recovery contract after an explicit stale-anchor rejection. Moving its turn alias to an account-neutral recovery bridge MUST require an explicit captured source-owner and alias fence; the private pool namespace alone MUST NOT authorize that transfer. A moved alias or changed source API scope, account, owner epoch or local generation MUST prevent transfer and replacement dispatch.
+#### Scenario: Independent same-key agents
+- **GIVEN** seven complete independent requests with one cache key and available account capacity
+- **WHEN** they submit concurrently
+- **THEN** none waits for another response solely because their cache keys match
+#### Scenario: Broad session headers retain group semantics
+- **GIVEN** complete independent requests share a broad session or thread header without a specific response or turn anchor
+- **WHEN** seven ordinary lanes are executing and an eighth request arrives
+- **THEN** the eighth waits within the bounded compatible group
+- **AND** exact anchored work keeps its own lane and queued cancellation preserves other owners
+- **AND** eligible complete independent header lanes can rotate between responses while genuine delta-only sessions remain protected
+#### Scenario: An active account becomes ineligible for new independent work
+- **GIVEN** existing lane work uses account A and the current API assignment now permits only B
+- **WHEN** a new complete independent same-group request arrives
+- **THEN** eligible B capacity can serve the new operation
+- **AND** existing A tickets and exact anchors retain their original ownership
+#### Scenario: A pool-origin exact continuation recovers a rejected anchor
+- **GIVEN** an exact response and turn anchor identify a pool lane and a complete full-resend is verified under the existing durable operation fence
+- **WHEN** the owner explicitly rejects the previous response and the captured source-owner and alias fence still matches
+- **THEN** the one permitted account-neutral recovery transfers only that turn alias through reversible registration
+- **AND** a moved alias or stale owner proof fails closed before a replacement send
+
+### Requirement: Publication fences transport replay
+Readable reasoning, text, tool calls and unknown output MUST commit publication before downstream enqueue. A single ordinary transport replay MAY replace an unpublished lifecycle/opaque-reasoning prefix when complete-input, same-account, tool-safety, ownership and deadline proofs hold. The client MUST observe one lifecycle and a stable response ID with an exact winning-upstream continuation binding.
+#### Scenario: Restart after visible reasoning
+- **GIVEN** readable reasoning was enqueued downstream
+- **WHEN** upstream closes with 1012
+- **THEN** the operation terminates without replay
+#### Scenario: Telemetry between opaque items
+- **GIVEN** an unpublished opaque reasoning prefix and an open publication boundary
+- **WHEN** noncommitting telemetry or lifecycle frames arrive between opaque items before a permitted replacement
+- **THEN** those frames cannot flush the opaque prefix downstream
+- **AND** a successful replacement publishes no abandoned opaque item or ciphertext
+#### Scenario: A replacement completes without a created event
+- **GIVEN** an unpublished attempt was replaced after its public lifecycle began
+- **WHEN** the winning replacement first emits a supported terminal event
+- **THEN** every public lifecycle frame retains the original public response ID
+- **AND** a subsequent anchored delta after successful completion translates to the winning physical response ID
+#### Scenario: Replacement uses a shorter numeric lifecycle
+- **GIVEN** the first attempt published numbered lifecycle events before replacement
+- **WHEN** a replacement publishes output with an equal or lower upstream sequence number
+- **THEN** HTTP publication assigns a strictly greater public sequence number
+- **AND** discarded buffered events do not consume public sequence numbers
+#### Scenario: Projected continuation loses its physical binding
+- **GIVEN** a public response ID was projected from a winning replacement response
+- **WHEN** the owner-process binding is missing or its lane, account, generation or owner epoch differs
+- **THEN** an anchored delta MUST fail closed without upstream dispatch
+- **AND** an existing owner-fenced durable marker distinguishes the projected ID from an ordinary upstream ID
+#### Scenario: Cancellation while a replacement connection opens
+- **GIVEN** an unpublished attempt has authorized replacement
+- **WHEN** downstream cancellation closes the operation while reconnect is suspended
+- **THEN** cleanup MUST close operation authority before waiting for the reader lifecycle lock
+- **AND** the replacement MUST NOT send another response.create
+
+### Requirement: One original deadline governs local HTTP operation handoffs
+HTTP receive timers, expired-request settlement and local proven-unsent transport handoffs MUST use the original immutable operation deadline. Pool waiting and re-preparation MUST NOT create a new total streaming budget. Connect, queue, awaiting-created and idle clocks MUST remain distinct; downstream keepalives MUST NOT extend the upstream total deadline. Direct downstream WebSocket timing MUST retain its existing contract.
+#### Scenario: Replacement accepted near the original deadline
+- **GIVEN** pool waiting or re-preparation consumed most of the original HTTP budget
+- **WHEN** an upstream replacement is accepted shortly before that deadline
+- **THEN** the receive watchdog expires at the original deadline
+- **AND** later output or downstream keepalives cannot extend it
+
+### Requirement: Every pool lane has an independent physical identity
+All seven lane identities, including lane zero, MUST be private to the compatible API/cache/model/tier/replica group. Authoritative physical account ownership MUST be retained separately from the logical queue fence through an explicitly authorized account change. Such a changed transport MUST NOT be advertised as warm for the original account.
+#### Scenario: Distinct model or tier leaders
+- **GIVEN** complete independent requests with one API/cache identity and distinct model or tier groups
+- **WHEN** each group elects its first lane
+- **THEN** those first lanes have distinct physical keys
+#### Scenario: A pinned continuation occupies its logical lane
+- **GIVEN** a known exact local continuation is executing on a pool lane
+- **WHEN** a complete independent same-group request arrives and a sibling lane is free
+- **THEN** the continuation retains its exact lane
+- **AND** the independent request can dispatch on the sibling before that continuation completes
+#### Scenario: Conclusive capacity recovery changes the physical owner
+- **GIVEN** a complete independent request has an output-free capacity rejection and a current controller grant permitting a different account under the existing ownership proofs
+- **WHEN** its replacement dispatches on account B
+- **THEN** the logical lane order remains intact and the physical connection is not advertised as warm for original account A
+- **AND** the private routing key cannot override the grant with an unrelated hard-owner constraint
+- **AND** transport recovery and exact, file, age and durable-operation owner restrictions retain their existing fences
+
+### Requirement: Pool work participates in bounded scheduling and restart readiness
+Pool admission MUST preserve the existing per-lane queue limit and ready FIFO ordering. Unsent independent work MAY move to any free compatible lane; exact anchors MUST remain ordered on their remembered logical lane. Cancellation MUST remove only the caller's ticket and cannot release a successor. Bootstrap waiters MUST survive another caller's cancellation. Logical pool work MUST block restart even before physical connection creation. Idle account hints and physical-key references MUST be bounded while retaining active/queued ownership evidence.
+#### Scenario: Bootstrap before a socket
+- **GIVEN** a pending pool bootstrap without a physical WebSocket
+- **WHEN** activity readiness is sampled
+- **THEN** http_bridge_restart_blocking is true
+- **AND** the logical queued-work count is nonzero
+#### Scenario: Pinned Bifrost conversion
+- **GIVEN** Bifrost 2.5.1 forwards Anthropic Messages to this HTTP bridge with synthetic upstream I/O
+- **WHEN** an opaque-only prefix is replaced after 1012
+- **THEN** the client receives one message_start and one successful message_stop
+- **AND** no abandoned opaque content is published
+- **AND** readable-output failure and successful tool-use retain their Anthropic contracts
+
+### Requirement: Operation authority survives HTTP transport boundaries
+The proxy SHALL preserve its original operation deadline, publication gate and shared replay quota when a proven-unsent bridge request changes to raw HTTP. A conclusive HTTP refusal recognized by existing raw retry policy SHALL obtain matching controller authority before a subsequent physical send, retaining account and file restrictions. Unknown send outcomes SHALL NOT acquire retry permission from status-code resemblance alone.
+#### Scenario: Explicit generic rate limit before acceptance
+- **GIVEN** a proven-unsent bridge handoff and a first raw response with status 429 and an ordinary rate-limit error before any accepted lifecycle
+- **WHEN** existing raw policy retries and the original deadline and ordinary quota remain available
+- **THEN** the authorized retry may complete without a dispatch-permit failure
+#### Scenario: No replay authority remains
+- **GIVEN** the ordinary quota is exhausted, output is committed, the deadline has expired or send outcome is ambiguous
+- **WHEN** a raw retry is proposed
+- **THEN** no unauthorized physical request is sent
+
+### Requirement: Projected continuation ownership precedes transport bypass
+Every HTTP routing path SHALL validate a recognized projected response anchor before any upstream dispatch. The proxy SHALL preserve its verified winning physical response and owner/lane/generation/API scope, or refuse before dispatch when the binding cannot safely be used by that route. It SHALL NOT send an abandoned public response ID as a physical anchor.
+#### Scenario: Automatic fallback after successful replay
+- **GIVEN** an opaque-only first attempt is replaced successfully while retaining a stable public response ID
+- **WHEN** the next anchored delta meets an active upstream WebSocket failure marker
+- **THEN** it uses a safely verified owning continuation or is refused before upstream dispatch
+#### Scenario: Binding evidence is unavailable or stale
+- **GIVEN** a projected anchor has missing, stale, wrong-generation, wrong-account, foreign-API or lost process-local binding evidence
+- **WHEN** routing would bypass bridge submission
+- **THEN** it fails closed without leaking that public ID to raw upstream
+#### Scenario: Ordinary physical response ID
+- **GIVEN** a request uses an ordinary upstream response ID without a projected-alias marker
+- **WHEN** raw HTTP routing is selected
+- **THEN** existing owner and retry behavior is retained
+
+### Requirement: Complete client tool-search history uses the HTTP operation contract
+The proxy SHALL recognize a complete native client-executed tool-search call and matching output as client work for existing HTTP pool admission and pre-publication recovery, while retaining the original native JSON, loaded tool definitions and prompt-cache identity.
+
+#### Scenario: Bifrost replays completed client tool discovery
+- **WHEN** the installed Bifrost sends a complete unanchored native history with paired `execution=client` tool-search items and client-only tool definitions
+- **THEN** the request uses the existing bounded operation contract and may recover from a retired predecessor or an eligible pre-publication transport failure on the same account within its original deadline and quotas
+- **AND** no old-attempt output or duplicate response is published
+
+#### Scenario: Discovery does not prove replay safety
+- **WHEN** a history has hosted or unspecified search execution, an unresolved or mismatched pair, malformed loaded tools, opaque references, or published output
+- **THEN** the proxy does not obtain a complete-client-work replay grant merely because the request contains tool search
+
+### Requirement: Recovery preserves meaningful tool capabilities
+The proxy SHALL preserve validated portable client tool-discovery history and loaded definitions during account-neutral recovery. Hosted, unknown or account-owned discovery that cannot be proven portable SHALL prevent that recovery rather than be silently omitted.
+
+#### Scenario: A discovered function exists only in historical discovery output
+- **WHEN** verified full-context recovery includes a completed portable client discovery pair defining a function absent from the current top-level catalog
+- **THEN** the replacement receives that definition and its discovery history in the original order
+
+#### Scenario: Discovery portability is unproven
+- **WHEN** discovery execution, loaded definitions or account ownership cannot be proven portable
+- **THEN** recovery refuses before replacement dispatch and retains the original history
+
+### Requirement: Independent pool work cannot inherit lane conversation authority
+An independent full-context HTTP operation SHALL remain independent through final preparation even when its reused physical lane carries Codex session provenance or previously served an explicit continuation.
+
+#### Scenario: Sibling full contexts share a warm broad-session lane
+- **WHEN** a request without a specific continuation anchor reuses a compatible warm lane under a broad session header
+- **THEN** its full native history and current tool catalog are sent without injecting a previous-response anchor from another operation
+
+### Requirement: Durable completeness covers every client obligation
+A durable pending-tool manifest SHALL account for every supported client call, compare observed streamed calls against terminal output, reject duplicate or cross-family identities, and remain unknown for unobserved terminal-only calls or unsupported client obligations. Legacy or unknown completeness-envelope versions SHALL NOT grant completeness authority.
+
+#### Scenario: A parallel client search is missing from the resend
+- **WHEN** a completed response requires a function result and a client tool-search result but the resend provides only the function result
+- **THEN** the resend cannot obtain exact-call completeness authority
+
+#### Scenario: A surviving legacy manifest omitted parallel discovery
+- **WHEN** persisted pending-call JSON lacks the current completeness version
+- **THEN** it is treated as unknown without rewriting the database or granting exact-call recovery authority
+
+#### Scenario: Anchored work continues after an interrupted client discovery
+- **WHEN** an explicit client discovery output is missing from a verified anchored follow-up
+- **THEN** the existing interruption handler closes that call with a native empty client discovery result without inventing loaded definitions
+
+### Requirement: Retry identity derives from canonical prepared input
+Every physical attempt SHALL distinguish canonical prepared request data from its final account-transformed wire frame. Recovery SHALL construct the next wire frame from canonical prepared data and apply identity exactly once, preserving existing dispatch, publication, owner and deadline fences.
+
+#### Scenario: Same-account isolated replay follows an opaque disconnect
+- **WHEN** a replay is authorized before visible output on the same isolated account
+- **THEN** both attempts retain the same physical cache identity and native request content
+
+#### Scenario: A raw key resembles a scoped key
+- **WHEN** the caller supplies a raw cache key resembling internal scoped output
+- **THEN** identity construction follows explicit canonical provenance without suffix guessing
+
+### Requirement: Exact response context transformations require response-owned metadata
+The proxy SHALL use input-prefix and pending-obligation metadata only for the exact response and owner to which it belongs. Historical aliases SHALL retain owner routing without granting authority from a newer lane snapshot. Completed-response advancement SHALL clear unprovable prefix metadata and associate pending obligations with that same response.
+
+#### Scenario: Older response follows independent work on the same lane
+- **WHEN** an independent request advances a reused lane and a later request names an older response while supplying new history and loaded tool definitions
+- **THEN** the proxy preserves supplied meaningful input and does not trim or grant anchor-free replay using the newer response snapshot
+
+#### Scenario: A response has unproven input-prefix metadata
+- **WHEN** the completed response advances but its input count or fingerprint is unproven
+- **THEN** prior prefix metadata cannot become associated with the new response
+
+#### Scenario: Marked output prefix lacks exact output evidence
+- **WHEN** an anchored request supplies marked assistant or tool-call items before a tool result
+- **THEN** the proxy removes that prefix only when exact owned completed-output evidence covers its meaningful content in order, preserving changed arguments, unknown metadata and unproven historical output
+
+### Requirement: Logical HTTP operations own effective cache identity policy
+The proxy SHALL resolve API-key cache identity override over overlaid fleet settings once per logical HTTP operation and retain that decision across attempts, raw handoff and owner forwarding. Account-specific cache identity SHALL be derived only after account selection and applied exactly once to canonical body and accepted process/thread handshake headers. Connection reuse SHALL respect its actual handshake policy while preserving exact continuation ownership and existing bounded lifecycle rules.
+
+#### Scenario: Per-key policy differs from fleet policy
+- **WHEN** the HTTP bridge handles a key whose shared/isolated override differs from fleet policy
+- **THEN** body and upstream handshake both obey the key's effective policy consistently with raw HTTP transport
+
+#### Scenario: Policy changes while an operation is recovering
+- **WHEN** current fleet or key policy changes after a logical operation starts
+- **THEN** its authorized retry retains its original decision and canonical input
+
+#### Scenario: Later traffic encounters a connection with older policy
+- **WHEN** a new operation has a different effective mode from a warm connection
+- **THEN** independent work cannot silently use incompatible handshake state and an exact continuation cannot silently move to another owner or lose supplied context
+
+### Requirement: Advisory warm-lane preference includes exact repeated input
+Independent complete HTTP work SHALL prefer an idle compatible lane whose nonempty stored input count and fingerprint match an equal-length or longer incoming list-shaped input over idle lanes with no matching stored prefix. This comparison SHALL remain advisory and SHALL NOT grant continuation trimming, anchor injection or retry authority. Missing or mismatched stored proof SHALL NOT earn a prefix score. Existing account/API/model/tier/mode compatibility and execution ownership SHALL remain authoritative.
+
+#### Scenario: Repeat after two independent lanes complete
+- **WHEN** two distinct compatible logical lanes concurrently complete different full inputs and a later independent request exactly repeats the second input
+- **THEN** the matching idle second lane is preferred and the full input is forwarded without inheriting an anchor
+
+#### Scenario: Strict extension or absent proof
+- **WHEN** the incoming input strictly extends a proven stored prefix or no valid matching proof exists
+- **THEN** the existing prefix preference or zero-score fallback respectively remains in effect, without changing strict continuation authority
+
+### Requirement: Portable discovery fixtures preserve references without operator content
+The offline fixture sanitizer SHALL rebuild client tool-search calls and outputs using the reviewed input field vocabulary, preserve pairing between discovery calls and outputs and between loaded tools and subsequent calls, and replace operator-authored names, arguments and descriptions deterministically. Rebuilding its output SHALL be idempotent. Unreviewed discovery fields SHALL be refused. Client function and client tool-search parameter schemas SHALL remain inert declarations; hosted and unknown tool state SHALL retain owner-sensitive classification.
+
+#### Scenario: Discovery loads a client function used by the next call
+- **GIVEN** paired client discovery items and a later call to an operator-named loaded function
+- **WHEN** the offline sanitizer rebuilds the body
+- **THEN** output and call reference the same anonymized function name and paired call identifiers
+- **AND** operator-authored argument values and descriptions are absent
+- **AND** the rebuilt request retains canonical input completeness
+
+### Requirement: String input retains advisory warm-lane locality
+Public string input SHALL normalize to the canonical itemized representation before ordinary owned snapshot and cache locality processing. Exact repeats SHALL prefer the matching idle warm lane using existing proof. Locality scoring SHALL NOT grant additional authority to trim input, inherit a continuation or change account.
+
+#### Scenario: Two independent string requests warm separate lanes
+- **GIVEN** completed string requests A and B on two compatible logical lanes
+- **WHEN** B is repeated after both lanes become idle
+- **THEN** the lane warmed by B is preferred
+- **AND** the full canonical wire input is retained without an inherited anchor
+
+### Requirement: Discovery fixture rebuilding retains invalidity and supported flags
+Offline sanitization SHALL preserve canonical completeness and portability rejection for missing, null, empty and whitespace-only discovery names and call identifiers. Supported boolean deferred-loading declarations SHALL remain represented with their original boolean value; unreviewed fields and invalid deferred-loading values SHALL be refused.
+
+#### Scenario: Discovery names or pairing identifiers are blank
+- **GIVEN** otherwise paired client discovery with an invalid blank function name or call identifier
+- **WHEN** the body is anonymized and serialized
+- **THEN** rebuilding SHALL NOT convert it to complete portable input
+
+#### Scenario: A loaded client function is deferred
+- **GIVEN** a valid loaded function with a boolean defer_loading field
+- **WHEN** the discovery body is anonymized and rebuilt again after serialization
+- **THEN** its field value, identity pairing and classifier results remain unchanged
+
+### Requirement: Startup cancellation retains the service iterator owner
+The HTTP route SHALL retain ownership of its service iterator until the delivery cleanup owner receives it. If startup probing is interrupted after its first-item task completes, the route SHALL close the original iterator before releasing startup-owned reservations. Closing operation authority SHALL precede waiting for a suspended replacement reader, and no replacement response.create SHALL be dispatched after cancellation.
+
+#### Scenario: Cancellation between a completed startup probe and delivery handoff
+- **GIVEN** the probe has consumed the first lifecycle item and a replacement reader is suspended
+- **WHEN** downstream cancellation interrupts the handoff to the response writer
+- **THEN** the original service iterator is closed by the startup owner
+- **AND** operation authority closes before reader cleanup can finish

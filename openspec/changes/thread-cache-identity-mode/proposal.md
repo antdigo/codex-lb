@@ -98,21 +98,11 @@ does not claim total isolation.
   constant rather than a knob.
 - A dashboard UI control. The mode is reachable through `PUT /api/settings` and
   the API-keys API; no bespoke effective-value hint is added anywhere.
-- The HTTP session bridge and the direct downstream WebSocket surface. Both
-  serialize the request text *before* an account is chosen and then treat that
-  exact text as a dispatch-owner and replay key, so scoping either means
-  re-preparing the text after account selection against the
-  stored-input-context, input-fingerprint and size-guard invariants that
-  re-preparation already has to respect. That is its own change with its own
-  tests.
-
-  So this change lands the mechanism, the configuration, the safe default and
-  the coverage for the core upstream client (HTTP streaming, non-streaming
-  HTTP, the upstream websocket `response.create`) plus compact. The bridge is
-  enabled by default, so an operator who flips `isolated` today will see it
-  apply to less HTTP traffic than the word "HTTP" suggests. That is stated
-  here and in the spec rather than papered over, and it is the reason the
-  measurement plan starts with a direct probe rather than a production A/B.
+- The direct downstream WebSocket surface. It has a separate dispatch/replay
+  contract and remains outside this change. HTTP bridge coverage is governed
+  by the normative responses-api-compat requirements and the later
+  session-cache-affinity-ownership correction: canonical request data stays
+  unscoped, while request-owned policy governs final body/handshake egress.
 
 ## Capabilities
 

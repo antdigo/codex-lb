@@ -11,6 +11,7 @@ from typing import cast
 import aiohttp
 
 from app.core.clients.proxy import ProxyResponseError, filter_inbound_headers
+from app.core.clients.thread_cache_identity import THREAD_CACHE_IDENTITY_MODES, ThreadCachePolicy
 from app.core.clock import REAL_CLOCK, REAL_SCHEDULER, Clock, Scheduler
 from app.core.config.dashboard_overrides import with_dashboard_overrides
 from app.core.config.settings import get_settings
@@ -57,6 +58,8 @@ HTTP_BRIDGE_RESERVATION_MODEL_HEADER = "x-codex-bridge-reservation-model"
 HTTP_BRIDGE_AFFINITY_KIND_HEADER = "x-codex-bridge-affinity-kind"
 HTTP_BRIDGE_AFFINITY_KEY_HEADER = "x-codex-bridge-affinity-key"
 HTTP_BRIDGE_FILE_OWNER_HEADER = "x-codex-bridge-file-owner"
+HTTP_BRIDGE_CACHE_IDENTITY_MODE_HEADER = "x-codex-bridge-cache-identity-mode"
+HTTP_BRIDGE_CACHE_IDENTITY_FROM_KEY_HEADER = "x-codex-bridge-cache-identity-from-key"
 HTTP_BRIDGE_ORIGINAL_UNANCHORED_HEADER = "x-codex-bridge-original-unanchored"
 HTTP_BRIDGE_SIGNATURE_VERSION_HEADER = "x-codex-bridge-signature-version"
 HTTP_BRIDGE_CLIENT_IP_HEADER = "x-codex-bridge-client-ip"
@@ -98,6 +101,7 @@ class HTTPBridgeForwardContext:
     client_ip: str | None = None
     reservation: ApiKeyUsageReservationData | None = None
     signature_version: str | None = None
+    cache_policy: ThreadCachePolicy | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -329,10 +333,17 @@ def build_owner_forward_headers(
     forwarded[HTTP_BRIDGE_ORIGIN_INSTANCE_HEADER] = context.origin_instance
     forwarded[HTTP_BRIDGE_TARGET_INSTANCE_HEADER] = context.target_instance
     forwarded[HTTP_BRIDGE_CODEX_AFFINITY_HEADER] = "1" if context.codex_session_affinity else "0"
-    signature_version = _HTTP_BRIDGE_SIGNATURE_VERSION_V2 if context.original_request_unanchored else None
+    signature_version = (
+        _HTTP_BRIDGE_SIGNATURE_VERSION_V2
+        if context.original_request_unanchored or context.cache_policy is not None
+        else None
+    )
     if signature_version is not None:
         forwarded[HTTP_BRIDGE_SIGNATURE_VERSION_HEADER] = signature_version
-        forwarded[HTTP_BRIDGE_ORIGINAL_UNANCHORED_HEADER] = "1"
+        forwarded[HTTP_BRIDGE_ORIGINAL_UNANCHORED_HEADER] = "1" if context.original_request_unanchored else "0"
+    if context.cache_policy is not None:
+        forwarded[HTTP_BRIDGE_CACHE_IDENTITY_MODE_HEADER] = context.cache_policy.mode
+        forwarded[HTTP_BRIDGE_CACHE_IDENTITY_FROM_KEY_HEADER] = "1" if context.cache_policy.from_key else "0"
     if context.original_affinity_kind and context.original_affinity_key:
         forwarded[HTTP_BRIDGE_AFFINITY_KIND_HEADER] = context.original_affinity_kind
         forwarded[HTTP_BRIDGE_AFFINITY_KEY_HEADER] = context.original_affinity_key
@@ -415,6 +426,17 @@ def parse_forwarded_request(
         original_request_unanchored = False
     else:
         return None, _invalid_bridge_forward_signature_error()
+    cache_mode = _optional_header(headers.get(HTTP_BRIDGE_CACHE_IDENTITY_MODE_HEADER))
+    cache_from_key = _optional_header(headers.get(HTTP_BRIDGE_CACHE_IDENTITY_FROM_KEY_HEADER))
+    cache_policy = None
+    if cache_mode is not None or cache_from_key is not None:
+        if (
+            signature_version != _HTTP_BRIDGE_SIGNATURE_VERSION_V2
+            or cache_mode not in THREAD_CACHE_IDENTITY_MODES
+            or cache_from_key not in {"0", "1"}
+        ):
+            return None, _invalid_bridge_forward_signature_error()
+        cache_policy = ThreadCachePolicy(cache_mode, cache_from_key == "1")
     context = HTTPBridgeForwardContext(
         origin_instance=headers.get(HTTP_BRIDGE_ORIGIN_INSTANCE_HEADER, "").strip() or "unknown",
         target_instance=target_instance,
@@ -427,6 +449,7 @@ def parse_forwarded_request(
         client_ip=client_ip,
         reservation=_reservation_from_headers(headers),
         signature_version=signature_version,
+        cache_policy=cache_policy,
     )
     # Tamper-proofing fast path (#1203): a VALIDATING tamper-proofing
     # signature proves the received body was not rewritten in transit —
@@ -449,7 +472,11 @@ def parse_forwarded_request(
     )
     if tools_bound_valid:
         return HTTPBridgeForwardedRequest(context=context), None
-    if context.file_owner_account_id is not None or extract_input_file_ids(payload.input):
+    if (
+        context.cache_policy is not None
+        or context.file_owner_account_id is not None
+        or extract_input_file_ids(payload.input)
+    ):
         # The rolling-upgrade primary signature does not bind the additive
         # file-owner proof. Never allow a stripped/forged proof to downgrade to
         # it, and never allow payloads with file references to fall back after a
@@ -669,6 +696,14 @@ def _structured_bridge_signing_payload(
     return json.dumps(
         {
             "body_digest": body_digest,
+            **(
+                {
+                    "cache_identity_mode": context.cache_policy.mode,
+                    "cache_identity_from_key": context.cache_policy.from_key,
+                }
+                if context.cache_policy is not None
+                else {}
+            ),
             "client_ip": context.client_ip if include_client_ip else None,
             "client_ip_present": context.client_ip is not None,
             "codex_session_affinity": context.codex_session_affinity,

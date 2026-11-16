@@ -33,7 +33,7 @@ Sizing guidance:
 
 - Choose a positive cap for the **cluster**: the total concurrent upstream streams one account may hold. Scaling replicas out does not raise it; it only re-partitions it.
 - Every share is floored at one slot so an account never becomes unroutable on a replica; when `cap < replica_count` the cluster-wide aggregate therefore equals the replica count — and grows with each added replica — rather than honoring the configured cap.
-- `proxy_account_stream_recovery_reserve` (default 1) is subtracted at **selection time only** — it keeps slots free for recovery/reconnect traffic and is deliberately not consulted when a warm session reacquires its lease between turns. On small per-replica shares the reserve is proportionally heavy: with a share of 2, selection sees 1 usable slot.
+- `proxy_account_stream_recovery_reserve` (default 1) is applied to ordinary HTTP bridge selection **and warm lease reacquisition**. Established reconnect/reattach recovery may use the full hard cap and retains its fair-share exemption; warm reuse alone does not authorize that exemption. On small per-replica shares the reserve is proportionally heavy: with a share of 2, selection sees 1 usable slot.
 - Membership changes apply with hysteresis: a replica adopts a share **increase** only after the new partition has been stable for a window, while decreases apply immediately — so a missed heartbeat or rolling replacement cannot transiently inflate the aggregate toward upstream.
 - Since turn-scoped leases (#1476), idle warm sessions do not occupy slots. A slot lost to an abnormal condition is reclaimed by the stale-lease sweep, whose stream threshold is NOT the raw `proxy_account_lease_ttl_seconds` (default 900s): a legitimately long-running stream must not be reclaimed mid-flight, so the effective bound is `max(lease TTL, longest stream/request budget) + 60s grace` (`_account_lease_stale_ttl_seconds`) — 7260s with the default 7200s Responses budgets. That is the true worst-case recovery time for a leaked stream slot.
 
@@ -56,3 +56,13 @@ Observable deltas operators may notice:
 
 1. A cancellation that is already pending when a task reaches an uncontended bridge-lock acquire is now delivered at the task's next `await` instead of at the post-acquire checkpoint. Bodies under `pending_lock` are synchronous bookkeeping (see the "pending_lock critical sections do not suspend" requirement), so the cancellation lands at the same logical boundary — after the critical section — rather than inside it.
 2. `_http_bridge_pending_count_nowait` hits `WouldBlock` less often because the lock is no longer held across an extra loop turn per acquire. Expect fewer `http_bridge_pending_count_unavailable context=idle_prune` warnings (hundreds per hour in production before the change) and more sessions actually evaluated by idle prune on each sweep; eviction cadence therefore converges toward the configured idle TTL rather than being skipped for busy sessions.
+
+## Ordinary bridge lanes and recovery reserve
+
+The compatible per-replica HTTP pool contains up to seven ordinary logical lanes.
+Account stream caps and replica partitioning remain authoritative; the pool does
+not subtract the reserve a second time. For the eight-slot/one-reserve case,
+seven ordinary streams may execute and authorized recovery may use slot eight.
+Pool waiting and physical generation pins do not themselves acquire stream
+leases. The request estimate is retained when an idle session reacquires a lease,
+so warm traffic remains visible to capacity-weighted routing.

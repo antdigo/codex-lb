@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 
@@ -13,6 +14,66 @@ from app.db.models import ApiKeyUsageReservation
 from app.db.session import SessionLocal
 
 pytestmark = pytest.mark.integration
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_chat_startup_cancel_closes_completed_probe_source(async_client, monkeypatch, streaming):
+    auth_json = _make_auth_json("acc_chat_probe_cancel", "chat-probe-cancel@example.com")
+    imported = await async_client.post(
+        "/api/accounts/import", files={"auth_json": ("auth.json", json.dumps(auth_json), "application/json")}
+    )
+    assert imported.status_code == 200
+    ready = asyncio.Event()
+    release = asyncio.Event()
+    closed = asyncio.Event()
+    sources = []
+    service_streams = []
+
+    async def source(*_args, **_kwargs):
+        try:
+            yield 'data: {"type":"response.output_text.delta","delta":"hi"}\n\n'
+            await release.wait()
+        finally:
+            closed.set()
+
+    def core(*args, **kwargs):
+        result = source(*args, **kwargs)
+        sources.append(result)
+        return result
+
+    probe = proxy_api._probe_chat_stream_startup_error
+
+    async def hold_completed_probe(*args, **kwargs):
+        service_streams.append(args[0])
+        result = await probe(*args, **kwargs)
+        ready.set()
+        await release.wait()
+        return result
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", core)
+    monkeypatch.setattr(proxy_api, "_probe_chat_stream_startup_error", hold_completed_probe)
+    task = asyncio.create_task(
+        async_client.post(
+            "/v1/chat/completions",
+            json={"model": "gpt-5.2", "messages": [{"role": "user", "content": "hi"}], "stream": streaming},
+        )
+    )
+    try:
+        await asyncio.wait_for(ready.wait(), 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 5)
+        await asyncio.wait_for(closed.wait(), 2)
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        for owned in service_streams:
+            await owned.aclose()
+        for owned in sources:
+            await owned.aclose()
 
 
 def _encode_jwt(payload: dict) -> str:

@@ -299,15 +299,9 @@ SCHEMA_TYPES: frozenset[str] = frozenset({"array", "boolean", "integer", "null",
 # The only JSON Schema property names carried across, and the measured reason
 # they are:
 #
-# ``_contains_account_scoped_tool_state`` recognises an account-scoped reference
-# by *key name*, so renaming one inside a declaration it walks flips its answer.
-# It walks the whole subtree of every declaration except a ``function`` tool's
-# own ``parameters``, which it skips at the root. Measured against 0.154.0's
-# declarations: a property named ``file_id`` under ``tool_search.parameters``
-# moves that answer, the same property under a ``function`` tool's
-# ``parameters`` does not. Keeping the names everywhere is the cheap side of
-# that asymmetry -- eight OpenAI-vocabulary words, chosen from a list written
-# down here rather than from the capture.
+# Reference-key names are retained conservatively in all schemas. Client
+# function/tool-search schemas are inert declarations; hosted/unknown tool
+# subtrees remain owner-sensitive. No operator-authored key is preserved.
 SCHEMA_PRESERVED_PROPERTY_NAMES: frozenset[str] = frozenset(
     {
         "container_id",
@@ -364,6 +358,7 @@ class _Run:
     redactions: list[Redaction] = field(default_factory=list)
     identifiers: dict[tuple[str, str], str] = field(default_factory=dict)
     next_ordinal: int = 1
+    labels: dict[str, str] = field(default_factory=dict)
 
     def note(self, path: str, kind: str, *, changed: bool = True) -> None:
         if changed:
@@ -427,6 +422,16 @@ class _Enum(_Node):
 
     def vocabulary(self) -> Iterator[str]:
         return iter(sorted(self.values))
+
+
+@dataclass(frozen=True, slots=True)
+class _Boolean(_Node):
+    """One reviewed boolean flag, without integer coercion."""
+
+    def apply(self, value: Any, path: str, run: _Run) -> Any:
+        if not isinstance(value, bool):
+            raise _refuse(path, "expected a boolean")
+        return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -495,7 +500,11 @@ class _KnownLabel(_Node):
             raise _refuse(path, "expected a string")
         if value in self.values:
             return value
-        replacement = synthetic_text(path)
+        # Keep empty and nonempty blank values distinct: neither may become
+        # a valid function name or identifier during anonymization.
+        replacement = (
+            (" " if value else "") if not value.strip() else run.labels.setdefault(value, synthetic_text(path))
+        )
         run.note(path, "synthetic_label", changed=replacement != value)
         return replacement
 
@@ -525,6 +534,9 @@ class _Ident(_Node):
         if self.strippable and run.strip_item_ids:
             run.note(path, "item_id_stripped")
             return _ABSENT
+        if not value.strip():
+            run.note(path, "blank_identifier", changed=value != " ")
+            return " "
         replacement = run.identifier(self.namespace, value, fixed_ordinal=self.fixed_ordinal)
         run.note(path, "identifier_placeholder", changed=replacement != value)
         return replacement
@@ -568,7 +580,8 @@ class _Arr(_Node):
 class _Obj(_Node):
     """An object with a closed key namespace.
 
-    Keys are emitted in the order the capture presents them; a key no rule names
+    Keys are visited in canonical order so label and identifier pairing stays
+    stable after sorted JSON serialization; a key no rule names
     is refused rather than dropped, because a silently dropped key changes the
     key set the replay predicate validates. ``dropped`` is the one exception:
     keys removed on purpose, each with a redaction entry.
@@ -581,7 +594,7 @@ class _Obj(_Node):
         if not isinstance(value, dict):
             raise _refuse(path, "expected an object")
         rebuilt: dict[str, Any] = {}
-        for index, (key, entry) in enumerate(value.items(), start=1):
+        for index, (key, entry) in enumerate(sorted(value.items()), start=1):
             child = f"{path}.{key}" if path else str(key)
             if key in self.dropped:
                 run.note(child, self.dropped[key])
@@ -689,6 +702,31 @@ class _Lazy(_Node):
 
     def apply(self, value: Any, path: str, run: _Run) -> Any:
         return self.factory().apply(value, path, run)
+
+
+class _OpaqueValue(_Node):
+    """Discovery arguments retain JSON shape, never operator-authored values."""
+
+    def apply(self, value: Any, path: str, run: _Run) -> Any:
+        if isinstance(value, dict):
+            slots = _numbered_slots(sorted(value), f"{path}.field")
+            rebuilt = {}
+            for key in sorted(value):
+                slot = slots[key]
+                replacement = synthetic_text(slot)
+                run.note(slot, "synthetic_key", changed=replacement != key)
+                rebuilt[replacement] = self.apply(value[key], slot, run)
+            return rebuilt
+        if isinstance(value, list):
+            return [self.apply(entry, f"{path}[{index}]", run) for index, entry in enumerate(value)]
+        if isinstance(value, str):
+            return _Text().apply(value, path, run)
+        if value is None or isinstance(value, bool):
+            return value
+        if isinstance(value, int | float):
+            run.note(path, "synthetic_number", changed=value != SYNTHETIC_NUMBER)
+            return SYNTHETIC_NUMBER
+        raise _refuse(path, "expected JSON discovery arguments")
 
 
 class _SchemaNode(_Node):
@@ -854,6 +892,7 @@ _TOOL: _Switch = _Switch(
                 "description": _Text(),
                 "parameters": _SCHEMA,
                 "strict": _Scalar(),
+                "defer_loading": _Boolean(),
             }
         ),
         "custom": _Obj(
@@ -944,6 +983,28 @@ _INPUT_ITEM = _Switch(
                 "role": _Enum(MESSAGE_ROLES),
                 "id": _Ident("at", strippable=True),
                 "tools": _Arr(_TOOL),
+            }
+        ),
+        "tool_search_call": _Obj(
+            {
+                "type": _Enum(frozenset({"tool_search_call"})),
+                "id": _Ident("search", strippable=True),
+                "call_id": _Ident("call"),
+                "execution": _Enum(TOOL_SEARCH_EXECUTIONS),
+                "status": _Enum(ITEM_STATUSES),
+                "arguments": _OpaqueValue(),
+                "internal_chat_message_metadata_passthrough": _INTERNAL_CHAT_METADATA,
+            }
+        ),
+        "tool_search_output": _Obj(
+            {
+                "type": _Enum(frozenset({"tool_search_output"})),
+                "id": _Ident("search", strippable=True),
+                "call_id": _Ident("call"),
+                "execution": _Enum(TOOL_SEARCH_EXECUTIONS),
+                "status": _Enum(ITEM_STATUSES),
+                "tools": _Arr(_TOOL),
+                "internal_chat_message_metadata_passthrough": _INTERNAL_CHAT_METADATA,
             }
         ),
         "function_call": _tool_call("function_call", {"name": _KnownLabel(CODEX_TOOL_NAMES), "arguments": _Text()}),

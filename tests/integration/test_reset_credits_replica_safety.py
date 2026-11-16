@@ -16,8 +16,9 @@ from functools import partial
 from typing import Any
 from unittest.mock import AsyncMock
 
+import aiosqlite
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from app.core.auth import generate_unique_account_id
 from app.core.cache.invalidation import NAMESPACE_RESET_CREDITS, CacheInvalidationPoller
@@ -30,6 +31,7 @@ from app.core.clients.rate_limit_reset_credits import (
 from app.db.models import ResetCreditRedeemClaim, ResetCreditRedeemRequest
 from app.db.session import SessionLocal
 from app.modules.rate_limit_reset_credits import api as reset_credits_api
+from app.modules.rate_limit_reset_credits import redeem_coordination as redeem_coordination_module
 from app.modules.rate_limit_reset_credits.redeem_coordination import (
     RedeemClaimTimeoutError,
     acquire_redeem_claim,
@@ -319,7 +321,7 @@ async def test_expired_redeem_claim_is_taken_over(async_client) -> None:
 
 
 @pytest.mark.asyncio
-async def test_redeem_claim_heartbeat_keeps_live_claim_from_takeover(async_client) -> None:
+async def test_redeem_claim_heartbeat_keeps_live_claim_from_takeover(async_client, monkeypatch) -> None:
     """A renewed lease outlives its original expiry; without the heartbeat the
     claim would be taken over mid-section by a second process."""
     account_id = await _import_account(
@@ -327,19 +329,40 @@ async def test_redeem_claim_heartbeat_keeps_live_claim_from_takeover(async_clien
         email="claim-heartbeat@example.com",
         account_id="acc_claim_heartbeat",
     )
+    initial = datetime.now(UTC)
+    now = initial
+    renewed = asyncio.Event()
+    renew = redeem_coordination_module.renew_redeem_claim
+
+    class ClaimDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            assert tz is UTC
+            return now
+
+    async def observe_committed_renewal(*args, **kwargs):
+        result = await renew(*args, **kwargs)
+        renewed.set()
+        return result
+
+    monkeypatch.setattr(redeem_coordination_module, "datetime", ClaimDateTime)
+    monkeypatch.setattr(redeem_coordination_module, "renew_redeem_claim", observe_committed_renewal)
 
     assert await try_acquire_redeem_claim(account_id, "holder-1", lease_seconds=0.5) is True
+    now = initial + timedelta(seconds=0.4)
     heartbeat = asyncio.create_task(
         renew_redeem_claim_periodically(
             account_id,
             "holder-1",
             lease_seconds=0.5,
-            renew_interval_seconds=0.1,
+            renew_interval_seconds=0.01,
         )
     )
     try:
-        # Well past the original 0.5s lease: renewal must still hold the claim.
-        await asyncio.sleep(1.0)
+        await asyncio.wait_for(renewed.wait(), 5)
+        # Past the original 0.5s expiry, before the committed 0.9s renewal.
+        # Scheduler delays cannot advance this claim clock past either fence.
+        now = initial + timedelta(seconds=0.6)
         assert await try_acquire_redeem_claim(account_id, "holder-2") is False
     finally:
         heartbeat.cancel()
@@ -347,9 +370,78 @@ async def test_redeem_claim_heartbeat_keeps_live_claim_from_takeover(async_clien
             await heartbeat
 
     # Once the heartbeat stops, lease expiry recovers the claim as before.
-    await asyncio.sleep(0.7)
+    now = initial + timedelta(seconds=2)
     assert await try_acquire_redeem_claim(account_id, "holder-2") is True
     await release_redeem_claim(account_id, "holder-2")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("renewal_error", [False, True])
+async def test_cancelled_heartbeat_finishes_its_sqlite_returning_statement(
+    async_client, monkeypatch, renewal_error
+) -> None:
+    async with SessionLocal() as session:
+        if session.get_bind().dialect.name != "sqlite":
+            pytest.skip("SQLite RETURNING cursor cancellation regression")
+    account_id = await _import_account(async_client, email="claim-cancel@example.com", account_id="acc_claim_cancel")
+    assert await try_acquire_redeem_claim(account_id, "holder-1")
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    execute = aiosqlite.Cursor.execute
+    cursors = []
+
+    async def hold_returning(cursor, sql, parameters=None):
+        result = await execute(cursor, sql, parameters)
+        if sql.startswith("UPDATE reset_credit_redeem_claims"):
+            cursors.append(cursor)
+            entered.set()
+            await release.wait()
+        return result
+
+    monkeypatch.setattr(aiosqlite.Cursor, "execute", hold_returning)
+    if renewal_error:
+        renew = redeem_coordination_module.renew_redeem_claim
+        calls = 0
+
+        async def fail_completed_renewal(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                return False
+            await renew(*args, **kwargs)
+            raise RuntimeError("synthetic renewal failure during cancellation")
+
+        monkeypatch.setattr(redeem_coordination_module, "renew_redeem_claim", fail_completed_renewal)
+    heartbeat = asyncio.create_task(
+        renew_redeem_claim_periodically(account_id, "holder-1", renew_interval_seconds=0.01)
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        heartbeat.cancel()
+        # Drain already-ready callbacks: the old implementation cancels the
+        # driver while its real RETURNING cursor still owns a writer slot.
+        await asyncio.sleep(0)
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(heartbeat, 5)
+        if renewal_error:
+            assert calls == 1, "cancellation must not start another heartbeat"
+        async with SessionLocal() as session:
+            await session.execute(text("PRAGMA busy_timeout=100"))
+            await session.execute(text("UPDATE reset_credit_redeem_claims SET expires_at=expires_at"))
+            await session.commit()
+    finally:
+        release.set()
+        if not heartbeat.done():
+            heartbeat.cancel()
+        await asyncio.gather(heartbeat, return_exceptions=True)
+        # Fault injection can retain the unconsumed cursor on RED; reclaim it
+        # before the test database is reused, without masking the assertion.
+        for cursor in cursors:
+            try:
+                await cursor.close()
+            except (ValueError, aiosqlite.ProgrammingError):
+                pass
 
 
 @pytest.mark.asyncio

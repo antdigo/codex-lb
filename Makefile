@@ -2,6 +2,13 @@ PYTEST_ARGS := -q -ra -o faulthandler_timeout=300 -o faulthandler_exit_on_timeou
 POSTGRES_TEST_DATABASE_URL ?= postgresql+asyncpg://codex_lb:codex_lb@127.0.0.1:5432/codex_lb
 INTEGRATION_CORE_SHARD_COUNT := 3
 POSTGRES_PYTEST_TARGETS := \
+	tests/integration/test_live_usage_ingest.py::test_postgresql_live_ingest_serializes_identity_membership_through_snapshot_commit \
+	tests/integration/test_live_usage_ingest.py::test_postgresql_live_ingest_waits_for_identity_consolidation_commit \
+	tests/integration/test_live_usage_ingest.py::test_postgresql_live_ingest_recovers_when_current_identity_reconciliation_wins_owner_lock \
+	tests/integration/test_live_usage_ingest.py::test_postgresql_opposite_identity_moves_use_one_sorted_lock_order \
+	tests/integration/test_usage_repository.py::test_additional_latest_by_account_postgres_uses_top1_probes \
+	tests/integration/test_usage_repository.py::test_list_quota_keys_postgres_loose_scan_matches_distinct \
+	tests/integration/test_migration_benchmark.py \
 	tests/integration/test_affinity_invite_migration.py \
 	tests/integration/test_affinity_identity_migration.py \
 	tests/integration/test_cost_backfill.py \
@@ -147,7 +154,7 @@ rust-audit:
 	test-integration-core-1 test-integration-core-2 test-integration-core-3 \
 	test-integration-bridge test-e2e test-postgres
 test-unit: frontend-build
-	uv sync --dev --frozen
+	uv sync --dev --extra metrics --frozen
 	PYTHONFAULTHANDLER=1 uv run pytest $(PYTEST_ARGS) tests/unit tests/simulation tests/test_request_logs_options_api.py
 
 test-integration-core: frontend-build

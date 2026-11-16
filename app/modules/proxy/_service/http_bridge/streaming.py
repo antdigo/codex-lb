@@ -36,6 +36,7 @@ from app.core.clients.proxy import codex_control_request as core_codex_control_r
 from app.core.clients.proxy import compact_responses as core_compact_responses  # noqa: F401
 from app.core.clients.proxy import transcribe_audio as core_transcribe_audio  # noqa: F401
 from app.core.clients.proxy_websocket import UpstreamWebSocketTransportError
+from app.core.clients.thread_cache_identity import ThreadCachePolicy, resolve_thread_cache_policy
 from app.core.clock import Clock, Scheduler, clock_for, scheduler_for
 from app.core.errors import (
     PREVIOUS_RESPONSE_STREAM_INCOMPLETE_MESSAGE,
@@ -77,6 +78,10 @@ from app.modules.proxy._service.http_bridge.connection_lifetime import (
     _HTTP_BRIDGE_MAX_IDLE_SOCKET_AGE_SECONDS,
     _HTTPBridgeAgeReplacementError,
     _HTTPBridgeAgeRotation,
+)
+from app.modules.proxy._service.http_bridge.continuation import (
+    owns_completed_response_context,
+    response_snapshot_matches,
 )
 from app.modules.proxy._service.http_bridge.helpers import (
     _HTTP_BRIDGE_COOLDOWN_SUPPRESSION_ATTR,
@@ -131,11 +136,13 @@ from app.modules.proxy._service.http_bridge.helpers import (
 from app.modules.proxy._service.http_bridge.owner_forwarding import (
     _owner_forward_failure_allows_local_recovery,
 )
+from app.modules.proxy._service.http_bridge.pool_routing import PoolRequestContext
 from app.modules.proxy._service.http_bridge.quarantine import (
     _http_bridge_quarantine_clear_fence,
     _http_bridge_session_key_poison_quarantined,
     _http_bridge_session_key_quarantined,
 )
+from app.modules.proxy._service.http_bridge.recovery_alias import RecoveryAliasTransfer
 from app.modules.proxy._service.http_bridge.retry_circuit import (
     _HTTP_BRIDGE_RETRY_CIRCUIT_ANCHOR_ABANDONED_DETAIL,
     _http_bridge_retry_circuit_suppression_message,
@@ -272,6 +279,17 @@ from app.modules.proxy.durable_bridge_runtime import http_bridge_owner_process_e
 from app.modules.proxy.helpers import (
     _normalize_error_code,
 )
+from app.modules.proxy.http_operation import (
+    CancellationObservation,
+    DecisionAction,
+    HandoffObservation,
+    OperationController,
+    ReplayKind,
+    TerminalObservation,
+    TimeoutObservation,
+)
+from app.modules.proxy.input_contract import _client_tools_only, _complete_original_items
+from app.modules.proxy.pool_identity import HTTP_BRIDGE_POOL_LANE_KIND
 from app.modules.proxy.replay_safety import (
     AccountNeutralReplayProjection,
     project_responses_input_for_account_neutral_fresh_replay,
@@ -285,6 +303,28 @@ logger = logging.getLogger("app.modules.proxy.service")
 T = TypeVar("T")
 _REQUEST_TRANSPORT_HTTP = "http"
 
+
+def _new_http_operation(
+    payload: ResponsesRequest,
+    frame: JsonObject,
+    deadline: float,
+    cache_policy: ThreadCachePolicy = ThreadCachePolicy(),
+) -> OperationController:
+    proof = (
+        payload.model_copy(update={"input": [{"role": "user", "content": payload.input}]})
+        if isinstance(payload.input, str)
+        else payload
+    )
+    tools = frame.get("tools")
+    return OperationController(
+        deadline,
+        request_text=json.dumps({**frame, "type": "response.create"}, separators=(",", ":")),
+        complete_input=_complete_original_items(proof),
+        client_tools_only=_client_tools_only(tools),
+        cache_policy=cache_policy,
+    )
+
+
 _RESPONSE_CREATE_GATE_RETRY_SLEEP_SECONDS = 10.0
 
 # Why a cross-account replay of an unavailable owner's turn was refused. The
@@ -296,6 +336,7 @@ _AccountNeutralReplayRejection = Literal[
     "no_durable_lookup",
     "payload_not_full_resend",
     "anchor_metadata_missing",
+    "anchor_response_mismatch",
     "prefix_fingerprint_mismatch",
     "input_not_itemized",
     "missing_prior_output",
@@ -329,6 +370,8 @@ def _durable_full_resend_anchor_rejection(
     """
     if not payload_looks_like_full_resend:
         return "payload_not_full_resend"
+    if not response_snapshot_matches(payload.previous_response_id, lookup.latest_response_id):
+        return "anchor_response_mismatch"
     stored_count = lookup.latest_input_item_count
     if stored_count is None:
         return "anchor_metadata_missing"
@@ -423,6 +466,7 @@ class _VerifiedDurableFullResend:
         input_items = payload.input
         return (
             isinstance(input_items, list)
+            and response_snapshot_matches(payload.previous_response_id, self._latest_response_id)
             and durable_lookup is not None
             and durable_lookup.session_id == self._durable_session_id
             and durable_lookup.account_id == self._owner_account_id
@@ -446,6 +490,7 @@ class _VerifiedDurableFullResend:
         if (
             owner_account_id is None
             or latest_response_id is None
+            or not response_snapshot_matches(payload.previous_response_id, latest_response_id)
             or stored_count is None
             or stored_fingerprint is None
             or not _http_bridge_payload_looks_like_full_resend(payload)
@@ -701,13 +746,32 @@ def _http_bridge_can_replace_retired_gate_session(
     # not disqualify replacement on its own.
     code, _message = _proxy_error_code_message(exc)
     retired_create_gate = code == "response_create_gate_timeout" and session.closed and session.key.strength == "hard"
+    pool_context = request_state.http_pool_context
+    operation = request_state.http_operation
+    independent_pool_waiter = (
+        session.key.affinity_kind == "internal_pool_lane"
+        and pool_context is not None
+        and pool_context.request is not None
+        and pool_context.independent
+        and pool_context.owns_pin(session)
+        and pool_context.account_id == session.account.id
+        and operation is not None
+        and operation.initial.complete
+        and operation.initial.client_tools_only
+        and not request_state.file_required_preferred_account
+    )
     retired_execution = (
         exc.local_pre_dispatch_refusal
         and code == "response_execution_session_retired"
         and (session.closed or session.upstream_control.retire_after_drain)
-        and session.key.strength == "soft"
-        and session.key.affinity_kind == "prompt_cache"
-        and not session.codex_session
+        and (
+            independent_pool_waiter
+            or (
+                session.key.strength == "soft"
+                and session.key.affinity_kind == "prompt_cache"
+                and not session.codex_session
+            )
+        )
         and request_state.previous_response_id is None
         and not request_state.hard_continuity_anchor
         and not request_state.payload_conversation_bound
@@ -797,7 +861,7 @@ def _http_bridge_interrupted_tool_outputs_input(
     """
     if not session.last_pending_tool_calls or session.last_completed_response_id is None:
         return None
-    if payload.previous_response_id != session.last_completed_response_id:
+    if not owns_completed_response_context(session, payload.previous_response_id):
         return None
     input_items = payload.input
     if not isinstance(input_items, list):
@@ -958,6 +1022,7 @@ class _HTTPBridgeStreamingMixin:
         forwarded_affinity_kind: str | None = None,
         forwarded_affinity_key: str | None = None,
         forwarded_file_owner_account_id: str | None = None,
+        forwarded_cache_policy: ThreadCachePolicy | None = None,
         client_ip: str | None = None,
         enforce_openai_sdk_contract: bool = True,
         http_bridge_active: bool | None = None,
@@ -984,6 +1049,7 @@ class _HTTPBridgeStreamingMixin:
             forwarded_affinity_kind=forwarded_affinity_kind,
             forwarded_affinity_key=forwarded_affinity_key,
             forwarded_file_owner_account_id=forwarded_file_owner_account_id,
+            forwarded_cache_policy=forwarded_cache_policy,
             client_ip=client_ip,
             enforce_openai_sdk_contract=enforce_openai_sdk_contract,
             http_bridge_active=http_bridge_active,
@@ -1010,6 +1076,7 @@ class _HTTPBridgeStreamingMixin:
         forwarded_affinity_kind: str | None = None,
         forwarded_affinity_key: str | None = None,
         forwarded_file_owner_account_id: str | None = None,
+        forwarded_cache_policy: ThreadCachePolicy | None = None,
         client_ip: str | None = None,
         enforce_openai_sdk_contract: bool = True,
         http_bridge_active: bool | None = None,
@@ -1017,6 +1084,7 @@ class _HTTPBridgeStreamingMixin:
         capacity_startup_ready_event: asyncio.Event | None = None,
     ) -> AsyncIterator[str]:
         dashboard_settings = await _service_get_settings_cache().get()
+        cache_policy = forwarded_cache_policy or resolve_thread_cache_policy(api_key, _service_get_settings())
         runtime_config = _http_bridge_runtime_config(dashboard_settings, _service_get_settings())
         if http_bridge_active is False:
             runtime_config = dataclasses.replace(runtime_config, enabled=False)
@@ -1111,6 +1179,7 @@ class _HTTPBridgeStreamingMixin:
                 rewritten_file_account_id=rewritten_file_account_id,
                 file_account_resolution_complete=True,
                 upstream_stream_transport_override=force_upstream_stream_transport,
+                cache_policy=cache_policy,
                 client_ip=client_ip,
                 enforce_openai_sdk_contract=enforce_openai_sdk_contract,
             ):
@@ -1122,9 +1191,16 @@ class _HTTPBridgeStreamingMixin:
         bridge_yielded_any = False
         bridge_transport_unavailable = False
         bridge_attempt_started_at = clock_for(self).monotonic()
+        operation = _new_http_operation(
+            payload,
+            bridge_payload,
+            bridge_attempt_started_at + _http_bridge_request_budget_seconds(_service_get_settings()),
+            cache_policy,
+        )
+        bridge_stream = None
         try:
             try:
-                async for line in self._stream_via_http_bridge(
+                bridge_stream = self._stream_via_http_bridge(
                     payload,
                     headers,
                     codex_session_affinity=codex_session_affinity,
@@ -1152,7 +1228,9 @@ class _HTTPBridgeStreamingMixin:
                     capacity_startup_ready_event=capacity_startup_ready_event,
                     deferred_account_backoff_tracker=deferred_account_backoff_tracker,
                     bridge_payload=bridge_payload,
-                ):
+                    _operation=operation,
+                )
+                async for line in bridge_stream:
                     bridge_yielded_any = True
                     yield line
             except ProxyResponseError as exc:
@@ -1245,6 +1323,11 @@ class _HTTPBridgeStreamingMixin:
                     # instead of denied with 426.
                     mark_upstream_websocket_transport_failure()
                 bridge_transport_unavailable = True
+        except (asyncio.CancelledError, GeneratorExit):
+            # Cancellation may arrive before the stream adapter enters its
+            # receive loop (for example while submit waits on reader ownership).
+            operation.decide(CancellationObservation(request_id))
+            raise
         finally:
             with anyio.CancelScope(shield=True):
                 try:
@@ -1262,7 +1345,11 @@ class _HTTPBridgeStreamingMixin:
                             # reservation. Once ownership transfers, the request
                             # finalizer is the only safe settlement owner.
                             try:
-                                await self._release_websocket_reservation(lifecycle.reservation)
+                                await self._release_websocket_reservation(
+                                    lifecycle.reservation,
+                                    operation=operation,
+                                    decision=operation.decide(TerminalObservation(None, request_id, compensation=True)),
+                                )
                             except Exception:
                                 logger.warning(
                                     "Failed to release HTTP bridge API key reservation before deferred backoff",
@@ -1272,18 +1359,35 @@ class _HTTPBridgeStreamingMixin:
                                 lifecycle.settlement_confirmed = True
                                 await self._drain_deferred_account_error_backoffs(pending_backoffs)
                 finally:
-                    await _release_http_bridge_unanchored_handoffs_for_request(
-                        self,
-                        request_scope_id=request_scope_id,
-                    )
+                    try:
+                        if bridge_stream is not None:
+                            await bridge_stream.aclose()
+                    finally:
+                        await _release_http_bridge_unanchored_handoffs_for_request(
+                            self,
+                            request_scope_id=request_scope_id,
+                        )
+                        if not bridge_transport_unavailable:
+                            operation.close()
         if not bridge_transport_unavailable:
             return
+        if (
+            operation.decide(
+                HandoffObservation(
+                    clock_for(self).monotonic(),
+                    proven_unsent=True,
+                )
+            ).action
+            is not DecisionAction.HANDOFF
+        ):
+            operation.close()
+            raise ProxyResponseError(504, openai_error("upstream_request_timeout", "Original HTTP deadline exhausted"))
         logger.warning(
             "stream_responses http bridge upstream unavailable; retrying over http upstream transport request_id=%s",
             request_id,
         )
-        stream_with_retry = cast(Callable[..., AsyncIterator[str]], self._stream_with_retry)
-        async for line in stream_with_retry(
+        stream_with_retry = cast(Callable[..., AsyncGenerator[str, None]], self._stream_with_retry)
+        raw_stream = stream_with_retry(
             payload,
             headers,
             codex_session_affinity=codex_session_affinity,
@@ -1298,8 +1402,15 @@ class _HTTPBridgeStreamingMixin:
             upstream_stream_transport_override="http",
             client_ip=client_ip,
             enforce_openai_sdk_contract=enforce_openai_sdk_contract,
-        ):
-            yield line
+            http_operation=operation,
+            cache_policy=cache_policy,
+        )
+        try:
+            async for line in raw_stream:
+                yield line
+        finally:
+            operation.close()
+            await raw_stream.aclose()
 
     async def _stream_via_http_bridge_impl(
         self: Any,
@@ -1332,10 +1443,17 @@ class _HTTPBridgeStreamingMixin:
         deferred_account_backoff_tracker: _DeferredAccountBackoffTracker | None = None,
         bridge_payload: JsonObject | None = None,
         _denied_anchor_request_id: str | None = None,
+        _pool_request: PoolRequestContext | None = None,
+        _operation: OperationController | None = None,
     ) -> AsyncIterator[str]:
         scheduler = scheduler_for(self)
         clock = clock_for(self)
         del suppress_text_done_events
+        operation_deadline = (
+            _operation.deadline
+            if _operation is not None and _operation.deadline is not None
+            else clock.monotonic() + _http_bridge_request_budget_seconds(_service_get_settings())
+        )
         dead_owner_anchor = False
         dead_owner_process_epoch_mismatch = False
         request_id = _denied_anchor_request_id or ensure_request_id()
@@ -1386,6 +1504,14 @@ class _HTTPBridgeStreamingMixin:
             return lifecycle
 
         original_inline_item_id_seen = False
+        proof_payload = (
+            payload.model_copy(update={"input": [{"role": "user", "content": payload.input}]})
+            if isinstance(payload.input, str)
+            else payload
+        )
+        operation = _operation or _new_http_operation(
+            payload, bridge_payload, operation_deadline, resolve_thread_cache_policy(api_key, _service_get_settings())
+        )
 
         def prepare_bridge_request(
             request_payload: ResponsesRequest,
@@ -1413,6 +1539,8 @@ class _HTTPBridgeStreamingMixin:
                     client_ip=client_ip,
                 )
             original_inline_item_id_seen = original_inline_item_id_seen or request_state.has_original_inline_item_id
+            request_state.http_operation = operation
+            request_state.http_pool_context = _pool_request
             request_state.has_original_inline_item_id = original_inline_item_id_seen
             request_state.capacity_startup_wait_event = capacity_startup_wait_event
             request_state.capacity_startup_ready_event = capacity_startup_ready_event
@@ -1432,7 +1560,11 @@ class _HTTPBridgeStreamingMixin:
             if request_state is not None:
                 await self._release_websocket_request_state_reservation(request_state)
                 return
-            await self._release_websocket_reservation(lifecycle.reservation)
+            await self._release_websocket_reservation(
+                lifecycle.reservation,
+                operation=operation,
+                decision=operation.decide(TerminalObservation(None, request_id, compensation=True)),
+            )
             lifecycle.settlement_confirmed = True
             await self._drain_deferred_account_error_backoffs(lifecycle.pending_backoffs)
 
@@ -1723,6 +1855,41 @@ class _HTTPBridgeStreamingMixin:
                                 "HTTP responses recovery state could not be claimed; retry the request.",
                             ),
                         )
+        if _pool_request is not None:
+            assert operation.deadline is not None
+            pool_key = await _pool_request.choose(
+                self,
+                bridge_session_key,
+                payload,
+                lookup=durable_lookup,
+                instance_id=_service_get_settings().http_responses_session_bridge_instance_id,
+                incoming_turn_state=incoming_turn_state_header,
+                forwarded_request=forwarded_request,
+                responses_lite=bridge_uses_responses_lite,
+                api_key=api_key,
+                restart=affinity.abandon_unavailable_legacy_owner,
+                queue_limit=queue_limit,
+                deadline=operation.deadline,
+                clock=clock,
+                scheduler=scheduler,
+                cache_policy=operation.initial.cache_policy,
+            )
+            if pool_key != bridge_session_key:
+                bridge_session_key = pool_key
+                original_age_rotation_key = pool_key
+                await self._ensure_http_bridge_retry_circuit_loaded_for_key(pool_key, request_model=payload.model)
+                if _pool_request.independent:
+                    # Full input is prepared against its own lane before any
+                    # canonical latest-response injection or prefix trimming.
+                    durable_lookup = None
+                    durable_full_resend_anchor_count = None
+                    durable_full_resend_anchor_fingerprint = None
+                    durable_full_resend_has_safe_fresh_context = False
+                    dead_owner_anchor = False
+                    dead_owner_process_epoch_mismatch = False
+                    session_header_fallback_key = None
+                    durable_session_header_alias = None
+                    incoming_session_header = None
         durable_anchor_trimmable = durable_full_resend_anchor_count is not None
         durable_model_transition_lookup = (
             durable_lookup
@@ -1895,6 +2062,7 @@ class _HTTPBridgeStreamingMixin:
             kind=bridge_session_key.affinity_kind,
             key=bridge_session_key.affinity_key,
         )
+        recovery_alias_transfer: RecoveryAliasTransfer | None = None
         if account_neutral_recovery:
             affinity = _AffinityPolicy()
             incoming_turn_state_header = None
@@ -1925,13 +2093,6 @@ class _HTTPBridgeStreamingMixin:
                 model_class=_extract_model_class(payload.model) if payload.model else None,
                 owner_check_applied=True,
             )
-        if effective_payload.previous_response_id is not None and isinstance(effective_payload.input, list):
-            previous_response_input_items = cast(list[JsonValue], effective_payload.input)
-            trimmed_input_items = _trim_http_bridge_previous_response_input_items(previous_response_input_items)
-            if len(trimmed_input_items) != len(previous_response_input_items):
-                previous_response_trimmed_input_count = len(previous_response_input_items)
-                previous_response_trimmed_input_fingerprint = _fingerprint_input_items(previous_response_input_items)
-                effective_payload = effective_payload.model_copy(update={"input": trimmed_input_items})
         request_state, text_data = prepare_bridge_request(effective_payload)
         if proxy_injected_previous_response_id and request_state.previous_response_id is not None:
             # Capture denial provenance before owner lookups below can suspend
@@ -1952,19 +2113,6 @@ class _HTTPBridgeStreamingMixin:
             downstream_turn_state=downstream_turn_state,
             incoming_turn_state_header=incoming_turn_state_header,
         )
-        if previous_response_trimmed_input_count is not None:
-            request_state.input_item_count = previous_response_trimmed_input_count
-            request_state.input_full_fingerprint = previous_response_trimmed_input_fingerprint
-            logger.info(
-                "http_bridge_previous_response_input_trimmed request_id=%s original_items=%s trimmed_to=%s "
-                "previous_response_id=%s",
-                request_state.request_id,
-                previous_response_trimmed_input_count,
-                len(cast(list[JsonValue], effective_payload.input))
-                if isinstance(effective_payload.input, list)
-                else None,
-                effective_payload.previous_response_id,
-            )
         request_state.transport = _REQUEST_TRANSPORT_HTTP
         request_state.request_stage = _http_bridge_request_stage(
             headers=headers,
@@ -2081,6 +2229,12 @@ class _HTTPBridgeStreamingMixin:
             and request_state.preferred_account_id == continuity_preferred_account_id
         )
         file_required_preferred_account = rewritten_file_account_id is not None
+        pool_required_account = _pool_request.account_id if _pool_request is not None else None
+        if pool_required_account is not None:
+            request_state.preferred_account_id = resolve_required_account_id(
+                ("continuity or file owner", request_state.preferred_account_id),
+                ("pool lane account", pool_required_account),
+            )
         if proxy_injected_previous_response_id:
             request_state.proxy_injected_previous_response_id = True
             request_state.proxy_injected_anchor_had_full_resend_payload = payload_looks_like_full_resend
@@ -2112,7 +2266,8 @@ class _HTTPBridgeStreamingMixin:
             request_state.fresh_upstream_request_text = client_full_resend_fresh_upstream_request_text
             request_state.fresh_upstream_request_is_retry_safe = True
         settings = _service_get_settings()
-        request_deadline = request_state.started_at + _http_bridge_request_budget_seconds(settings)
+        request_deadline = operation.deadline
+        assert request_deadline is not None
         session_creation_headers = (
             without_http_bridge_session_affinity_headers(headers)
             if account_neutral_recovery or owner_bound_full_resend_ignores_broad_session
@@ -2523,8 +2678,10 @@ class _HTTPBridgeStreamingMixin:
             and age_session.physical_opened_at is not None
             and clock.monotonic() - age_session.physical_opened_at >= _HTTP_BRIDGE_MAX_IDLE_SOCKET_AGE_SECONDS
             and bridge_session_key == original_age_rotation_key
-            and bridge_session_key.affinity_kind == "prompt_cache"
-            and bridge_session_key.strength == "soft"
+            and bridge_session_key.affinity_kind in {"prompt_cache", HTTP_BRIDGE_POOL_LANE_KIND}
+            and (
+                bridge_session_key.strength == "soft" or bridge_session_key.affinity_kind == HTTP_BRIDGE_POOL_LANE_KIND
+            )
             and not forwarded_request
             and not bridge_uses_responses_lite
             and payload.previous_response_id is None
@@ -2537,7 +2694,14 @@ class _HTTPBridgeStreamingMixin:
             and not force_local_recovery_creation
             and not fresh_replay_excluded_account_ids
         ):
-            age_rotation = _HTTPBridgeAgeRotation(bridge_session_key, payload)
+            age_rotation = _HTTPBridgeAgeRotation(
+                bridge_session_key,
+                proof_payload,
+                own_pool_waiters=int(_pool_request is not None and _pool_request.owns_pin(age_session)),
+                independent_pool_lane=(
+                    _pool_request is not None and _pool_request.request is not None and _pool_request.independent
+                ),
+            )
         del age_session
 
         while True:
@@ -2582,13 +2746,16 @@ class _HTTPBridgeStreamingMixin:
                     request_stage=request_state.request_stage,
                     preferred_account_id=request_state.preferred_account_id,
                     preferred_account_has_continuity_provenance=preferred_account_has_continuity_provenance,
-                    fallback_on_preferred_account_unavailable=not file_required_preferred_account,
+                    fallback_on_preferred_account_unavailable=(
+                        not file_required_preferred_account and pool_required_account is None
+                    ),
                     request_usage_budget=request_state.request_usage_budget,
                     request_deadline=request_deadline,
                     session_header_fallback_key=session_header_fallback_key,
                     exclude_account_ids=fresh_replay_excluded_account_ids or None,
                     deferred_account_backoff_lifecycle=request_state.deferred_account_backoff_lifecycle,
                     defer_account_health_writes=request_state.api_key_reservation is not None,
+                    cache_policy=operation.initial.cache_policy,
                 )
             except ProxyResponseError as exc:
                 if age_rotation is not None and age_rotation.required_account_id is not None:
@@ -2698,6 +2865,7 @@ class _HTTPBridgeStreamingMixin:
                     request_started_at=request_state.started_at,
                     proxy_api_authorization=proxy_api_authorization,
                     client_ip=client_ip,
+                    cache_policy=operation.initial.cache_policy,
                 ):
                     forwarded_any = True
                     yield line
@@ -2891,6 +3059,7 @@ class _HTTPBridgeStreamingMixin:
                             exclude_account_ids=request_state.excluded_account_ids or None,
                             deferred_account_backoff_lifecycle=request_state.deferred_account_backoff_lifecycle,
                             defer_account_health_writes=request_state.api_key_reservation is not None,
+                            cache_policy=operation.initial.cache_policy,
                         )
                     except ProxyResponseError as capacity_exc:
                         if owner_unavailable_allows_account_neutral_replay(capacity_exc):
@@ -3017,8 +3186,12 @@ class _HTTPBridgeStreamingMixin:
                             recovery_anchor_fence_response_id,
                             request_id,
                         )
-                        if durable_lookup.latest_response_id != session.last_completed_response_id:
+                        if (
+                            durable_lookup.latest_response_id != session.last_completed_response_id
+                            or durable_lookup.account_id != session.last_completed_response_account_id
+                        ):
                             session.last_pending_tool_calls = {}
+                            session.last_completed_output_identities = ()
                         session.last_completed_response_id = durable_lookup.latest_response_id
                         session.last_completed_response_account_id = durable_lookup.account_id
                         session.last_completed_input_count = durable_full_resend_anchor_count
@@ -3126,6 +3299,8 @@ class _HTTPBridgeStreamingMixin:
                             session.last_used_at = clock.monotonic()
                 return
         session = session_or_forward
+        if _pool_request is not None:
+            await _pool_request.bind(session)
         if (
             # A quarantine-suppressed anchor (#1534) must not be rehydrated
             # into the session either: doing so would let the session-level
@@ -3138,11 +3313,15 @@ class _HTTPBridgeStreamingMixin:
             and durable_lookup is not None
             and durable_lookup.latest_response_id is not None
         ):
-            if durable_lookup.latest_response_id != session.last_completed_response_id:
+            if (
+                durable_lookup.latest_response_id != session.last_completed_response_id
+                or durable_lookup.account_id != session.last_completed_response_account_id
+            ):
                 # The pending tool calls were recorded for the session's own
                 # last completed response; a durable anchor pointing elsewhere
                 # must not trigger interrupted-output injection.
                 session.last_pending_tool_calls = {}
+                session.last_completed_output_identities = ()
             session.last_completed_response_id = durable_lookup.latest_response_id
             # The durable anchor is owned by the durable session's account, which
             # may differ from this session's account after a failover. Record the
@@ -3195,6 +3374,7 @@ class _HTTPBridgeStreamingMixin:
         ) and (not _http_bridge_payload_looks_like_full_resend(effective_payload) or session_anchor_trimmable)
         session_anchor_candidate = (
             session.codex_session
+            and not (_pool_request is not None and _pool_request.independent_admission)
             # Honor the quarantine decision end to end: the durable anchor
             # skipped above must not come back as a session-level injection.
             and not fresh_reattach_anchor_suppressed_quarantined
@@ -3324,6 +3504,8 @@ class _HTTPBridgeStreamingMixin:
         store_context_original_fingerprint: str | None = None
         if (
             has_previous_response_id
+            and owns_completed_response_context(session, effective_payload.previous_response_id)
+            and not (_pool_request is not None and _pool_request.independent_admission)
             and stored_count > 0
             and stored_fingerprint is not None
             and isinstance(incoming_input, list)
@@ -3352,14 +3534,31 @@ class _HTTPBridgeStreamingMixin:
                     stored_count,
                     effective_payload.previous_response_id,
                 )
-        injected_input_items = _http_bridge_interrupted_tool_outputs_input(
-            session,
-            payload=submit_payload,
-            request_id=request_id,
+        replayed_output_trim_applied = False
+        if (
+            owns_completed_response_context(session, submit_payload.previous_response_id)
+            and isinstance(submit_payload.input, list)
+            and not (_pool_request is not None and _pool_request.independent_admission)
+        ):
+            output_input = cast(list[JsonValue], submit_payload.input)
+            trimmed = _trim_http_bridge_previous_response_input_items(
+                output_input, covered_output_identities=session.last_completed_output_identities
+            )
+            if len(trimmed) != len(output_input):
+                replayed_output_trim_applied = True
+                previous_response_trimmed_input_count = len(cast(list[JsonValue], incoming_input))
+                previous_response_trimmed_input_fingerprint = _fingerprint_input_items(
+                    cast(list[JsonValue], incoming_input)
+                )
+                submit_payload = submit_payload.model_copy(update={"input": trimmed})
+        injected_input_items = (
+            _http_bridge_interrupted_tool_outputs_input(session, payload=submit_payload, request_id=request_id)
+            if _pool_request is None or not _pool_request.independent_admission
+            else None
         )
         if injected_input_items is not None:
             submit_payload = submit_payload.model_copy(update={"input": injected_input_items})
-        if store_context_trim_applied or injected_input_items is not None:
+        if store_context_trim_applied or replayed_output_trim_applied or injected_input_items is not None:
             # Re-prepare from the final upstream-shaped payload (post-trim,
             # post-injection) so the serialized request text, the slim/size
             # guard, the stored input context, and the usage budget all
@@ -3686,6 +3885,7 @@ class _HTTPBridgeStreamingMixin:
                                 exclude_account_ids=request_state.excluded_account_ids or None,
                                 deferred_account_backoff_lifecycle=request_state.deferred_account_backoff_lifecycle,
                                 defer_account_health_writes=request_state.api_key_reservation is not None,
+                                cache_policy=operation.initial.cache_policy,
                             )
                         except ProxyResponseError as capacity_exc:
                             wait_plan = _http_bridge_capacity_wait_plan(
@@ -3753,7 +3953,9 @@ class _HTTPBridgeStreamingMixin:
             if (
                 _http_bridge_should_attempt_soft_affinity_reroute(
                     exc,
-                    key=bridge_session_key,
+                    key=_pool_request.affinity_authority(bridge_session_key)
+                    if _pool_request is not None
+                    else bridge_session_key,
                     previous_response_id=effective_payload.previous_response_id,
                 )
                 and not file_required_preferred_account
@@ -3802,6 +4004,7 @@ class _HTTPBridgeStreamingMixin:
                             exclude_account_ids=request_state.excluded_account_ids or None,
                             deferred_account_backoff_lifecycle=request_state.deferred_account_backoff_lifecycle,
                             defer_account_health_writes=request_state.api_key_reservation is not None,
+                            cache_policy=operation.initial.cache_policy,
                         )
                     except ProxyResponseError as capacity_exc:
                         wait_plan = _http_bridge_capacity_wait_plan(
@@ -3874,7 +4077,9 @@ class _HTTPBridgeStreamingMixin:
             is_context_overflow = _http_bridge_is_context_overflow_error(exc)
             should_rollover_after_context_overflow = _http_bridge_should_rollover_after_context_overflow(
                 exc,
-                key=bridge_session_key,
+                key=_pool_request.affinity_authority(bridge_session_key)
+                if _pool_request is not None
+                else bridge_session_key,
             )
             should_attempt_previous_response_recovery = (
                 effective_payload.previous_response_id is not None
@@ -3932,6 +4137,22 @@ class _HTTPBridgeStreamingMixin:
                         "HTTP response recovery operation fence is unavailable; retry the request.",
                     ),
                 ) from exc
+            if (
+                operation.attempts
+                and (should_attempt_previous_response_recovery or should_attempt_context_overflow_fresh_turn_recovery)
+                and operation.authorize_replay(
+                    ReplayKind.CONTINUITY,
+                    now=clock.monotonic(),
+                    account_id=session.account.id,
+                    authority_valid=not request_state.operation_replay,
+                    allow_account_switch=not request_state.file_required_preferred_account,
+                    required_account_id=(
+                        None if previous_response_rejected_full_resend else request_state.replay_required_account_id
+                    ),
+                )
+                is None
+            ):
+                raise
             if should_attempt_context_overflow_fresh_turn_recovery:
                 if PROMETHEUS_AVAILABLE and bridge_durable_recover_total is not None:
                     bridge_durable_recover_total.labels(path="context_overflow_fresh_turn").inc()
@@ -3974,6 +4195,24 @@ class _HTTPBridgeStreamingMixin:
                 )
                 raise
             elif previous_response_rejected_full_resend:
+                if session.key.affinity_kind == "internal_pool_lane" and downstream_turn_state is not None:
+                    async with self._http_bridge_lock:
+                        recovery_alias_transfer = RecoveryAliasTransfer.capture_locked(
+                            self,
+                            session,
+                            request_state,
+                            downstream_turn_state,
+                            instance_id=_service_get_settings().http_responses_session_bridge_instance_id,
+                            process_epoch=http_bridge_owner_process_epoch(),
+                        )
+                    if recovery_alias_transfer is None:
+                        raise ProxyResponseError(
+                            502,
+                            openai_error(
+                                "bridge_continuity_persistence_failed",
+                                "HTTP response recovery alias owner could not be verified; retry the request.",
+                            ),
+                        ) from exc
                 await capture_verified_stale_anchor_circuit_generation(session)
                 capture_verified_stale_anchor_quarantine_generation(session)
                 await reset_previous_response_recovery_operation_spool(session, request_state)
@@ -4169,6 +4408,7 @@ class _HTTPBridgeStreamingMixin:
                             exclude_account_ids=request_state.excluded_account_ids or None,
                             deferred_account_backoff_lifecycle=request_state.deferred_account_backoff_lifecycle,
                             defer_account_health_writes=request_state.api_key_reservation is not None,
+                            cache_policy=operation.initial.cache_policy,
                         )
                     except ProxyResponseError as capacity_exc:
                         wait_plan = _http_bridge_capacity_wait_plan(
@@ -4232,6 +4472,7 @@ class _HTTPBridgeStreamingMixin:
                     retry_payload,
                     reservation=retry_api_key_reservation,
                 )
+                retry_request_state.http_recovery_alias_transfer = recovery_alias_transfer
                 local_previous_response_recovery = recovery_path in {
                     "local_previous_response_error",
                     "local_previous_response_fresh_replay",
@@ -4365,6 +4606,8 @@ class _HTTPBridgeStreamingMixin:
                         request_scope_id=local_recovery_scope_id,
                     )
         finally:
+            if _operation is None:
+                operation.close()
             if initial_handoff_scope_id is not None:
                 _release_http_bridge_unanchored_handoff(
                     initial_handoff_session,
@@ -4382,9 +4625,11 @@ class _HTTPBridgeStreamingMixin:
     ) -> AsyncIterator[str]:
         """Run one bridge request and release its process-level anchor pins."""
         request_id = ensure_request_id()
+        pool_request = PoolRequestContext()
         inner_stream = self._stream_via_http_bridge_impl(
             *args,
             _denied_anchor_request_id=request_id,
+            _pool_request=pool_request,
             **kwargs,
         )
         try:
@@ -4394,6 +4639,7 @@ class _HTTPBridgeStreamingMixin:
             try:
                 await inner_stream.aclose()
             finally:
+                pool_request.close()
                 _release_http_bridge_denied_anchor_fences(self, request_id)
 
     async def _reset_http_bridge_session_after_local_terminal_error(
@@ -4438,7 +4684,9 @@ class _HTTPBridgeStreamingMixin:
     ) -> AsyncGenerator[str, None]:
         scheduler = scheduler_for(self)
         clock = clock_for(self)
-        if request_deadline is None:
+        if request_state.http_operation is not None and request_state.http_operation.deadline is not None:
+            request_deadline = request_state.http_operation.deadline
+        elif request_deadline is None:
             request_deadline = request_state.started_at + _http_bridge_request_budget_seconds(_service_get_settings())
         request_state.bridge_request_deadline = request_deadline
         account_neutral_recovery = is_http_bridge_account_neutral_replay(
@@ -4452,6 +4700,20 @@ class _HTTPBridgeStreamingMixin:
             downstream_response_id: str,
             after_circuit_cooldown: bool = False,
         ) -> tuple[bool, str | None]:
+            operation = request_state.http_operation
+            observed_at = clock.monotonic()
+            if (
+                operation is not None
+                and operation.decide(
+                    TimeoutObservation(
+                        now=observed_at,
+                        due_at=observed_at,
+                        recovery_candidate=True,
+                    )
+                ).action
+                is not DecisionAction.RECOVER
+            ):
+                return False, None
             # The reader may already be performing the bounded additional
             # clean-close replay (including its jitter). Wait for that result
             # instead of interpreting the in-progress flag as a terminal idle
@@ -4926,6 +5188,30 @@ class _HTTPBridgeStreamingMixin:
                 return _codex_keepalive_frame()
 
             while True:
+                operation = request_state.http_operation
+                if operation is not None:
+                    timeout_decision = operation.decide(
+                        TimeoutObservation(
+                            now=clock.monotonic(),
+                            due_at=request_deadline,
+                            completion_owned=request_state.completed_delivery_scope is not None,
+                        )
+                    )
+                    if (
+                        timeout_decision.total_deadline_expired
+                        and request_state.completed_delivery_scope is None
+                        and event_queue.empty()
+                    ):
+                        failure = format_sse_event(
+                            response_failed_event(
+                                "upstream_request_timeout",
+                                "Original HTTP response deadline exhausted",
+                                response_id=_websocket_downstream_response_id(request_state),
+                            )
+                        )
+                        for final_block in operation.publication_batch(failure, final=True):
+                            yield final_block
+                        break
                 keepalive_interval = getattr(_service_get_settings(), "sse_keepalive_interval_seconds", 10.0)
                 if keepalive_interval > 0:
                     settings = _service_get_settings()
@@ -4976,6 +5262,8 @@ class _HTTPBridgeStreamingMixin:
                             )
                     if not yielded_any and not keepalive_sent:
                         wait_timeout = max(wait_timeout, _http_bridge_startup_keepalive_grace_seconds())
+                    if operation is not None and operation.deadline is not None:
+                        wait_timeout = min(wait_timeout, max(0.001, operation.deadline - clock.monotonic()))
                     try:
                         event_block = await scheduler.wait_for(event_queue.get(), timeout=wait_timeout)
                     except asyncio.TimeoutError:
@@ -5408,8 +5696,31 @@ class _HTTPBridgeStreamingMixin:
                     )
                 # Carry the parsed payload so the API-layer normalizers reuse
                 # it instead of parsing the same block again.
+                if request_state.http_operation is not None and block_event_type in {
+                    "response.completed",
+                    "response.failed",
+                    "response.incomplete",
+                    "error",
+                }:
+                    operation = request_state.http_operation
+                    # Recovery has declined this terminal. Only now may an
+                    # unexposed opaque prefix accompany the final failure.
+                    if operation.buffered:
+                        batch = operation.publication_batch(event_block, final=True)
+                        for prefix_block in batch[:-1]:
+                            yield prefix_block
+                        event_block = batch[-1]
+                        block_payload = parse_sse_data_json(event_block)
+                    else:
+                        operation.commit()
                 yield sse_block_with_payload(event_block, block_payload)
                 yielded_any = True
+        except (asyncio.CancelledError, GeneratorExit):
+            # Close authority before waiting for lifecycle cleanup: a reader
+            # can be suspended in reconnect while holding that lock.
+            if request_state.http_operation is not None:
+                request_state.http_operation.decide(CancellationObservation(request_state.request_id))
+            raise
         finally:
             with anyio.CancelScope(shield=True):
                 if idle_settlement_task is not None and not idle_settlement_task.done():

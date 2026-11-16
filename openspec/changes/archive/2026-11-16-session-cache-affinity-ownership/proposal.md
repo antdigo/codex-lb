@@ -1,0 +1,5 @@
+## Why
+The independent Astra/max session/cache review reproduced two ownership defects: old exact response anchors borrow newer lane prefix/tool metadata, and bridged cache identity ignores API-key policy and does not scope handshake locality headers. Correct the shared request and response ownership boundaries rather than add retries or cache machinery.
+
+## What Changes
+Bind context transformations and durable replay proofs to the response that owns their metadata, including verified public-to-physical bindings. Clear unknown prefix/obligation fields together when the current response advances. Resolve effective identity once per logical HTTP request, carry it through existing retries/raw handoff/forwarding, and consistently derive body and handshake identity at selected-account egress. Track actual physical handshake policy and enforce warm reuse compatibility without moving exact continuation authority. Preserve canonical replay text, owner/publication/deadline/quota fences and native tool history. No database schema/dependency/new-setting/pool-width changes; direct downstream WebSocket identity redesign remains explicitly outside scope.

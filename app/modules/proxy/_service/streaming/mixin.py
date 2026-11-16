@@ -269,20 +269,20 @@ from app.modules.proxy._service.streaming.helpers import (
     _accept_http_response_owner,
     _classify_terminal_stream_error_frame,
     _close_http_stream,
+    _facade,
     _mark_downstream_stream_cancelled,
     _mark_upstream_stream_incomplete,
     _observe_terminal_stream_error_frame,
     _openai_error_fields,
     _record_or_defer_owner_recovery_health,
     _reject_foreign_http_response_owner,
+    _reported_usage_tokens,
     _rewrite_malformed_stream_error_event,
     _stamp_terminal,
     _stream_transport_failure_event_or_raise,
     _upstream_terminal_latency_ms,
 )
-from app.modules.proxy._service.streaming.helpers import (
-    _handle_stream_error as _handle_stream_error_helper,
-)
+from app.modules.proxy._service.streaming.helpers import _handle_stream_error as _handle_stream_error_helper
 from app.modules.proxy._service.streaming.helpers import _raw_stream_error_fields as _raw_error_fields
 from app.modules.proxy._service.streaming.helpers import (
     _resolve_upstream_route_for_account as _resolve_upstream_route_for_account_helper,
@@ -291,6 +291,7 @@ from app.modules.proxy._service.streaming.helpers import (
     _select_account_with_budget_for_stream as _select_account_with_budget_for_stream_helper,
 )
 from app.modules.proxy._service.streaming.helpers import _settle_background_ack as _settle_bg_ack
+from app.modules.proxy._service.streaming.operation_handoff import begin_handoff_dispatch
 from app.modules.proxy._service.streaming.protocol import _StreamingServiceProtocol
 from app.modules.proxy._service.streaming.retry import _StreamingRetryMixin
 from app.modules.proxy._service.support import (
@@ -418,6 +419,7 @@ from app.modules.proxy.http_bridge_forwarding import (
 from app.modules.proxy.http_bridge_forwarding import (
     OwnerForwardRelayFailure as OwnerForwardRelayFailure,
 )
+from app.modules.proxy.http_operation import OperationController
 from app.modules.proxy.load_balancer import AccountConcurrencyCaps, AccountLease
 from app.modules.proxy.tool_call_dedupe import mark_duplicate_tool_call_downstream_event
 from app.modules.proxy.tool_call_dedupe import (
@@ -427,10 +429,6 @@ from app.modules.proxy.tool_call_dedupe import (
     rewrite_parallel_tool_call_sse_line as _rewrite_tool_call_line,
 )
 from app.modules.proxy.work_admission import AdmissionLease
-
-
-def _facade() -> Any:
-    return sys.modules["app.modules.proxy.service"]
 
 
 class _StreamingMixin(_StreamingRetryMixin):
@@ -464,6 +462,7 @@ class _StreamingMixin(_StreamingRetryMixin):
         tool_call_dedupe: _WebSocketUpstreamControl | None = None,
         enforce_openai_sdk_contract: bool = True,
         thread_cache_identity: ThreadCacheIdentity | None = None,
+        http_operation: OperationController | None = None,
     ) -> AsyncIterator[str]:
         proxy = cast(_StreamingServiceProtocol, self)
         clock = clock_for(proxy)
@@ -547,6 +546,14 @@ class _StreamingMixin(_StreamingRetryMixin):
             }
             if upstream_stream_transport is not None:
                 stream_optional_kwargs["upstream_stream_transport_override"] = upstream_stream_transport
+            if http_operation is not None:
+                begin_handoff_dispatch(
+                    http_operation,
+                    account_id=account_id_value,
+                    clock=clock,
+                    connection_identity=id(response_create_lease),
+                    request_id=request_id,
+                )
             stream = _facade()._call_stream_with_supported_optional_kwargs(
                 _facade().core_stream_responses,
                 payload,
@@ -1024,14 +1031,7 @@ class _StreamingMixin(_StreamingRetryMixin):
                 proxy._cancel_api_key_reservation_heartbeat_task(api_key_reservation_heartbeat_task)
             response_create_lease.release()
             await proxy._load_balancer.release_account_lease(account_response_create_lease)
-            input_tokens = usage.input_tokens if usage else None
-            output_tokens = usage.output_tokens if usage else None
-            cached_input_tokens = (
-                usage.input_tokens_details.cached_tokens if usage and usage.input_tokens_details else None
-            )
-            reasoning_tokens = (
-                usage.output_tokens_details.reasoning_tokens if usage and usage.output_tokens_details else None
-            )
+            input_tokens, output_tokens, cached_input_tokens, reasoning_tokens = _reported_usage_tokens(usage)
             if latency_first_token_ms is None:
                 latency_first_token_ms = _finalize_ttft_latency_ms(
                     ttft_reasoning_deltas, attempt_started_at, now=clock.monotonic()

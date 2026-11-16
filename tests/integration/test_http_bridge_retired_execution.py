@@ -6,6 +6,7 @@ import pytest
 from app.core.clients.proxy import ProxyResponseError
 from app.core.clock import RealClock
 from app.core.errors import openai_error
+from app.core.types import JsonValue
 from app.modules.proxy import service as proxy_module
 from tests.integration.test_http_responses_bridge import (
     _FakeBridgeUpstreamWebSocket,
@@ -21,6 +22,7 @@ pytestmark = pytest.mark.integration
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("retirement", ["closed", "draining"])
+@pytest.mark.parametrize("tool_contract", ["function", "client_tool_search"])
 @pytest.mark.parametrize(
     "outcome",
     [
@@ -40,7 +42,7 @@ pytestmark = pytest.mark.integration
     ],
 )
 async def test_public_http_waiter_moves_to_one_same_account_replacement(
-    async_client, app_instance, monkeypatch, retirement, outcome
+    async_client, app_instance, monkeypatch, retirement, outcome, tool_contract
 ):
     _install_bridge_settings_with_limits(monkeypatch, enabled=True, max_sessions=128)
     owner = await _get_account(await _import_account(async_client, "waiter_owner", "waiter-owner@example.com"))
@@ -128,7 +130,7 @@ async def test_public_http_waiter_moves_to_one_same_account_replacement(
     monkeypatch.setattr(proxy_module.ProxyService, "_select_account_with_budget", select)
     monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fresh)
     monkeypatch.setattr(proxy_module.ProxyService, "_open_upstream_websocket_with_budget", connect)
-    body = {
+    body: dict[str, JsonValue] = {
         "model": "gpt-6.1-sol",
         "prompt_cache_key": "synthetic-retiring-waiter",
         "stream": True,
@@ -139,9 +141,31 @@ async def test_public_http_waiter_moves_to_one_same_account_replacement(
             {"type": "function_call_output", "call_id": "call_synthetic", "output": "synthetic result"},
         ],
     }
+    if tool_contract == "client_tool_search":
+        body["tools"] = [
+            {"type": "tool_search", "execution": "client", "parameters": {"type": "object"}},
+            {"type": "function", "name": "test_tool", "parameters": {"type": "object"}, "defer_loading": True},
+        ]
+        input_items = body["input"]
+        assert isinstance(input_items, list)
+        input_items[1:1] = [
+            {
+                "type": "tool_search_call",
+                "execution": "client",
+                "call_id": "call_synthetic_search",
+                "status": "completed",
+                "arguments": {"query": "test_tool"},
+            },
+            {
+                "type": "tool_search_output",
+                "execution": "client",
+                "call_id": "call_synthetic_search",
+                "tools": [{"type": "function", "name": "test_tool", "parameters": {"type": "object"}}],
+            },
+        ]
     warm = await async_client.post("/v1/responses", json=body, headers=auth_headers)
     assert warm.status_code == 200 and '"type":"response.completed"' in warm.text
-    old = next(s for s in service._http_bridge_sessions.values() if s.key.affinity_kind == "prompt_cache")
+    old = next(s for s in service._http_bridge_sessions.values() if s.upstream is old_socket)
     await old.execution_gate.acquire()
     waiting = asyncio.Event()
     acquire = service._acquire_request_state_response_create_admission
@@ -155,7 +179,7 @@ async def test_public_http_waiter_moves_to_one_same_account_replacement(
         reservations.append(state.api_key_reservation)
         if target is old:
             waiters_seen += 1
-            if waiters_seen == (2 if outcome == "concurrent" else 1):
+            if waiters_seen == 1:
                 waiting.set()
         elif outcome == "repeat_retirement":
             target.closed = True
@@ -210,6 +234,15 @@ async def test_public_http_waiter_moves_to_one_same_account_replacement(
     ]
     try:
         await asyncio.wait_for(waiting.wait(), timeout=5)
+        if outcome == "concurrent":
+            # Complete independent work uses another ready logical lane while
+            # the first caller waits for the old physical execution gate. Both
+            # callers still retain their own one-replacement/account fence.
+            done, pending = await asyncio.wait(requests, timeout=5, return_when=asyncio.FIRST_COMPLETED)
+            assert len(done) == 1 and len(pending) == 1
+            sibling = next(iter(done)).result()
+            assert sibling.status_code == 200 and '"type":"response.completed"' in sibling.text
+            assert not next(iter(pending)).done()
         await asyncio.sleep(0)
         if retirement == "closed":
             old.closed = True
@@ -259,7 +292,7 @@ async def test_public_http_waiter_moves_to_one_same_account_replacement(
         assert len(selections) == 1
         assert not replacement_socket.sent_text
         return
-    assert len(selections) == 2
+    assert len(selections) == 2, response.text
     assert selections[-1]["preferred_account_id"] == owner.id
     assert selections[-1]["fallback_on_preferred_account_unavailable"] is False
     if outcome == "owner_unavailable":

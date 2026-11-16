@@ -196,6 +196,55 @@ test("the built dashboard accepts real backend responses", async ({ page }) => {
   expect(consoleErrors).toEqual([]);
 });
 
+test("API key creation, plain value, edit and deletion persist through the real backend", async ({ page }) => {
+  const name = `Browser key ${Date.now()}`;
+  const updatedName = `${name} updated`;
+  let keyId: string | undefined;
+  try {
+    await page.goto("/settings", { waitUntil: "domcontentloaded" });
+    await acceptTelemetryConsentIfShown(page);
+    await page.getByRole("button", { name: "Create key", exact: true }).click();
+    const create = page.getByRole("dialog", { name: "Create API key", exact: true });
+    await create.getByLabel("Name", { exact: true }).fill(name);
+    const [createdResponse] = await Promise.all([
+      page.waitForResponse((response) => new URL(response.url()).pathname === "/api/api-keys/"
+        && response.request().method() === "POST"),
+      create.getByRole("button", { name: "Create", exact: true }).click(),
+    ]);
+    expect(createdResponse.ok()).toBe(true);
+    const created = await createdResponse.json() as { id: string; key: string };
+    keyId = created.id;
+    const plain = page.getByRole("dialog", { name: "API key created", exact: true });
+    await expect(plain.getByText(created.key, { exact: true })).toBeVisible();
+    await plain.locator('button[data-slot="button"]').filter({ hasText: /^Close$/ }).click();
+    const row = page.getByRole("row").filter({ hasText: name });
+    await expect(row).toHaveCount(1);
+    await row.getByRole("button", { name: "Actions", exact: true }).click();
+    await page.getByRole("menuitem", { name: "Edit", exact: true }).click();
+    const edit = page.getByRole("dialog", { name: "Edit API key", exact: true });
+    await edit.getByLabel("Name", { exact: true }).fill(updatedName);
+    await edit.getByRole("button", { name: "Save", exact: true }).click();
+    await expect(edit).toBeHidden();
+    await page.reload({ waitUntil: "networkidle" });
+    const updated = page.getByRole("row").filter({ hasText: updatedName });
+    await expect(updated).toHaveCount(1);
+    await expect(page.getByRole("dialog", { name: "API key created" })).toBeHidden();
+    await updated.getByRole("button", { name: "Actions", exact: true }).click();
+    await page.getByRole("menuitem", { name: "Delete", exact: true }).click();
+    await page.getByRole("alertdialog", { name: "Delete API key" })
+      .getByRole("button", { name: "Delete", exact: true }).click();
+    await expect(updated).toHaveCount(0);
+    keyId = undefined;
+    await page.reload({ waitUntil: "networkidle" });
+    await expect(page.getByRole("row").filter({ hasText: updatedName })).toHaveCount(0);
+  } finally {
+    if (keyId !== undefined) {
+      const response = await page.request.delete(`/api/api-keys/${encodeURIComponent(keyId)}`);
+      expect(response.ok()).toBe(true);
+    }
+  }
+});
+
 test("dashboard usage donuts stay within supported viewports", async ({ page }) => {
   const viewportCases = [
     { size: { width: 320, height: 568 }, donutColumns: 1 },

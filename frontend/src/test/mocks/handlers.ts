@@ -898,6 +898,23 @@ function listFilteredAutomationRuns(url: URL) {
 }
 
 export const handlers = [
+  http.get("/api/diagnostics/cache-isolation-probe", () => HttpResponse.json({
+    model: null,
+    seedAccount: null,
+    availableOtherAccounts: [],
+    seedRepetitions: 2,
+    totalCalls: 0,
+    estimatedInputTokensPerCall: 1024,
+    estimatedTotalInputTokens: 0,
+    maxSeedRepetitions: 5,
+    maxOtherAccounts: 5,
+    pressure: {
+      underPressure: false,
+      selectableAccountCount: 0,
+      eligibleAccountCount: 0,
+      pressuredAccountCount: 0,
+    },
+  })),
   http.get("/health", () => {
     return HttpResponse.json({ status: "ok" });
   }),

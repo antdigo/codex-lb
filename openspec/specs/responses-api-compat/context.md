@@ -417,3 +417,121 @@ physical socket before the first response.create attempt. A separate
 request-scoped flag fences the common reconnect entry point without spending
 the replay counter: an eligible connection-limit error after an actual send
 still follows the existing bounded same-account recovery policy.
+
+## Operation lifecycle and rollout context
+
+A prompt cache key is a reuse hint shared by independent agents. It does not
+identify a conversation. Independent complete requests use a bounded group of
+seven logical lanes; an exact response or turn anchor keeps its lane and order.
+Broad session/thread headers retain group locality rather than selecting a
+single physical lane. Account eligibility for new independent work is checked
+against the current API assignment without moving existing anchored work.
+The account stream cap remains eight, with one slot reserved for the existing
+recovery admission path. Physical sessions remain subject to the existing global
+session limit and idle eviction policy.
+
+For example, seven agents can submit complete conversations with the same cache
+key concurrently. A follow-up containing a previous response ID waits for that
+response's lane, while an independent eighth request can use whichever compatible
+ordinary lane next becomes available. A lane queue survives replacement of its
+physical WebSocket. Waiting references pin the required generation against idle
+eviction; these pins do not acquire account stream leases.
+
+The publication boundary separates replaceable work from output already exposed
+to the client. Readable reasoning is output. Only an understood opaque reasoning
+prefix can remain unpublished, bounded to 256 KiB. An allowed replacement keeps
+the public response ID and translates an anchored continuation to the winning
+physical response ID. Item IDs and ciphertext are retained unchanged. A lost
+process-local binding fails closed, using an existing owner-fenced durable alias
+marker to distinguish projected IDs. No process-restart recovery or database
+migration is introduced.
+
+Dispatch authorizations are single-use and checked at the physical send boundary.
+Close, timeout, cancellation and terminal observations produce controller-owned
+decisions; existing socket, lock, lease and persistence code executes those
+decisions. Resumable resource receipts preserve compensation after an interrupted
+terminal write. The original absolute deadline spans pool waits, re-preparation
+and a proven-unsent local transport handoff.
+
+An abandoned physical attempt may have consumed tokens without returning usage.
+Its usage is marked unknown; reported final usage belongs to the winning attempt.
+The system cannot infer an unreported upstream charge.
+
+Specific continuations retain the existing verified full-resend recovery path
+even when their physical owner originated in the independent pool. For example,
+an exact response/turn follow-up whose owner explicitly rejects the old response
+may replay its verified complete context under the existing durable operation
+fence. Moving that particular turn alias requires a captured source-owner/alias
+proof and reversible registration; a private pool key is not itself permission
+to move aliases. Changed ownership or a concurrently moved alias fails closed.
+
+### Validation and deployment boundary
+
+The source change uses synthetic upstream sockets, temporary databases and an
+isolated Bifrost 2.5.1 process for Anthropic conversion acceptance. Production
+credentials and prompts are not acceptance fixtures. The normal test suite skips
+this optional binary test unless `CODEX_LB_BIFROST_ACCEPTANCE_BINARY` is supplied.
+
+Deployment is separate from source implementation. Before activation, seal the
+candidate with its base revision, complete source hashes and patch digest; retain
+the previous runtime selection. Stop and back up application data using the
+existing service-user SQLite backup procedure. Since this change does not alter
+the database schema, rollback selects the previous runtime while retaining live
+database and refreshed authentication tokens. Do not restore an old database
+snapshot merely to roll back this code change.
+
+Process-local projected continuation bindings do not survive a runtime switch.
+Drain active operations and resume clients with complete unanchored context,
+without the old `previous_response_id` or turn-state anchor. This is especially
+necessary when selecting an older runtime that has no projection translator.
+Retaining the live database preserves tokens and routing records, not the lost
+process-local translation map.
+
+The canary gate requires at least 65 minutes and 100 comparable requests. Observe
+correctness, active/queued operations, session and lease cleanup, failure kinds
+and comparable cache-hit ratios. Stop expansion on duplicate or misrouted output,
+leaked ownership/leases, or a cache-hit ratio drop greater than five percentage
+points. Synthetic acceptance is evidence of conversion behavior, not evidence
+that this operational canary has run.
+
+## HTTP transport boundary corrections
+
+An explicit raw HTTP refusal after a proven-unsent bridge handoff must acquire a controller grant before a retry. The refusal uses the existing raw failure classification and consumes the same ordinary replay quota as transport/capacity/continuity recovery. The original deadline, publication gate and account/file restrictions survive the handoff.
+
+A public response ID retained across opaque replay is not a portable physical anchor. When raw HTTP cannot preserve its bridge binding, the request fails locally before dispatch. For example, a public `resp_original` bound to a winning replacement response must never be sent to raw upstream as though it named that replacement. Local bindings and a durable existence-only marker recognize this case without exposing another API key's owner or response. Ordinary physical response IDs retain their raw path. Marker lookup shares the remaining request budget.
+
+## Client-executed tool discovery and HTTP operation completeness
+
+Bifrost 2.5.1 can map Claude Code's client ToolSearch function and tool-reference results into native `tool_search_call` / `tool_search_output` pairs. The installed-binary synthetic acceptance test asserts that actual HTTP wire shape before exercising codex-lb. Treating these items as opaque excluded otherwise complete histories from the independent affinity pool and pre-publication recovery, leaving parallel agents on the legacy canonical execution queue.
+
+The complete-input proof now recognizes explicit client-executed pairs with unique call IDs, object arguments and a matching output containing complete client function definitions. Search and ordinary function pending IDs remain separate; a function output cannot settle a search and vice versa. Hosted or unspecified search execution, unresolved/duplicate pairs, malformed loaded definitions and unknown item types remain outside this proof. The operation capability is named `client_tools_only`: functions and explicitly client-executed tool search may qualify, whereas server tool search, web search, computer execution and other hosted tools do not. Native input, loaded tools, ciphertext, status and cache keys are inspected without rewriting or reordering. Existing operation quotas, publication, account/API ownership, original deadline and settlement remain authoritative.
+
+For example, two complete same-cache histories that contain an already answered client tool-search call can use separate compatible lanes while one physical predecessor is occupied. An eligible opaque-prefix upstream restart can use the existing same-account replay once; readable output still closes that option. This does not establish replay safety for every builtin tool or every native item kind.
+
+Cache monitoring must compare matched workload windows and continuing sessions, rather than interpret a process restart or an HTTP 200 as cache/reliability success. In the observed rollout the matched hour dropped from 92.37% to 87.54% cached input tokens, the two continuing sessions moved in opposite directions, and a subsequent fifteen-minute window reached 99.17%. Those measurements establish changing cache outcomes, not a causal attribution to this compatibility gap. A live rotation/cache canary remains required after operator activation.
+
+Reference: [OpenAI client-executed tool search](https://developers.openai.com/api/docs/guides/tools-tool-search). The proxy preserves the supplied native contract rather than converting discovery history itself.
+
+
+## Tool capability continuity and error-induced cache misses
+
+Input completeness, portability and durable exact-call completeness are separate policies sharing a pure tool vocabulary. Portable client discovery remains meaningful history, including loaded function definitions absent from the current catalog. Unsupported hosted, unknown or account-owned discovery refuses portability rather than disappearing. A physical lane's old Codex-session flag cannot authorize anchoring, trimming or interrupted-output injection for a newly independent request. Exact request continuations retain existing account/API/owner fences. Interrupted client discovery receives an empty native tools result, never a function-shaped string output.
+
+Every client obligation must participate in a durable pending-call proof; unknown calls or unrepresentable loaded-definition updates make the whole call-only manifest unknown. The existing JSON envelope now uses completeness version2. Older writers could omit parallel search calls, so unversioned/unknown envelopes grant no completeness authority; no schema migration or production data rewrite is involved.
+
+For example, an opaque 1012 retry previously retained the final account-scoped frame and applied account identity again: a short key acquired a second scope suffix, while a long key was re-digested. ResponseCreateAttempt now retains explicitly prepared pre-egress text in its existing string slot, and retries derive final egress from that snapshot. Inline-prepared input, ordered history/tools and logical key survive; account-specific identity is applied once. The final wire remains local to exact sizing/send. No new cache, retry loop, setting, prewarming or wider pool is introduced.
+
+Stable prepared/wire input removes confirmed avoidable misses; it does not prove a provider cache hit or attribute prior aggregate hit-ratio changes. Connection-local continuation state and provider prompt caching remain distinct. Evaluate real comparable traffic for at least65minutes and100completed requests, compare weighted cached/input tokens within matched scope/model/tier/transport/context cohorts, retain unknown usage and errors separately, and investigate drops over5percentage points. No paid probes are needed to fill the sample.
+
+
+### Session/cache affinity ownership correction (2026-11-16)
+
+A response alias retains routing authority, not the latest lane snapshot's trimming or replay authority. Example: after independent B follows A on one warm lane, C anchored to A preserves supplied B-only assistant/call/discovery history. Exact physical response/account or an existing verified public→physical binding is required before using snapshot context. A bounded transient output-identity tuple verifies marked-output deduplication; absence/overflow/uncertainty preserves input. It grants neither retry permission nor historical response storage. Known individual pending calls remain distinct from a complete durable obligation manifest.
+
+HTTP operations resolve API-key cache identity override over overlaid fleet settings once. Canonical bodies/headers stay unscoped internally; egress derives the selected account identity once for body and physical handshake. Independent requests require mode-compatible lanes. Exact continuations retain the owner and locally refuse incompatible policy rather than silently relocating. Signed owner forwarding binds the immutable policy to its existing full-context signature. New policy-bearing forwarding requires a compatible owner version; legacy no-policy signatures retain their encoding. Direct downstream WebSocket identity coverage remains the pre-existing explicit non-goal.
+
+This removes demonstrated local causes of cache fragmentation/context loss; it does not establish provider cache residence or a hit-rate increase. No new pool width, retries, prewarm, cache controls, DB schema, dependencies or user settings are introduced. Installation remains a manually selected separate code-only runtime with rollback retaining live DB/authentication state.
+
+
+### Exact-repeat advisory locality follow-up (2026-11-16)
+A completed lane's stored input fingerprint can rank an equal full input as well as a strict extension. Example: concurrent independent A and B finish on two compatible idle lanes; an exact repeat of B should prefer B's lane. This is advisory locality only: account/API/model/tier/mode compatibility, hard continuation ownership and the strict trim proof still decide authority. Missing/mismatching fingerprints earn no preference. No provider cache-hit or billing improvement is implied; no new cache state, retries, prewarm or pool growth is added. The older owner-loss projection wording now preserves validated portable client discovery/loaded definitions and refuses unsafe discovery consistently with the current recovery implementation.

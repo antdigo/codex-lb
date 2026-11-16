@@ -8,6 +8,22 @@ def _ci_workflow_text() -> str:
     return CI_WORKFLOW.read_text(encoding="utf-8")
 
 
+def test_manual_ci_forces_all_areas_and_retains_full_frontend_coverage() -> None:
+    text = _ci_workflow_text()
+    assert "  workflow_dispatch:" in text.split("concurrency:", maxsplit=1)[0]
+    changes = _job_block(text, "changes")
+    assert '"${{ github.event_name }}" == "workflow_dispatch"' in changes
+    frontend = _job_block(text, "frontend-test")
+    assert "github.event_name != 'pull_request'" in frontend
+    assert "run: make frontend-test\n" in frontend
+
+
+def test_helm_ci_executes_python_chart_contracts_with_metrics_available() -> None:
+    job = _job_block(_ci_workflow_text(), "helm-lint")
+    assert "uv sync --dev --extra metrics --frozen" in job
+    assert "tests/unit/test_helm_" in job
+
+
 def _job_block(text: str, job_name: str) -> str:
     start_match = re.search(rf"^  {re.escape(job_name)}:\n", text, re.MULTILINE)
     assert start_match is not None

@@ -5,6 +5,7 @@ import base64
 import json
 import logging
 from collections import Counter
+from contextlib import aclosing
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock
@@ -46,6 +47,39 @@ async def _force_usage_weighted_routing(async_client) -> None:
     # dashboard value and override the Settings these tests monkeypatch.
     response = await async_client.put("/api/settings", json={"routingStrategy": "usage_weighted"})
     assert response.status_code == 200
+
+
+@pytest.fixture
+async def _virtual_sse_scheduler(monkeypatch):
+    from functools import partial
+
+    import app.core.utils.sse as sse_module
+    from tests.simulation.virtual_time import VirtualClock, VirtualScheduler
+
+    scheduler = VirtualScheduler(VirtualClock())
+    monkeypatch.setattr(
+        sse_module,
+        "wait_on_shared_future",
+        partial(sse_module.wait_on_shared_future, scheduler=scheduler),
+    )
+    try:
+        yield scheduler
+    finally:
+        await scheduler.cancel_owned_tasks()
+
+
+async def _read_timed_sse_keepalive(iterator, scheduler):
+    read = scheduler.create_task(iterator.__anext__())
+    try:
+        await scheduler.advance(0.009)
+        assert not read.done()
+        await scheduler.advance(0.001)
+        assert read.done()
+        return read.result()
+    finally:
+        if not read.done():
+            read.cancel()
+        await asyncio.gather(read, return_exceptions=True)
 
 
 def _encode_jwt(payload: dict) -> str:
@@ -2726,7 +2760,7 @@ async def test_proxy_stream_exception_without_terminal_event_logs_as_stream_inco
 
 
 @pytest.mark.asyncio
-async def test_stream_responses_starts_sse_keepalive_before_first_upstream_event(monkeypatch):
+async def test_stream_responses_starts_sse_keepalive_before_first_upstream_event(monkeypatch, _virtual_sse_scheduler):
     upstream_started = asyncio.Event()
     release_upstream = asyncio.Event()
     seen_client_ip: list[str | None] = []
@@ -2777,24 +2811,26 @@ async def test_stream_responses_starts_sse_keepalive_before_first_upstream_event
 
     assert isinstance(response, StreamingResponse)
     assert upstream_started.is_set() is True
-    iterator = response.body_iterator.__aiter__()
-    first_chunk = await asyncio.wait_for(iterator.__anext__(), timeout=0.2)
-    assert first_chunk == SSE_KEEPALIVE_FRAME
-    release_upstream.set()
-    chunks = [cast(str, await asyncio.wait_for(iterator.__anext__(), timeout=0.2)) for _ in range(2)]
-    assert any("response.completed" in chunk for chunk in chunks)
-    assert seen_client_ip == ["203.0.113.7"]
+    async with aclosing(cast(Any, response.body_iterator.__aiter__())) as iterator:
+        first_chunk = await _read_timed_sse_keepalive(iterator, _virtual_sse_scheduler)
+        assert first_chunk == SSE_KEEPALIVE_FRAME
+        release_upstream.set()
+        chunks = [cast(str, await iterator.__anext__()) for _ in range(2)]
+        assert any("response.completed" in chunk for chunk in chunks)
+        assert seen_client_ip == ["203.0.113.7"]
 
 
 @pytest.mark.asyncio
-async def test_stream_responses_keepalive_interval_honours_dashboard_value_over_environment(async_client, monkeypatch):
+async def test_stream_responses_keepalive_interval_honours_dashboard_value_over_environment(
+    async_client, monkeypatch, _virtual_sse_scheduler
+):
     """A dashboard ``sse_keepalive_interval_seconds`` (0.01 s) beats the 10 s environment value.
 
     The dashboard value is stored through the settings API, read back through
     the ``SettingsCache`` snapshot and bound the way ``DashboardOverridesMiddleware``
     binds it for a request; the keepalive injector then sees it through the
     settings facade. Outside the binding the environment value applies and no
-    keepalive shows up within the same window.
+    keepalive shows up within the same virtual window.
     """
     from app.core.config.dashboard_overrides import dashboard_overrides_bound, with_dashboard_overrides
     from app.core.config.settings import get_settings as get_environment_settings
@@ -2814,6 +2850,8 @@ async def test_stream_responses_keepalive_interval_honours_dashboard_value_over_
         proxy_api_module.proxy_service_module, "get_settings", lambda: with_dashboard_overrides(base_settings)
     )
 
+    release_upstream = asyncio.Event()
+
     class _FakeService:
         async def rate_limit_headers(self):
             return {}
@@ -2821,7 +2859,7 @@ async def test_stream_responses_keepalive_interval_honours_dashboard_value_over_
         async def stream_responses(self, *args, **kwargs):
             del args, kwargs
             _signal_propagated_capacity_startup_ready()
-            await asyncio.sleep(0.3)
+            await release_upstream.wait()
             yield _sse_event({"type": "response.completed", "response": {"id": "resp_dashboard_keepalive"}})
 
     def _request() -> Request:
@@ -2844,14 +2882,22 @@ async def test_stream_responses_keepalive_interval_honours_dashboard_value_over_
         with dashboard_overrides_bound(snapshot):
             bound = await proxy_api_module._stream_responses(_request(), payload, context, api_key=None)
             assert isinstance(bound, StreamingResponse)
-            first_chunk = await asyncio.wait_for(bound.body_iterator.__aiter__().__anext__(), timeout=0.2)
+            async with aclosing(cast(Any, bound.body_iterator.__aiter__())) as iterator:
+                first_chunk = await _read_timed_sse_keepalive(iterator, _virtual_sse_scheduler)
         assert first_chunk == SSE_KEEPALIVE_FRAME
 
         unbound = await proxy_api_module._stream_responses(_request(), payload, context, api_key=None)
         assert isinstance(unbound, StreamingResponse)
-        with pytest.raises(asyncio.TimeoutError):
-            await asyncio.wait_for(unbound.body_iterator.__aiter__().__anext__(), timeout=0.15)
+        async with aclosing(cast(Any, unbound.body_iterator.__aiter__())) as iterator:
+            read = _virtual_sse_scheduler.create_task(iterator.__anext__())
+            try:
+                await _virtual_sse_scheduler.advance(0.15)
+                assert not read.done()
+            finally:
+                read.cancel()
+                await asyncio.gather(read, return_exceptions=True)
     finally:
+        release_upstream.set()
         # The database is reset per test, but the process-wide SettingsCache is
         # not: clear the dashboard value and drop the cached row so a following
         # test cannot observe the 0.01 s keepalive within the cache TTL.
@@ -2860,7 +2906,9 @@ async def test_stream_responses_keepalive_interval_honours_dashboard_value_over_
 
 
 @pytest.mark.asyncio
-async def test_source_responses_stream_starts_sse_keepalive_before_first_upstream_event(monkeypatch):
+async def test_source_responses_stream_starts_sse_keepalive_before_first_upstream_event(
+    monkeypatch, _virtual_sse_scheduler
+):
     """Source-routed /v1/responses must keep SSE alive like account streams."""
     from app.db.models import ModelSource
     from app.modules.model_sources.forwarding import SourceResponsesStream, SourceUsageHolder
@@ -2929,24 +2977,24 @@ async def test_source_responses_stream_starts_sse_keepalive_before_first_upstrea
     )
 
     assert isinstance(response, StreamingResponse)
-    iterator = response.body_iterator.__aiter__()
-    first_chunk = await asyncio.wait_for(iterator.__anext__(), timeout=0.2)
-    assert first_chunk == SSE_KEEPALIVE_FRAME
-    assert keepalives == ["responses_source"]
-    release_upstream.set()
-    remaining: list[str] = []
-    while True:
-        try:
-            remaining.append(cast(str, await asyncio.wait_for(iterator.__anext__(), timeout=0.2)))
-        except StopAsyncIteration:
-            break
-    joined = "".join(remaining)
-    assert "resp_source_delayed" in joined
-    created_at = joined.find("response.created")
-    completed_at = joined.find("response.completed")
-    assert created_at != -1
-    assert completed_at != -1
-    assert created_at < completed_at
+    async with aclosing(cast(Any, response.body_iterator.__aiter__())) as iterator:
+        first_chunk = await _read_timed_sse_keepalive(iterator, _virtual_sse_scheduler)
+        assert first_chunk == SSE_KEEPALIVE_FRAME
+        assert keepalives == ["responses_source"]
+        release_upstream.set()
+        remaining: list[str] = []
+        while True:
+            try:
+                remaining.append(cast(str, await iterator.__anext__()))
+            except StopAsyncIteration:
+                break
+        joined = "".join(remaining)
+        assert "resp_source_delayed" in joined
+        created_at = joined.find("response.created")
+        completed_at = joined.find("response.completed")
+        assert created_at != -1
+        assert completed_at != -1
+        assert created_at < completed_at
 
 
 @pytest.mark.asyncio
@@ -3233,7 +3281,9 @@ async def test_iter_source_sse_event_blocks_rejects_oversize_event():
 
 
 @pytest.mark.asyncio
-async def test_wrap_source_responses_native_codex_preserves_codex_events_and_keepalive(monkeypatch):
+async def test_wrap_source_responses_native_codex_preserves_codex_events_and_keepalive(
+    monkeypatch, _virtual_sse_scheduler
+):
     keepalives: list[str] = []
     release_upstream = asyncio.Event()
 
@@ -3257,19 +3307,19 @@ async def test_wrap_source_responses_native_codex_preserves_codex_events_and_kee
         enforce_openai_sdk_contract=False,
         native_codex_heartbeat=True,
     )
-    iterator = stream.__aiter__()
-    first = await asyncio.wait_for(iterator.__anext__(), timeout=0.2)
-    assert first == CODEX_KEEPALIVE_FRAME
-    # Prefixed heartbeat does not record metrics; wait for an injected idle frame.
-    second = await asyncio.wait_for(iterator.__anext__(), timeout=0.2)
-    assert second == CODEX_KEEPALIVE_FRAME
-    assert keepalives == ["responses_source"]
-    release_upstream.set()
-    remaining = [chunk async for chunk in iterator]
-    joined = "".join(remaining)
-    assert "codex.rate_limits" in joined
-    assert "response.created" not in joined
-    assert "resp_codex_src" in joined
+    async with aclosing(cast(Any, stream.__aiter__())) as iterator:
+        first = await iterator.__anext__()
+        assert first == CODEX_KEEPALIVE_FRAME
+        # Prefixed heartbeat does not record metrics; wait for an injected idle frame.
+        second = await _read_timed_sse_keepalive(iterator, _virtual_sse_scheduler)
+        assert second == CODEX_KEEPALIVE_FRAME
+        assert keepalives == ["responses_source"]
+        release_upstream.set()
+        remaining = [chunk async for chunk in iterator]
+        joined = "".join(remaining)
+        assert "codex.rate_limits" in joined
+        assert "response.created" not in joined
+        assert "resp_codex_src" in joined
 
 
 @pytest.mark.asyncio
@@ -3784,7 +3834,9 @@ async def test_compact_responses_passes_client_ip_to_service(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_codex_route_stream_responses_starts_event_keepalive_before_first_upstream_event(monkeypatch):
+async def test_codex_route_stream_responses_starts_event_keepalive_before_first_upstream_event(
+    monkeypatch, _virtual_sse_scheduler
+):
     upstream_started = asyncio.Event()
     release_upstream = asyncio.Event()
 
@@ -3831,17 +3883,18 @@ async def test_codex_route_stream_responses_starts_event_keepalive_before_first_
 
     assert isinstance(response, StreamingResponse)
     assert upstream_started.is_set() is True
-    iterator = response.body_iterator.__aiter__()
-    first_chunk = await asyncio.wait_for(iterator.__anext__(), timeout=0.2)
-    assert first_chunk == CODEX_KEEPALIVE_FRAME
-    release_upstream.set()
-    chunks = [cast(str, await asyncio.wait_for(iterator.__anext__(), timeout=0.2)) for _ in range(2)]
-    assert any("response.completed" in chunk for chunk in chunks)
+    async with aclosing(cast(Any, response.body_iterator.__aiter__())) as iterator:
+        first_chunk = await iterator.__anext__()
+        assert first_chunk == CODEX_KEEPALIVE_FRAME
+        release_upstream.set()
+        chunks = [cast(str, await iterator.__anext__()) for _ in range(2)]
+        assert any("response.completed" in chunk for chunk in chunks)
 
 
 @pytest.mark.asyncio
 async def test_codex_route_stream_responses_keeps_client_alive_while_bridge_cooldown_delays_first_event(
     monkeypatch,
+    _virtual_sse_scheduler,
 ):
     upstream_started = asyncio.Event()
     release_upstream = asyncio.Event()
@@ -3889,14 +3942,14 @@ async def test_codex_route_stream_responses_keeps_client_alive_while_bridge_cool
 
     assert isinstance(response, StreamingResponse)
     assert upstream_started.is_set() is True
-    iterator = response.body_iterator.__aiter__()
-    first_chunk = await asyncio.wait_for(iterator.__anext__(), timeout=0.2)
-    assert first_chunk == CODEX_KEEPALIVE_FRAME
-    release_upstream.set()
-    second_chunk = cast(str, await asyncio.wait_for(iterator.__anext__(), timeout=0.2))
-    third_chunk = cast(str, await asyncio.wait_for(iterator.__anext__(), timeout=0.2))
-    assert "response.in_progress" in second_chunk
-    assert "response.completed" in third_chunk
+    async with aclosing(cast(Any, response.body_iterator.__aiter__())) as iterator:
+        first_chunk = await iterator.__anext__()
+        assert first_chunk == CODEX_KEEPALIVE_FRAME
+        release_upstream.set()
+        second_chunk = cast(str, await iterator.__anext__())
+        third_chunk = cast(str, await iterator.__anext__())
+        assert "response.in_progress" in second_chunk
+        assert "response.completed" in third_chunk
 
 
 @pytest.mark.asyncio
