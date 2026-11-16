@@ -744,7 +744,9 @@ async def test_a_successful_login_clears_its_own_bucket_and_not_the_address_ceil
 
 
 @pytest.mark.asyncio
-async def test_one_valid_account_cannot_reset_the_address_ceiling(async_client: AsyncClient, app_instance) -> None:
+async def test_one_valid_account_cannot_reset_the_address_ceiling(
+    async_client: AsyncClient, app_instance, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Clearing the coarse bucket on success would hand its ceiling to any insider.
 
     Seven guesses at someone else's username, one sign-in of their own, seven
@@ -753,6 +755,17 @@ async def test_one_valid_account_cannot_reset_the_address_ceiling(async_client: 
     on the loop that also serves the proxy.
     """
 
+    from app.core.rate_limiter import db_rate_limiter
+
+    class FixedLimiterDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 1, 15, 12, tzinfo=UTC).astimezone(tz)
+
+    # Password hashing may exceed the real minute on a loaded coverage runner.
+    # Freeze only limiter observations; retain the actual address ceiling and
+    # real password comparisons and route responses.
+    monkeypatch.setattr(db_rate_limiter, "datetime", FixedLimiterDateTime)
     await _setup_admin(async_client)
     await _clear_rate_limits()
     ceiling = get_password_address_rate_limiter().max_attempts

@@ -4,7 +4,7 @@ import asyncio
 import logging
 import re
 from collections.abc import Awaitable, Callable, Collection
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from typing import Any, AsyncIterator, Literal, Mapping, NoReturn, TypeVar, cast
 
 import aiohttp
@@ -176,6 +176,7 @@ from app.modules.proxy._service.compact import (
 )
 from app.modules.proxy._service.file_ops import _FileOpsMixin
 from app.modules.proxy._service.http_bridge import _HTTPBridgeMixin
+from app.modules.proxy._service.http_bridge.execution import acquire_http_bridge_execution_before_create
 from app.modules.proxy._service.http_bridge.helpers import (
     _TASK_CANCEL_TIMEOUT_SECONDS as _TASK_CANCEL_TIMEOUT_SECONDS,
 )
@@ -202,11 +203,6 @@ from app.modules.proxy._service.http_bridge.helpers import (
 )
 from app.modules.proxy._service.http_bridge.helpers import (
     _has_http_bridge_response_output_marker as _has_http_bridge_response_output_marker,
-)
-from app.modules.proxy._service.http_bridge.helpers import (
-    _http_bridge_admission_timeout_seconds,
-    _http_bridge_is_explicit_previous_response_rejection,  # noqa: F401
-    _http_bridge_should_attempt_local_previous_response_recovery,  # noqa: F401
 )
 from app.modules.proxy._service.http_bridge.helpers import (
     _http_bridge_allow_durable_takeover as _http_bridge_allow_durable_takeover,
@@ -237,6 +233,10 @@ from app.modules.proxy._service.http_bridge.helpers import (
 )
 from app.modules.proxy._service.http_bridge.helpers import (
     _http_bridge_is_context_overflow_error as _http_bridge_is_context_overflow_error,
+)
+from app.modules.proxy._service.http_bridge.helpers import (
+    _http_bridge_is_explicit_previous_response_rejection,  # noqa: F401
+    _http_bridge_should_attempt_local_previous_response_recovery,  # noqa: F401
 )
 from app.modules.proxy._service.http_bridge.helpers import (
     _http_bridge_is_previous_response_owner_unavailable as _http_bridge_is_previous_response_owner_unavailable,
@@ -1290,32 +1290,41 @@ class ProxyService(
         scheduler = self._scheduler
         timeout_seconds = _proxy_admission_wait_timeout_seconds()
         if bridge_session is not None:
-            timeout_seconds = _http_bridge_admission_timeout_seconds(
-                request_state, timeout_seconds, get_settings(), now=self._clock.monotonic()
+            admission_deadline = await acquire_http_bridge_execution_before_create(
+                request_state,
+                bridge_session,
+                scheduler=scheduler,
+                clock=self._clock,
+                settings=get_settings(),
+                admission_timeout_seconds=timeout_seconds,
+                prewarm=surface == "http_bridge_prewarm",
+                expected_account_id=account_id,
             )
+            timeout_seconds = max(0.0, admission_deadline - self._clock.monotonic())
         request_state.response_create_gate = response_create_gate
         request_state.response_create_gate_wait_started_at = self._clock.monotonic()
-        if account_id is not None:
-            # One cached snapshot for this lease operation. A caller that
-            # already resolved the row for the same turn passes it in, and then
-            # this helper awaits nothing here at all -- which the prewarm path
-            # needs: it admits its warm-up while holding the session's
-            # ``prewarm_lock``, and a cache refresh behind this read runs a DB
-            # query under a process-global lock, so one stalled refresh would
-            # suspend that critical section (issues #1971/#1972 wedged every
-            # keyed submit on exactly this pattern). Tunables resolved by the
-            # caller (bridge submit) still override the snapshot's.
-            settings = dashboard_settings if dashboard_settings is not None else await get_settings_cache().get()
-            request_state.account_response_create_lease = await self._acquire_account_response_create_lease_or_overload(
-                account_id=account_id,
-                request_id=request_state.request_id,
-                surface=surface,
-                concurrency_caps=effective_account_concurrency_caps(settings),
-                routing_tunables=routing_tunables or effective_routing_tunables(settings),
-            )
-            request_state.account_response_create_release = self._load_balancer.release_account_lease
         try:
-            await scheduler.wait_for(response_create_gate.acquire(), timeout=timeout_seconds)
+            with scheduler.fail_after(timeout_seconds) if bridge_session is not None else nullcontext():
+                if account_id is not None:
+                    # Prewarm passes its snapshot to avoid a DB refresh under
+                    # prewarm_lock. Ordinary refresh/lease waits share the
+                    # absolute create deadline rather than extending it.
+                    settings = (
+                        dashboard_settings if dashboard_settings is not None else await get_settings_cache().get()
+                    )
+                    request_state.account_response_create_lease = (
+                        await self._acquire_account_response_create_lease_or_overload(
+                            account_id=account_id,
+                            request_id=request_state.request_id,
+                            surface=surface,
+                            concurrency_caps=effective_account_concurrency_caps(settings),
+                            routing_tunables=routing_tunables or effective_routing_tunables(settings),
+                        )
+                    )
+                    request_state.account_response_create_release = self._load_balancer.release_account_lease
+                if bridge_session is not None:
+                    timeout_seconds = max(0.0, admission_deadline - self._clock.monotonic())
+                await scheduler.wait_for(response_create_gate.acquire(), timeout=timeout_seconds)
         except TimeoutError as exc:
             await self._release_request_state_account_response_create_lease(request_state)
             request_state.response_create_gate = None
@@ -1416,8 +1425,8 @@ class ProxyService(
                 max(0.0, self._clock.monotonic() - request_state.response_create_gate_wait_started_at) * 1000
             )
         try:
-            request_state.response_create_admission = await self._get_work_admission().acquire_response_create(
-                compact=compact
+            await self._acquire_request_state_global_response_create_admission(
+                request_state, compact=compact, deadline=admission_deadline if bridge_session is not None else None
             )
         except BaseException:
             await self._release_request_state_account_response_create_lease(request_state)
@@ -1431,15 +1440,6 @@ class ProxyService(
             request_state.latency_response_create_gate_wait_ms = int(
                 max(0.0, self._clock.monotonic() - request_state.response_create_gate_wait_started_at) * 1000
             )
-
-    async def _release_request_state_account_response_create_lease(
-        self,
-        request_state: "_WebSocketRequestState",
-    ) -> None:
-        lease = request_state.account_response_create_lease
-        request_state.account_response_create_lease = None
-        request_state.account_response_create_release = None
-        await self._load_balancer.release_account_lease(lease)
 
     async def _select_account_with_budget_compatible(self, deadline: float, **kwargs: object) -> AccountSelection:
         affinity_policy = kwargs.pop("affinity_policy", None)

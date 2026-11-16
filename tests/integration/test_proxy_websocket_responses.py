@@ -4535,32 +4535,34 @@ def test_backend_responses_websocket_echoes_existing_turn_state_header(app_insta
     assert seen["sticky_kind"] == proxy_module.StickySessionKind.CODEX_SESSION
 
 
-def test_v1_responses_websocket_reuses_upstream_for_sequential_requests(app_instance, monkeypatch):
+@pytest.mark.parametrize("next_after_idle", [False, True])
+def test_v1_responses_websocket_reuses_upstream_for_sequential_requests(app_instance, monkeypatch, next_after_idle):
     first_upstream = _SequencedUpstreamWebSocket(
-        [
-            _FakeUpstreamMessage(
-                "text",
-                text=json.dumps(
-                    {"type": "response.created", "response": {"id": "resp_ws_first", "status": "in_progress"}},
-                    separators=(",", ":"),
-                ),
-            ),
-            _FakeUpstreamMessage(
-                "text",
-                text=json.dumps(
-                    {
-                        "type": "response.completed",
-                        "response": {
-                            "id": "resp_ws_first",
-                            "status": "completed",
-                            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
-                        },
-                    },
-                    separators=(",", ":"),
-                ),
-            ),
-        ],
+        [],
         deferred_message_batches=[
+            [
+                _FakeUpstreamMessage(
+                    "text",
+                    text=json.dumps(
+                        {"type": "response.created", "response": {"id": "resp_ws_first", "status": "in_progress"}},
+                        separators=(",", ":"),
+                    ),
+                ),
+                _FakeUpstreamMessage(
+                    "text",
+                    text=json.dumps(
+                        {
+                            "type": "response.completed",
+                            "response": {
+                                "id": "resp_ws_first",
+                                "status": "completed",
+                                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                            },
+                        },
+                        separators=(",", ":"),
+                    ),
+                ),
+            ],
             [
                 _FakeUpstreamMessage(
                     "text",
@@ -4583,10 +4585,25 @@ def test_v1_responses_websocket_reuses_upstream_for_sequential_requests(app_inst
                         separators=(",", ":"),
                     ),
                 ),
-            ]
+            ],
         ],
     )
     connect_calls: list[dict[str, object]] = []
+    reader_idle = threading.Event()
+    received = 0
+    receive = first_upstream.receive
+
+    async def receive_dispatched_batch_only():
+        nonlocal received
+        if received == 2:
+            if len(first_upstream.sent_text) == 1:
+                assert first_upstream._messages.empty(), "second response preceded its response.create"
+            reader_idle.set()
+        message = await receive()
+        received += 1
+        return message
+
+    monkeypatch.setattr(first_upstream, "receive", receive_dispatched_batch_only)
     dispatch_owner_snapshots: list[tuple[str | None, str | None]] = []
     original_bind_dispatch_owner = websocket_mixin_module._bind_websocket_request_dispatch_owner
 
@@ -4677,7 +4694,8 @@ def test_v1_responses_websocket_reuses_upstream_for_sequential_requests(app_inst
         with client.websocket_connect("/v1/responses") as websocket:
             websocket.send_text(json.dumps(first_request))
             first_events = [json.loads(websocket.receive_text()) for _ in range(2)]
-
+            if next_after_idle:
+                assert reader_idle.wait(timeout=5), "reader never reached the next-request boundary"
             websocket.send_text(json.dumps(second_request))
             second_events = [json.loads(websocket.receive_text()) for _ in range(2)]
 

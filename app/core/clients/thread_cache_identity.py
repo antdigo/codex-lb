@@ -115,6 +115,21 @@ def normalize_thread_cache_identity_mode(value: object) -> str | None:
 
 
 @dataclass(frozen=True, slots=True)
+class ThreadCachePolicy:
+    """Account-neutral HTTP policy, captured once for a logical request."""
+
+    mode: str = THREAD_CACHE_IDENTITY_MODE_SHARED
+    from_key: bool = False
+
+    def __post_init__(self) -> None:
+        if self.mode not in THREAD_CACHE_IDENTITY_MODES:
+            raise ValueError("Unknown thread cache identity mode")
+
+    def for_account(self, account_id: str) -> ThreadCacheIdentity:
+        return ThreadCacheIdentity(self.mode, account_id)
+
+
+@dataclass(frozen=True, slots=True)
 class ThreadCacheIdentity:
     """Resolved mode plus the load-balancer account the request is going out on."""
 
@@ -334,6 +349,10 @@ def effective_thread_cache_identity_mode(api_key: object, dashboard_settings: ob
     if fleet is not None:
         return fleet, False
     return THREAD_CACHE_IDENTITY_MODE_DEFAULT, False
+
+
+def resolve_thread_cache_policy(api_key: object, settings: object) -> ThreadCachePolicy:
+    return ThreadCachePolicy(*effective_thread_cache_identity_mode(api_key, settings))
 
 
 def thread_cache_identity_log_fields(identity: ThreadCacheIdentity | None) -> Mapping[str, str]:

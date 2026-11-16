@@ -613,3 +613,76 @@ def test_outcome_label_set_is_closed() -> None:
         "ended_without_terminal",
     }
     assert "stream_terminal_delivery_total" in prometheus.__all__
+
+
+@pytest.mark.parametrize("fail_on", ["start", "body"])
+async def test_writer_failure_closes_body_without_replacing_original_exception(fail_on: str) -> None:
+    class Stream:
+        closed = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            return _CREATED
+
+        async def aclose(self):
+            self.closed = True
+            raise ValueError("close failed")
+
+    stream = Stream()
+    response = DeliveryTracedStreamingResponse(stream, surface="responses")
+
+    async def receive():
+        await asyncio.Event().wait()
+
+    async def send(message):
+        if message["type"] == f"http.response.{fail_on}":
+            raise RuntimeError("original writer error")
+
+    scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": "2.4"}}
+    with pytest.raises(RuntimeError, match="original writer error"):
+        await response(scope, receive, send)
+    assert stream.closed
+    assert response.outcome == OUTCOME_EXCEPTION_BEFORE_TERMINAL
+
+
+async def test_successful_terminal_survives_body_close_error() -> None:
+    class Stream:
+        sent = False
+        closed = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self.sent:
+                raise StopAsyncIteration
+            self.sent = True
+            return _COMPLETED
+
+        async def aclose(self):
+            self.closed = True
+            raise ValueError("close failed")
+
+    stream = Stream()
+    response = DeliveryTracedStreamingResponse(stream, surface="responses")
+    sent = await _run(response)
+    assert stream.closed
+    assert _bodies(sent) == [_COMPLETED.encode(), b""]
+    assert response.outcome == OUTCOME_TERMINAL_WRITTEN
+
+
+async def test_owner_close_error_does_not_erase_successful_delivery() -> None:
+    closed = False
+
+    async def close_owner():
+        nonlocal closed
+        closed = True
+        raise ValueError("owner cleanup failed")
+
+    response = DeliveryTracedStreamingResponse(_iter(_COMPLETED), surface="responses", on_close=close_owner)
+    sent = await _run(response)
+    assert closed
+    assert _bodies(sent) == [_COMPLETED.encode(), b""]
+    assert response.outcome == OUTCOME_TERMINAL_WRITTEN

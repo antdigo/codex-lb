@@ -1,5 +1,5 @@
 import { KeySquare } from "lucide-react";
-import { lazy, useMemo } from "react";
+import { lazy, Suspense, useMemo } from "react";
 import { useTranslation } from "react-i18next";
 
 import { ConfirmDialog } from "@/components/confirm-dialog";
@@ -126,20 +126,22 @@ export function ApiKeysSection({
         }}
       />
 
-      <ApiKeyCreateDialog
-        open={createDialog.open}
-        busy={createMutation.isPending}
-        onOpenChange={createDialog.onOpenChange}
-        onSubmit={handleCreate}
-      />
+      <Suspense fallback={null}>
+        <ApiKeyCreateDialog
+          open={createDialog.open}
+          busy={createMutation.isPending}
+          onOpenChange={createDialog.onOpenChange}
+          onSubmit={handleCreate}
+        />
 
-      <ApiKeyEditDialog
-        open={editDialog.open}
-        busy={updateMutation.isPending}
-        apiKey={editDialog.data}
-        onOpenChange={editDialog.onOpenChange}
-        onSubmit={handleUpdate}
-      />
+        <ApiKeyEditDialog
+          open={editDialog.open}
+          busy={updateMutation.isPending}
+          apiKey={editDialog.data}
+          onOpenChange={editDialog.onOpenChange}
+          onSubmit={handleUpdate}
+        />
+      </Suspense>
 
       <ApiKeyCreatedDialog
         open={createdDialog.open}

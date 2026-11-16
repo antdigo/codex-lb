@@ -1819,6 +1819,11 @@ async def test_http_previous_response_owner_is_ready_before_persistence(
 
     from app.core.config.settings import get_settings
 
+    # Both real socket hops are localhost fixtures; operator proxies must not
+    # reroute either the test client or the app's pooled upstream session.
+    for key in ("http_proxy", "https_proxy", "all_proxy", "socks_proxy"):
+        monkeypatch.delenv(key, raising=False)
+        monkeypatch.delenv(key.upper(), raising=False)
     dashboard_settings = await proxy_module.get_settings_cache().get()
     dashboard_settings.upstream_stream_transport = "http"
     origin_accounts: list[str | None] = []
@@ -1924,7 +1929,7 @@ async def test_http_previous_response_owner_is_ready_before_persistence(
                     await serve_task
                 await asyncio.sleep(0.01)
         port = server.servers[0].sockets[0].getsockname()[1]
-        async with AsyncClient(base_url=f"http://127.0.0.1:{port}", timeout=10) as client:
+        async with AsyncClient(base_url=f"http://127.0.0.1:{port}", trust_env=False, timeout=10) as client:
             for number in range(2):
                 auth = _make_auth_json(f"acc_http_owner_{number}", f"http-owner-{number}@example.com")
                 imported = await client.post(

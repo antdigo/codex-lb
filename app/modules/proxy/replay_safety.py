@@ -10,22 +10,24 @@ from urllib.parse import urlsplit
 
 from app.core.openai.requests import extract_input_file_ids
 from app.core.types import JsonValue
-
-_TOOL_CALL_TYPE_BY_OUTPUT_TYPE = {
-    "function_call_output": "function_call",
-    "custom_tool_call_output": "custom_tool_call",
-    "apply_patch_call_output": "apply_patch_call",
-}
-_TOOL_CALL_TYPES = frozenset(_TOOL_CALL_TYPE_BY_OUTPUT_TYPE.values())
-_ACCOUNT_NEUTRAL_REPLAY_OMITTED_ITEM_TYPES = frozenset(
-    {"reasoning", "tool_search_call", "tool_search_output", "web_search_call"}
+from app.modules.proxy.input_contract import (
+    CLIENT_CALL_OUTPUT_TYPES,
+    CLIENT_SEARCH_CALL_FIELDS,
+    CLIENT_SEARCH_OUTPUT_FIELDS,
+    client_search_call_is_complete,
+    client_search_output_is_complete,
 )
+
+_TOOL_CALL_TYPE_BY_OUTPUT_TYPE = {output: call for call, output in CLIENT_CALL_OUTPUT_TYPES.items()}
+_TOOL_CALL_TYPES = frozenset(_TOOL_CALL_TYPE_BY_OUTPUT_TYPE.values())
+_ACCOUNT_NEUTRAL_REPLAY_OMITTED_ITEM_TYPES = frozenset({"reasoning", "web_search_call"})
 _INTERNAL_CHAT_MESSAGE_METADATA_FIELD = "internal_chat_message_metadata_passthrough"
 _ACCOUNT_NEUTRAL_INTERNAL_CHAT_MESSAGE_METADATA_FIELDS = frozenset({"turn_id"})
-_ACCOUNT_NEUTRAL_TOOL_TYPES = frozenset({"custom", "function", "web_search", "web_search_preview"})
+_ACCOUNT_NEUTRAL_TOOL_TYPES = frozenset({"custom", "function", "tool_search", "web_search", "web_search_preview"})
 _ACCOUNT_NEUTRAL_TOOL_DECLARATION_FIELDS = {
     "custom": frozenset({"description", "format", "name", "type"}),
-    "function": frozenset({"description", "name", "parameters", "strict", "type"}),
+    "function": frozenset({"description", "name", "parameters", "strict", "type", "defer_loading"}),
+    "tool_search": frozenset({"type", "description", "execution", "parameters"}),
     "web_search": frozenset({"filters", "search_context_size", "type", "user_location"}),
     "web_search_preview": frozenset({"filters", "search_context_size", "type", "user_location"}),
 }
@@ -43,6 +45,8 @@ _ACCOUNT_NEUTRAL_INPUT_ITEM_TYPES = frozenset(
         "custom_tool_call_output",
         "function_call",
         "function_call_output",
+        "tool_search_call",
+        "tool_search_output",
         "input_file",
         "input_image",
         "input_text",
@@ -64,6 +68,8 @@ _ACCOUNT_NEUTRAL_CONTENT_FIELDS = {
     "text": frozenset({"text", "type"}),
 }
 _ACCOUNT_NEUTRAL_INPUT_ITEM_FIELDS = {
+    "tool_search_call": CLIENT_SEARCH_CALL_FIELDS,
+    "tool_search_output": CLIENT_SEARCH_OUTPUT_FIELDS,
     "additional_tools": frozenset({"role", "tools", "type"}),
     "apply_patch_call": frozenset(
         {
@@ -628,6 +634,8 @@ def _tool_call_is_self_contained(item_type: str, item: Mapping[str, JsonValue]) 
         return _is_nonblank_string(item.get("name")) and isinstance(item.get("arguments"), str)
     if item_type == "custom_tool_call":
         return _is_nonblank_string(item.get("name")) and isinstance(item.get("input"), str)
+    if item_type == "tool_search_call":
+        return client_search_call_is_complete(item)
     operation = item.get("operation")
     patch = item.get("patch")
     input_value = item.get("input")
@@ -675,6 +683,8 @@ def _apply_patch_operation_is_self_contained(operation: JsonValue | None) -> boo
 
 
 def _tool_output_is_self_contained(item_type: str, item: Mapping[str, JsonValue]) -> bool:
+    if item_type == "tool_search_output":
+        return client_search_output_is_complete(item) and _tools_are_account_neutral(item.get("tools"))
     if item.get("status") not in (None, "completed", "failed"):
         return False
     output = item.get("output")
@@ -831,8 +841,14 @@ def _tool_declaration_is_account_neutral(tool: Mapping[str, JsonValue]) -> bool:
     if tool.get("description") is not None and not isinstance(tool.get("description"), str):
         return False
     if tool_type == "function":
-        return (tool.get("parameters") is None or isinstance(tool.get("parameters"), dict)) and (
-            tool.get("strict") is None or isinstance(tool.get("strict"), bool)
+        return (
+            (tool.get("parameters") is None or isinstance(tool.get("parameters"), dict))
+            and (tool.get("strict") is None or isinstance(tool.get("strict"), bool))
+            and ("defer_loading" not in tool or isinstance(tool["defer_loading"], bool))
+        )
+    if tool_type == "tool_search":
+        return tool.get("execution") == "client" and (
+            tool.get("parameters") is None or isinstance(tool["parameters"], dict)
         )
     if tool_type == "custom":
         return _custom_tool_format_is_account_neutral(tool.get("format"))
@@ -929,7 +945,7 @@ def _contains_account_scoped_tool_state(value: JsonValue) -> bool:
             pending.extend(
                 (nested, False)
                 for key, nested in current.items()
-                if not (is_root and current.get("type") == "function" and key == "parameters")
+                if not (is_root and current.get("type") in {"function", "tool_search"} and key == "parameters")
             )
         elif isinstance(current, list):
             pending.extend((nested, False) for nested in current)
@@ -1029,6 +1045,10 @@ def _contains_account_scoped_input_state(value: JsonValue) -> bool:
                 return True
             if item_type == "additional_tools" and not _tools_are_account_neutral(current.get("tools")):
                 return True
+            if item_type == "tool_search_output" and (
+                not client_search_output_is_complete(current) or not _tools_are_account_neutral(current.get("tools"))
+            ):
+                return True
             if (
                 isinstance(item_type, str)
                 and (item_type.endswith("_call") or item_type.endswith("_call_output"))
@@ -1039,7 +1059,9 @@ def _contains_account_scoped_input_state(value: JsonValue) -> bool:
             if _mapping_has_account_scoped_reference(current):
                 return True
             pending.extend(
-                nested for key, nested in current.items() if not (item_type == "additional_tools" and key == "tools")
+                nested
+                for key, nested in current.items()
+                if not (item_type in {"additional_tools", "tool_search_output"} and key == "tools")
             )
         elif isinstance(current, list):
             pending.extend(current)

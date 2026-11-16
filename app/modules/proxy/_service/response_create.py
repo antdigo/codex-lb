@@ -46,6 +46,7 @@ from app.modules.proxy._service.support import (
     _PENDING_TOOL_CALL_OUTPUT_ITEM_TYPES,
     _WebSocketRequestState,
 )
+from app.modules.proxy.input_contract import CallExecution, tool_call_execution
 
 logger = logging.getLogger("app.modules.proxy.service")
 T = TypeVar("T")
@@ -448,6 +449,8 @@ def _synthetic_interrupted_function_call_output(
     call_type: str = "function_call",
 ) -> dict[str, JsonValue]:
     output_type = _PENDING_TOOL_CALL_OUTPUT_ITEM_TYPE_BY_CALL_TYPE.get(call_type, "function_call_output")
+    if output_type == "tool_search_output":
+        return {"type": output_type, "call_id": call_id, "execution": "client", "tools": []}
     item: dict[str, JsonValue] = {
         "type": output_type,
         "call_id": call_id,
@@ -486,7 +489,7 @@ def _response_output_item_done_tool_call(payload: dict[str, JsonValue] | None) -
 
     Covers every tool-call item type that upstream requires a matching output
     item for on the next anchored request: ``function_call``,
-    ``custom_tool_call``, and ``apply_patch_call``.
+    ``custom_tool_call``, ``apply_patch_call`` and explicit client discovery.
     """
     if not isinstance(payload, dict) or payload.get("type") != "response.output_item.done":
         return None
@@ -495,6 +498,8 @@ def _response_output_item_done_tool_call(payload: dict[str, JsonValue] | None) -
         return None
     item_type = item.get("type")
     if not isinstance(item_type, str) or item_type not in _PENDING_TOOL_CALL_ITEM_TYPES:
+        return None
+    if tool_call_execution(item) is not CallExecution.CLIENT:
         return None
     call_id = item.get("call_id")
     if not isinstance(call_id, str) or not call_id:

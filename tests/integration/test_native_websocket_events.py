@@ -22,6 +22,7 @@ from app.core.utils.sse import parse_sse_data_json_text
 from app.modules.proxy import service as proxy_service
 from app.modules.proxy._service.http_bridge import upstream_events as bridge
 from app.modules.proxy._service.websocket import mixin
+from app.modules.proxy.affinity import _AffinityPolicy
 
 FIXTURES = Path(__file__).resolve().parents[2] / "crates/codex-lb-responses/tests/fixtures/websocket-v1.json"
 
@@ -173,14 +174,30 @@ async def test_native_websocket_values_and_policy_match_python(monkeypatch: pyte
                         assert actual.response_id == expected.response_id, case["name"]
                         assert actual.sequence_number == expected.sequence_number, case["name"]
                         process = AsyncMock()
-                        harness = SimpleNamespace(_process_parsed_http_bridge_upstream_event=process)
+                        harness = proxy_service.ProxyService(cast(Any, None))
+                        monkeypatch.setattr(harness, "_process_parsed_http_bridge_upstream_event", process)
+                        session = proxy_service._HTTPBridgeSession(
+                            key=proxy_service._HTTPBridgeSessionKey("thread_header", "native-probe", None),
+                            headers={},
+                            affinity=_AffinityPolicy(),
+                            request_model=None,
+                            account=cast(Any, SimpleNamespace(id="native-probe-account")),
+                            upstream=websocket,
+                            upstream_control=proxy_service._WebSocketUpstreamControl(),
+                            pending_requests=deque(),
+                            pending_lock=anyio.Lock(),
+                            response_create_gate=asyncio.Semaphore(1),
+                            queued_request_count=0,
+                            last_used_at=REAL_CLOCK.monotonic(),
+                            idle_ttl_seconds=60,
+                        )
                         expected_bridge_payload = parse_sse_data_json_text(text)
                         with monkeypatch.context() as patch:
                             if interpreted and text.startswith("{") and "\n" not in text and "\r" not in text:
                                 patch.setattr(bridge, "parse_sse_data_json_text", reject_decode)
                             await bridge._HTTPBridgeUpstreamEventsMixin._process_http_bridge_upstream_text(
                                 harness,
-                                cast(Any, None),
+                                session,
                                 text,
                                 message=message,
                                 scheduler=REAL_SCHEDULER,

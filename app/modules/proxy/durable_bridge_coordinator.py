@@ -19,6 +19,7 @@ from app.modules.proxy.durable_bridge_repository import (
     REBIND_ANCHOR_UNFENCED,
     DurableBridgeAliasRegistration,
     DurableBridgeAliasRegistrationReceipt,
+    DurableBridgeAliasSourceFence,
     DurableBridgeOperationAbandonment,
     DurableBridgeOperationAbandonmentScanCursor,
     DurableBridgeOperationEventInput,
@@ -31,9 +32,11 @@ from app.modules.proxy.durable_bridge_repository import (
     DurableBridgeTranscriptTurn,
     durable_bridge_api_key_scope,
 )
+from app.modules.proxy.pool_identity import HTTP_BRIDGE_POOL_LANE_KIND
 
 _DURABLE_TURN_STATE_ALIAS = "turn_state"
 _DURABLE_PREVIOUS_RESPONSE_ALIAS = "previous_response_id"
+_DURABLE_PROJECTED_RESPONSE_ALIAS = "http_projected_response_id"
 _DURABLE_SESSION_HEADER_ALIAS = "session_header"
 
 
@@ -134,13 +137,24 @@ class DurableBridgeSessionCoordinator:
                 )
                 if snapshot is not None and not durable_bridge_snapshot_is_detached(snapshot):
                     resolved_aliases.append((alias_kind, snapshot))
+            pool_routing = session_key_kind == HTTP_BRIDGE_POOL_LANE_KIND or any(
+                snapshot.session_key_kind == HTTP_BRIDGE_POOL_LANE_KIND for _kind, snapshot in resolved_aliases
+            )
+            if pool_routing:
+                # A process-wide header is locality evidence, not an anchor
+                # capable of joining independent branches of the same account.
+                resolved_aliases = [
+                    (kind, snapshot) for kind, snapshot in resolved_aliases if kind != _DURABLE_SESSION_HEADER_ALIAS
+                ]
             resolved_identities = {(snapshot.id, snapshot.account_id) for _alias_kind, snapshot in resolved_aliases}
             resolved_account_ids = {
                 snapshot.account_id for _alias_kind, snapshot in resolved_aliases if snapshot.account_id is not None
             }
             has_ownerless_snapshot = any(snapshot.account_id is None for _alias_kind, snapshot in resolved_aliases)
             if len(resolved_identities) > 1:
-                same_account_handoff = len(resolved_account_ids) == 1 and not has_ownerless_snapshot
+                same_account_handoff = (
+                    len(resolved_account_ids) == 1 and not has_ownerless_snapshot and not pool_routing
+                )
                 if same_account_handoff:
                     account_id = next(iter(resolved_account_ids))
                     same_account_snapshots = [
@@ -1097,6 +1111,7 @@ class DurableBridgeSessionCoordinator:
         owner_epoch: int,
         turn_state: str,
         lease_ttl_seconds: float,
+        source_fence: DurableBridgeAliasSourceFence | None = None,
     ) -> DurableBridgeAliasRegistrationReceipt:
         api_key_scope = durable_bridge_api_key_scope(api_key_id)
         async with self._session() as session:
@@ -1107,6 +1122,7 @@ class DurableBridgeSessionCoordinator:
                 owner_epoch=owner_epoch,
                 turn_state=turn_state,
                 lease_ttl_seconds=lease_ttl_seconds,
+                source_fence=source_fence,
             )
 
     async def rollback_recovery_turn_state_registration(
@@ -1131,6 +1147,7 @@ class DurableBridgeSessionCoordinator:
         input_item_count: int | None = None,
         input_full_fingerprint: str | None = None,
         pending_tool_calls: Mapping[str, str] | None = None,
+        advance_latest: bool = True,
     ) -> DurableBridgeAliasRegistration:
         api_key_scope = durable_bridge_api_key_scope(api_key_id)
         async with self._session() as session:
@@ -1142,11 +1159,51 @@ class DurableBridgeSessionCoordinator:
                 alias_kind=_DURABLE_PREVIOUS_RESPONSE_ALIAS,
                 alias_value=response_id,
                 lease_ttl_seconds=lease_ttl_seconds,
-                latest_response_id=response_id,
-                latest_input_item_count=input_item_count,
-                latest_input_full_fingerprint=input_full_fingerprint,
-                latest_pending_tool_calls=pending_tool_calls,
+                latest_response_id=response_id if advance_latest else None,
+                latest_input_item_count=input_item_count if advance_latest else None,
+                latest_input_full_fingerprint=input_full_fingerprint if advance_latest else None,
+                latest_pending_tool_calls=pending_tool_calls if advance_latest else None,
             )
+
+    async def register_projected_response_id(
+        self,
+        *,
+        session_id: str,
+        api_key_id: str | None,
+        instance_id: str,
+        owner_epoch: int,
+        response_id: str,
+        lease_ttl_seconds: float,
+    ) -> DurableBridgeAliasRegistration:
+        """Tag a process-local projection without publishing a completed anchor."""
+        async with self._session() as session:
+            return await DurableBridgeRepository(session).register_owned_alias(
+                session_id=session_id,
+                api_key_scope=durable_bridge_api_key_scope(api_key_id),
+                instance_id=instance_id,
+                owner_epoch=owner_epoch,
+                alias_kind=_DURABLE_PROJECTED_RESPONSE_ALIAS,
+                alias_value=response_id,
+                lease_ttl_seconds=lease_ttl_seconds,
+            )
+
+    async def is_projected_response_id(self, *, response_id: str) -> bool:
+        """Recognize an unusable raw anchor without exposing its API/owner scope."""
+        async with self._session() as session:
+            return await DurableBridgeRepository(session).has_alias(
+                alias_kind=_DURABLE_PROJECTED_RESPONSE_ALIAS, alias_value=response_id
+            )
+
+    async def lookup_projected_response_id(
+        self, *, response_id: str, api_key_id: str | None
+    ) -> DurableBridgeLookup | None:
+        async with self._session() as session:
+            snapshot = await DurableBridgeRepository(session).resolve_alias(
+                alias_kind=_DURABLE_PROJECTED_RESPONSE_ALIAS,
+                alias_value=response_id,
+                api_key_scope=durable_bridge_api_key_scope(api_key_id),
+            )
+            return _to_lookup(snapshot) if snapshot is not None else None
 
     async def register_session_header(
         self,

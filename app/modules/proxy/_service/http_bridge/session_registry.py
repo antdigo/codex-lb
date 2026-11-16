@@ -7,7 +7,7 @@ from datetime import timedelta
 from typing import Any
 
 from app.core.clients.proxy import ProxyResponseError
-from app.core.clock import scheduler_for
+from app.core.clock import clock_for, scheduler_for
 from app.core.config.dashboard_overrides import effective_settings
 from app.core.errors import openai_error
 from app.core.metrics.prometheus import (
@@ -19,6 +19,7 @@ from app.core.metrics.prometheus import (
 from app.core.utils.time import utcnow
 from app.db.models import StickySessionKind
 from app.modules.proxy._service.http_bridge import helpers as _http_bridge_helpers
+from app.modules.proxy._service.http_bridge.affinity_pool import PoolCoordinator
 from app.modules.proxy._service.http_bridge.helpers import (
     _await_task_deferring_cancellation,
     _forget_http_bridge_denied_anchor_fence_owner,
@@ -29,6 +30,7 @@ from app.modules.proxy._service.http_bridge.helpers import (
     _http_bridge_owner_lookup_unavailable_error_envelope,
     _http_bridge_previous_response_alias_key,
     _http_bridge_request_budget_seconds,
+    _http_bridge_session_has_admission_waiter,
     _http_bridge_turn_state_alias_key,
     _is_missing_durable_bridge_table_error,
     _log_http_bridge_event,
@@ -42,6 +44,7 @@ from app.modules.proxy._service.http_bridge.helpers import (
     _track_alias_registration,
 )
 from app.modules.proxy._service.http_bridge.protocol import _HTTPBridgeServiceProtocol
+from app.modules.proxy._service.http_bridge.recovery_alias import RecoveryAliasTransfer
 from app.modules.proxy._service.http_bridge.service_stubs import (
     _headers_with_turn_state,
     _service_get_settings,
@@ -84,6 +87,42 @@ def _requires_durable_recovery_alias_serialization(session: _HTTPBridgeSession) 
 
 
 class _HTTPBridgeSessionRegistryMixin:
+    def _prune_http_bridge_sessions_locked(self: _HTTPBridgeServiceProtocol) -> list[_HTTPBridgeSession]:
+        now = clock_for(self).monotonic()
+        stale_keys: list[_HTTPBridgeSessionKey] = []
+        for key, session in self._http_bridge_sessions.items():
+            if _http_bridge_session_has_admission_waiter(session):
+                continue
+            if session.handoff_in_progress:
+                continue
+            if session.closed:
+                stale_keys.append(key)
+                continue
+            if getattr(session, "unanchored_reservation_id", None) is not None:
+                continue
+            pending_count = self._http_bridge_pending_count_nowait(session, context="idle_prune")
+            if pending_count is None:
+                continue
+            if pending_count:
+                continue
+            if now - session.last_used_at < session.idle_ttl_seconds:
+                continue
+            stale_keys.append(key)
+        sessions_to_close: list[_HTTPBridgeSession] = []
+        for key in stale_keys:
+            session = self._detach_http_bridge_session_locked(key)
+            if session is not None:
+                _log_http_bridge_event(
+                    "evict_idle",
+                    key,
+                    account_id=session.account.id,
+                    model=session.request_model,
+                    cache_key_family=key.affinity_kind,
+                    model_class=_extract_model_class(session.request_model) if session.request_model else None,
+                )
+                sessions_to_close.append(session)
+        return sessions_to_close
+
     async def prune_idle_http_bridge_sessions(self: Any) -> int:
         """Run the idle sweep off the request path (issue #1354).
 
@@ -181,6 +220,7 @@ class _HTTPBridgeSessionRegistryMixin:
         # common resource finalization removes the latter entry.
         self._http_bridge_sessions = {}
         self._http_bridge_detached_sessions = {}
+        self._http_bridge_affinity_pool: PoolCoordinator | None = None
 
     async def close_all_http_bridge_sessions(self: _HTTPBridgeServiceProtocol) -> bool:
         async with self._http_bridge_lock:
@@ -254,6 +294,8 @@ class _HTTPBridgeSessionRegistryMixin:
         self: _HTTPBridgeServiceProtocol,
         session: _HTTPBridgeSession,
         turn_state: str,
+        *,
+        source_transfer: RecoveryAliasTransfer | None = None,
     ) -> tuple[bool, DurableBridgeAliasRegistrationReceipt | None]:
         if not _requires_durable_recovery_alias_serialization(session):
             return False, None
@@ -261,6 +303,7 @@ class _HTTPBridgeSessionRegistryMixin:
             session,
             turn_state,
             reversible=True,
+            source_transfer=source_transfer,
         )
 
     async def _register_http_bridge_turn_state_core(
@@ -269,10 +312,13 @@ class _HTTPBridgeSessionRegistryMixin:
         turn_state: str,
         *,
         reversible: bool,
+        source_transfer: RecoveryAliasTransfer | None = None,
     ) -> tuple[bool, DurableBridgeAliasRegistrationReceipt | None]:
         defer_durable_publication = False
         deferred_live_alias_owner: _HTTPBridgeSession | None = None
         async with self._http_bridge_lock:
+            if source_transfer is not None and not source_transfer.allows_locked(self, session, turn_state):
+                return False, None
             if session.closed or (
                 session.upstream_control.retire_after_drain
                 and self._http_bridge_sessions.get(session.key) is not session
@@ -294,8 +340,11 @@ class _HTTPBridgeSessionRegistryMixin:
             )
             live_alias_owner = _http_bridge_live_turn_state_alias_owner(self, session, turn_state)
             if live_alias_owner is not None:
-                can_rebind_recovery_alias = account_neutral_recovery and _recovery_can_rebind_live_alias(
-                    live_alias_owner
+                can_rebind_recovery_alias = account_neutral_recovery and (
+                    source_transfer is not None
+                    and live_alias_owner is source_transfer.source
+                    or source_transfer is None
+                    and _recovery_can_rebind_live_alias(live_alias_owner)
                 )
                 if not can_rebind_recovery_alias:
                     return not account_neutral_recovery, None
@@ -333,6 +382,7 @@ class _HTTPBridgeSessionRegistryMixin:
             lease_ttl_seconds=_http_bridge_durable_lease_ttl_seconds(),
             local_alias_was_published=not defer_durable_publication,
             reversible=reversible,
+            source_fence=source_transfer.durable if source_transfer is not None else None,
         )
         if not defer_durable_publication:
             return True, receipt
@@ -343,6 +393,8 @@ class _HTTPBridgeSessionRegistryMixin:
                 session.closed
                 or self._http_bridge_sessions.get(session.key) is not session
                 or session.turn_state_alias_registration_generations.get(turn_state) != registration_generation
+                or source_transfer is not None
+                and not source_transfer.allows_locked(self, session, turn_state)
             ):
                 if session.turn_state_alias_registration_generations.get(turn_state) == registration_generation:
                     session.turn_state_alias_registration_generations.pop(turn_state, None)
@@ -376,6 +428,7 @@ class _HTTPBridgeSessionRegistryMixin:
         input_item_count: int | None = None,
         input_full_fingerprint: str | None = None,
         pending_tool_calls: Mapping[str, str] | None = None,
+        advance_latest: bool = True,
     ) -> bool:
         if _requires_durable_recovery_alias_serialization(session):
             async with session.recovery_alias_lock:
@@ -385,6 +438,7 @@ class _HTTPBridgeSessionRegistryMixin:
                     input_item_count=input_item_count,
                     input_full_fingerprint=input_full_fingerprint,
                     pending_tool_calls=pending_tool_calls,
+                    advance_latest=advance_latest,
                 )
         return await self._register_http_bridge_previous_response_id_impl(
             session,
@@ -392,6 +446,7 @@ class _HTTPBridgeSessionRegistryMixin:
             input_item_count=input_item_count,
             input_full_fingerprint=input_full_fingerprint,
             pending_tool_calls=pending_tool_calls,
+            advance_latest=advance_latest,
         )
 
     async def _register_http_bridge_previous_response_id_impl(
@@ -402,6 +457,7 @@ class _HTTPBridgeSessionRegistryMixin:
         input_item_count: int | None = None,
         input_full_fingerprint: str | None = None,
         pending_tool_calls: Mapping[str, str] | None = None,
+        advance_latest: bool = True,
     ) -> bool:
         stripped_response_id = response_id.strip()
         if not stripped_response_id:
@@ -461,6 +517,7 @@ class _HTTPBridgeSessionRegistryMixin:
             instance_id=_service_get_settings().http_responses_session_bridge_instance_id,
             lease_ttl_seconds=_http_bridge_durable_lease_ttl_seconds(),
             local_alias_was_published=not defer_durable_publication,
+            advance_latest=advance_latest,
         )
         if not defer_durable_publication:
             # The in-memory alias stands either way, but the caller's

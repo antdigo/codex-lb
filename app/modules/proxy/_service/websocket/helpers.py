@@ -338,6 +338,7 @@ from app.modules.proxy._service.warmup import (
 from app.modules.proxy._service.warmup import (
     _WarmupUsageSnapshot as _WarmupUsageSnapshot,
 )
+from app.modules.proxy.account_create_lease import _release_request_state_account_create_lease
 from app.modules.proxy.affinity import (
     _AffinityPolicy,
     _sticky_key_from_session_header,  # noqa: F401
@@ -988,6 +989,7 @@ def _websocket_precreated_retry_error_code(
     event_type: str | None,
     payload: dict[str, JsonValue] | None,
     has_other_pending_requests: bool,
+    allow_connection_lifetime_retry: bool = False,
 ) -> str | None:
     if request_state is None:
         return None
@@ -1031,6 +1033,19 @@ def _websocket_precreated_retry_error_code(
     )
     error_param = _websocket_event_error_param(event_type, payload)
     error_message = _websocket_event_error_message(event_type, payload)
+    if allow_connection_lifetime_retry and error_code == "websocket_connection_limit_reached":
+        # Only an unaccepted, unanchored HTTP turn can start on a fresh socket.
+        # A failed response or a named response may already have executed.
+        if (
+            event_type != "error"
+            or payload is None
+            or payload.get("type") != "error"
+            or request_state.previous_response_id is not None
+            or request_state.hard_continuity_anchor
+            or _websocket_response_id(None, payload) is not None
+        ):
+            return None
+        return error_code
     if _facade()._is_previous_response_not_found_error(
         code=error_code,
         param=error_param,
@@ -1923,6 +1938,8 @@ def _match_websocket_request_state_for_anonymous_event(
         ]
         if len(created_requests) == 1:
             return created_requests[0]
+        if len(created_requests) > 1:
+            return None
 
     visible_requests = [
         request_state for request_state in pending_requests if _http_bridge_request_counts_against_queue(request_state)
@@ -2088,32 +2105,24 @@ async def _release_websocket_response_create_gate(
     response_create_gate: asyncio.Semaphore,
     *,
     scheduler: Scheduler,
-) -> None:
+) -> bool:
     """Release every create owner; ``scheduler`` owns the deferred lease-release task."""
 
     cancellation: asyncio.CancelledError | None = None
-    account_response_create_lease = request_state.account_response_create_lease
-    account_response_create_release = request_state.account_response_create_release
-    request_state.account_response_create_lease = None
-    request_state.account_response_create_release = None
     if request_state.response_create_admission is not None:
         request_state.response_create_admission.release()
         request_state.response_create_admission = None
-    if account_response_create_lease is not None and account_response_create_release is not None:
-        cancellation = await _await_cleanup_deferring_cancellation(
-            account_response_create_release(account_response_create_lease),
-            scheduler=scheduler,
-        )
-    request_state.awaiting_response_created = False
-    request_state.response_create_gate = None
-    if not request_state.response_create_gate_acquired:
-        if cancellation is not None:
-            raise cancellation
-        return
-    request_state.response_create_gate_acquired = False
-    response_create_gate.release()
+    try:
+        cancellation = await _release_request_state_account_create_lease(request_state, scheduler=scheduler)
+    finally:
+        request_state.awaiting_response_created = False
+        request_state.response_create_gate = None
+        if request_state.response_create_gate_acquired:
+            request_state.response_create_gate_acquired = False
+            response_create_gate.release()
     if cancellation is not None:
         raise cancellation
+    return request_state.account_response_create_lease is None
 
 
 def _pop_terminal_websocket_request_state(

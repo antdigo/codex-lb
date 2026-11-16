@@ -184,12 +184,16 @@ describe("OrganisationSettingsGroup", () => {
 
     async function connect(user: ReturnType<typeof userEvent.setup>) {
       await user.click(await screen.findByRole("button", { name: "Connect company sign-in" }));
-      await user.type(await screen.findByLabelText("Issuer address"), ISSUER);
-      await user.type(screen.getByLabelText("Application ID"), APPLICATION);
-      await user.type(screen.getByLabelText("Application secret"), TYPED_SECRET);
+      await user.click(await screen.findByLabelText("Issuer address"));
+      await user.paste(ISSUER);
+      await user.click(screen.getByLabelText("Application ID"));
+      await user.paste(APPLICATION);
+      await user.click(screen.getByLabelText("Application secret"));
+      await user.paste(TYPED_SECRET);
       const redirect = screen.getByLabelText("Return address");
       await user.clear(redirect);
-      await user.type(redirect, RETURN_URL);
+      await user.click(redirect);
+      await user.paste(RETURN_URL);
       await user.click(screen.getByRole("button", { name: "Next" }));
       await user.click(await screen.findByRole("button", { name: "Save connection" }));
     }
@@ -221,17 +225,22 @@ describe("OrganisationSettingsGroup", () => {
       await expand(user);
 
       await user.click(await screen.findByRole("button", { name: "Connect company sign-in" }));
-      await user.type(await screen.findByLabelText("Issuer address"), ISSUER);
-      await user.type(screen.getByLabelText("Application ID"), APPLICATION);
-      await user.type(screen.getByLabelText("Application secret"), TYPED_SECRET);
+      await user.click(await screen.findByLabelText("Issuer address"));
+      await user.paste(ISSUER);
+      await user.click(screen.getByLabelText("Application ID"));
+      await user.paste(APPLICATION);
+      await user.click(screen.getByLabelText("Application secret"));
+      await user.paste(TYPED_SECRET);
       const redirect = screen.getByLabelText("Return address");
       await user.clear(redirect);
-      await user.type(redirect, RETURN_URL);
+      await user.click(redirect);
+      await user.paste(RETURN_URL);
       // Step (a) writes nothing: the server refuses a partial document.
       await user.click(screen.getByRole("button", { name: "Next" }));
       expect(patched).toEqual([]);
 
-      await user.type(await screen.findByLabelText("Groups claim (optional)"), "roles");
+      await user.click(await screen.findByLabelText("Groups claim (optional)"));
+      await user.paste("roles");
       await user.click(screen.getByRole("button", { name: "Save connection" }));
 
       await waitFor(() =>
@@ -266,7 +275,8 @@ describe("OrganisationSettingsGroup", () => {
       await expand(user);
 
       await user.click(await screen.findByRole("button", { name: "Connect company sign-in" }));
-      await user.type(await screen.findByLabelText("Issuer address"), "http://login.example.com");
+      await user.click(await screen.findByLabelText("Issuer address"));
+      await user.paste("http://login.example.com");
       await user.click(screen.getByRole("button", { name: "Next" }));
       await user.click(await screen.findByRole("button", { name: "Save connection" }));
 
@@ -291,7 +301,8 @@ describe("OrganisationSettingsGroup", () => {
       await expand(user);
 
       await user.click(await screen.findByRole("button", { name: "Connect company sign-in" }));
-      await user.type(await screen.findByLabelText("Issuer address"), ISSUER);
+      await user.click(await screen.findByLabelText("Issuer address"));
+      await user.paste(ISSUER);
       await user.keyboard("{Escape}");
 
       expect(patched).toEqual([]);
@@ -623,7 +634,8 @@ describe("OrganisationSettingsGroup", () => {
       await expand(user);
 
       await user.click(await screen.findByRole("button", { name: "Edit connection" }));
-      await user.type(await screen.findByLabelText("Application secret"), TYPED_SECRET);
+      await user.click(await screen.findByLabelText("Application secret"));
+      await user.paste(TYPED_SECRET);
       await user.click(screen.getByRole("button", { name: "Next" }));
       await user.click(await screen.findByRole("button", { name: "Save connection" }));
 
@@ -1334,7 +1346,8 @@ describe("OrganisationSettingsGroup", () => {
       renderAt(<OrganisationSettingsGroup />);
       await expand(user);
 
-      await user.type(await screen.findByLabelText("Name this credential"), "Directory");
+      await user.click(await screen.findByLabelText("Name this credential"));
+      await user.paste("Directory");
       await user.click(screen.getByRole("button", { name: "Create credential" }));
 
       const secret = await screen.findByTestId("scim-token-secret");
@@ -1359,7 +1372,8 @@ describe("OrganisationSettingsGroup", () => {
       const { queryClient } = renderAt(<OrganisationSettingsGroup />);
       await expand(user);
 
-      await user.type(await screen.findByLabelText("Name this credential"), "Directory");
+      await user.click(await screen.findByLabelText("Name this credential"));
+      await user.paste("Directory");
       await user.click(screen.getByRole("button", { name: "Create credential" }));
 
       const plaintext = (await screen.findByTestId("scim-token-secret")).textContent ?? "";
@@ -1424,7 +1438,8 @@ describe("OrganisationSettingsGroup", () => {
       renderAt(<OrganisationSettingsGroup />);
       await expand(user);
 
-      await user.type(await screen.findByLabelText("Name this credential"), "Directory");
+      await user.click(await screen.findByLabelText("Name this credential"));
+      await user.paste("Directory");
       await user.click(screen.getByRole("button", { name: "Create credential" }));
 
       expect(await screen.findByText("You can only hand out permissions you hold yourself.")).toBeInTheDocument();

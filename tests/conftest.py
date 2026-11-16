@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 import tempfile
 from pathlib import Path
@@ -11,13 +12,39 @@ import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
+from sqlalchemy.engine import URL, make_url
 
 TEST_DB_DIR = Path(tempfile.mkdtemp(prefix="codex-lb-tests-"))
 TEST_DB_PATH = TEST_DB_DIR / "codex-lb.db"
 
-os.environ["CODEX_LB_DATABASE_URL"] = os.environ.get(
-    "CODEX_LB_TEST_DATABASE_URL", f"sqlite+aiosqlite:///{TEST_DB_PATH}"
-)
+TEST_DATABASE_URL = os.environ.get("CODEX_LB_TEST_DATABASE_URL", f"sqlite+aiosqlite:///{TEST_DB_PATH}")
+os.environ["CODEX_LB_DATABASE_URL"] = TEST_DATABASE_URL
+
+
+def _assert_test_database_url(actual: URL) -> None:
+    """Check the actual target, never just the environment, before any reset."""
+    expected = make_url(TEST_DATABASE_URL)
+
+    def normalized(url: URL) -> URL:
+        if url.get_backend_name() != "sqlite":
+            return url
+        if not url.database or url.database == ":memory:":
+            return url.set(drivername="sqlite")
+        # URI filenames can select a different target than Path.resolve sees.
+        if "uri" in url.query or url.database.startswith("file:"):
+            raise RuntimeError("Refusing destructive test database reset: SQLite URI target")
+        path = Path(url.database).resolve()
+        if not path.is_relative_to(Path(tempfile.gettempdir()).resolve()) or path.is_relative_to(
+            (Path.home() / ".codex-lb").resolve()
+        ):
+            raise RuntimeError("Refusing destructive test database reset: non-temporary SQLite target")
+        return url.set(drivername="sqlite", database=str(path))
+
+    if normalized(actual) != normalized(expected):
+        # Do not print URLs: PostgreSQL URLs can contain credentials.
+        raise RuntimeError("Refusing destructive test database reset: engine/connection differs from test target")
+
+
 os.environ["CODEX_LB_UPSTREAM_BASE_URL"] = "https://example.invalid/backend-api"
 # The HTTP responses session bridge is a request-path feature with a T4 env
 # kill switch (see app/core/config/tiers.py). The suite runs on the raw
@@ -39,6 +66,9 @@ os.environ["CODEX_LB_UPSTREAM_ROUTE_CACHE_TTL_SECONDS"] = "0"
 
 from app.db.models import Base  # noqa: E402
 from app.db.session import engine  # noqa: E402
+
+_assert_test_database_url(engine.url)
+
 from app.main import create_app  # noqa: E402
 from app.modules.auth_providers.seed import seed_default_auth_providers  # noqa: E402
 from app.modules.dashboard_roles.seed import seed_preset_dashboard_roles  # noqa: E402
@@ -129,6 +159,7 @@ def _drop_test_migration_tables(sync_conn) -> None:
 
 
 def _recreate_test_schema(sync_conn) -> None:
+    _assert_test_database_url(sync_conn.engine.url)
     _drop_test_migration_tables(sync_conn)
     Base.metadata.drop_all(sync_conn)
     Base.metadata.create_all(sync_conn)
@@ -146,6 +177,7 @@ def _reset_test_database(sync_conn) -> None:
 async def _reset_db_state():
     from app.db.session import close_db
 
+    _assert_test_database_url(engine.url)
     await close_db()
     async with engine.begin() as conn:
         await conn.run_sync(_reset_test_database)
@@ -607,6 +639,48 @@ async def _capture_session_loop():
     _session_loop = asyncio.get_running_loop()
     yield
     _session_loop = None
+
+
+def _pending_http_bridge_readers(loop: asyncio.AbstractEventLoop) -> list[asyncio.Task[Any]]:
+    return [
+        task
+        for task in asyncio.all_tasks(loop)
+        if not task.done()
+        and getattr(task.get_coro(), "__qualname__", "").endswith("._relay_http_bridge_upstream_messages")
+    ]
+
+
+@pytest.fixture(autouse=True)
+def _http_bridge_reader_ownership_fence(request, _capture_session_loop):
+    """Attribute leftover readers to their originating test and settle before DB reuse.
+
+    Enumerating tasks is passive. Only a detected leak steps the shared loop,
+    after app/transport fixtures have had their normal shutdown opportunity.
+    No production task registry or service behavior is changed.
+    """
+    loop = _session_loop
+    before = set(_pending_http_bridge_readers(loop)) if loop is not None else set()
+    yield
+    if loop is None or loop.is_closed() or loop.is_running():
+        return
+    leaked = [task for task in _pending_http_bridge_readers(loop) if task not in before]
+    if not leaked:
+        return
+    descriptions = []
+    for task in leaked:
+        coroutine = task.get_coro()
+        frame = coroutine.cr_frame if inspect.iscoroutine(coroutine) else None
+        session = frame.f_locals.get("session") if frame is not None else None
+        descriptions.append(
+            f"{task.get_name()} session={id(session)} owner={id(frame.f_locals.get('self')) if frame else 0}"
+        )
+        task.cancel()
+
+    async def settle() -> None:
+        await asyncio.wait_for(asyncio.gather(*leaked, return_exceptions=True), timeout=5)
+
+    loop.run_until_complete(settle())
+    pytest.fail(f"{request.node.nodeid} leaked HTTP bridge readers: " + "; ".join(descriptions), pytrace=False)
 
 
 async def _reap_leaked_live_usage_ingestor() -> None:

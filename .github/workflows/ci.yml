@@ -14,6 +14,7 @@ on:
   pull_request:
     types: [opened, reopened, synchronize, ready_for_review]
   merge_group:
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -49,7 +50,7 @@ jobs:
       - name: Detect full-suite events
         id: force
         run: |
-          if [[ "${{ github.event_name }}" == "push" || "${{ github.event_name }}" == "merge_group" ]]; then
+          if [[ "${{ github.event_name }}" == "push" || "${{ github.event_name }}" == "merge_group" || "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             echo "full_suite=true" >> "$GITHUB_OUTPUT"
           else
             echo "full_suite=" >> "$GITHUB_OUTPUT"
@@ -778,6 +779,17 @@ jobs:
 
       - name: Helm lint + template + kubeconform
         run: make helm-check
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884
+        with:
+          python-version: "3.13"
+          enable-cache: true
+
+      - name: Verify chart contracts
+        run: |
+          uv sync --dev --extra metrics --frozen
+          uv run pytest -q -ra tests/unit/test_helm_*.py
 
   helm-smoke-kind:
     name: Helm smoke install (kind)

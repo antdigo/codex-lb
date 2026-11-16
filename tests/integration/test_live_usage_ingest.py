@@ -607,9 +607,11 @@ async def test_postgresql_live_ingest_waits_for_identity_consolidation_commit(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("commit_before_lookup", [False, True], ids=["identity-observed", "identity-already-gone"])
 async def test_postgresql_live_ingest_recovers_when_current_identity_reconciliation_wins_owner_lock(
     monkeypatch: pytest.MonkeyPatch,
     db_setup,
+    commit_before_lookup: bool,
 ) -> None:
     del db_setup
     bind = SessionLocal.kw["bind"]
@@ -664,9 +666,12 @@ async def test_postgresql_live_ingest_recovers_when_current_identity_reconciliat
 
     async def _settlement_execute(statement: Any, *args: Any, **kwargs: Any):
         sql = str(statement)
+        result = await settlement_execute(statement, *args, **kwargs)
         if sql.startswith("SELECT accounts.id, accounts.chatgpt_account_id") and "WHERE accounts.id =" in sql:
+            # Signal only after the MVCC read captured the current identity.
+            # Before execute, reconciliation could commit and erase that evidence.
             settlement_local_lookup_started.set()
-        return await settlement_execute(statement, *args, **kwargs)
+        return result
 
     async def _reconciliation_commit() -> None:
         reconciliation_commit_started.set()
@@ -692,9 +697,13 @@ async def test_postgresql_live_ingest_recovers_when_current_identity_reconciliat
         )
         await asyncio.wait_for(reconciliation_commit_started.wait(), timeout=5.0)
 
+        if commit_before_lookup:
+            release_reconciliation_commit.set()
+            await asyncio.wait_for(reconciliation_task, timeout=5.0)
         settlement_task = asyncio.create_task(ingestor._ingest(queued))
         await asyncio.wait_for(settlement_local_lookup_started.wait(), timeout=5.0)
-        assert not settlement_task.done()
+        if not commit_before_lookup:
+            assert not settlement_task.done()
 
         release_reconciliation_commit.set()
         saved = await asyncio.wait_for(reconciliation_task, timeout=5.0)
@@ -719,6 +728,11 @@ async def test_postgresql_live_ingest_recovers_when_current_identity_reconciliat
         rows = list((await session.execute(select(UsageHistory).order_by(UsageHistory.id))).scalars().all())
     assert [account.id for account in accounts] == [canonical_id]
     assert [account.chatgpt_account_id for account in accounts] == [current_identity]
+    if commit_before_lookup:
+        # The queued identity is obsolete and the selected row disappeared
+        # before our MVCC read. There is no evidence linking it to the survivor.
+        assert rows == []
+        return
     assert [row.account_id for row in rows] == [canonical_id, canonical_id]
     assert {row.window for row in rows} == {"primary", "secondary"}
     assert {row.used_percent for row in rows} == {33.0, 44.0}

@@ -82,6 +82,11 @@ def test_matching_full_resend_has_no_anchor_rejection() -> None:
     assert _anchor_rejection(_full_resend_payload(), _matching_lookup()) is None
 
 
+def test_full_resend_matching_prefix_cannot_abandon_a_different_response() -> None:
+    payload = _full_resend_payload().model_copy(update={"previous_response_id": "resp-other"})
+    assert _anchor_rejection(payload, _matching_lookup()) == "anchor_response_mismatch"
+
+
 def test_non_full_resend_payload_is_reported_distinctly() -> None:
     # The body carries only the new turn, so there is no history to move.
     assert (
@@ -174,6 +179,7 @@ def test_closed_reason_set_matches_the_literal() -> None:
             "no_durable_lookup",
             "payload_not_full_resend",
             "anchor_metadata_missing",
+            "anchor_response_mismatch",
             "prefix_fingerprint_mismatch",
             "input_not_itemized",
             "missing_prior_output",

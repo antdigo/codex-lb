@@ -1,0 +1,16 @@
+# Design: operation lifecycle and bounded affinity pooling
+
+## Accepted design
+An OperationController owns one immutable input snapshot, absolute deadline, publication gate, attempt ledger and terminal settlement. Typed events from readers, timers and adapters produce effects; they do not run independent retry loops. Attempts bind account and physical generation, preserve actual upstream response IDs before projection and reject stale events. Lanes own ordered continuity and queued work independently of sockets. A per-replica AffinityPool contains up to seven lanes per compatible account/API scope/cache/model/tier group.
+
+## Admission
+The hard account stream cap remains eight with recovery reserve one. Ordinary HTTP bridge admission, including warm reacquisition, requires total inflight below cap minus reserve. Authorized recovery/reattach may use the full cap. Pool size seven does not subtract the reserve again. Existing replica partitioning remains authoritative; all physical generations count against max_sessions (default 256). Existing queue_limit (default eight) applies per lane; ready FIFO work cannot be blocked by another lane's anchor.
+
+## Publication and recovery
+Open -> Committed -> Closed. Commit before enqueueing readable reasoning, text, tool calls or unknown output. Hold only lifecycle and strictly opaque reasoning, at most 256 KiB; overflow flushes and commits. One ordinary transport grant spans all phases; existing auth-refresh/failover/early clean-close quotas are explicit independent grants, never reset by reconnect. Recovery requires complete proven original input, same account, function-only tools, valid durable authority and remaining original deadline. Unknown durable/send outcomes retain existing prohibitions. After commitment, fail honestly without replay. One public response ID/lifecycle maps to winning upstream response ID, lane, account, generation and owner epoch. Preserve output item IDs/ciphertext. Existing durable aliases route to the owning process; no new persistence schema.
+
+## Continuity and rotation
+Specific anchors identify lanes; broad session headers identify groups/locality. Distinct specific lane anchors conflict even on one account. Same-lane generation handoffs are distinct from branches. Pool keys use an unprivileged namespace. Queue ownership survives safe socket replacement. Retire eligible generations after 3000 seconds between responses, with complete-context proof; never interrupt accepted output or guess delta-only context. Keep connect, queue, awaiting-created, idle and total deadlines separate; downstream keepalives do not extend upstream liveness.
+
+## Rollout and acceptance
+Extract parity first, then projection/recovery, then pooling/rotation; one authoritative executor at each stage and remove superseded HTTP paths. Preserve direct WebSocket contract. Deterministic virtual-clock/FakeWebSocket tests plus actual Bifrost 2.5.1 synthetic-upstream acceptance. Seven independent same-key requests can execute concurrently, an eighth ordinary request waits, authorized recovery may use slot eight. Final Astra/max review; canary >=65 minutes and >=100 comparable requests with correctness/cleanup and cache metrics; stop expansion for correctness violations or >5 percentage-point cache ratio loss. No real upstream prompts in synthetic tests.

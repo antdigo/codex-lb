@@ -32,7 +32,9 @@ from app.modules.proxy.continuity import (
 from app.modules.proxy.durable_bridge_coordinator import DurableBridgeLookup, DurableBridgeSessionCoordinator
 from app.modules.proxy.durable_bridge_repository import (
     DurableBridgeAliasRegistration,
+    DurableBridgeAliasSourceFence,
     DurableBridgeRepository,
+    durable_bridge_api_key_scope,
     durable_bridge_hash,
     durable_bridge_operation_id,
 )
@@ -301,6 +303,141 @@ async def test_reversible_recovery_rollback_does_not_restore_reclaimed_predecess
         )
         is None
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "none",
+        "no-proof",
+        "source-epoch",
+        "source-owner",
+        "source-account",
+        "source-api",
+        "source-process",
+        "moved-alias",
+        "target-owner",
+        "rollback-after-reclaim",
+    ],
+)
+async def test_pool_recovery_alias_requires_exact_released_source_and_rolls_back(
+    coordinator: DurableBridgeSessionCoordinator,
+    async_session_factory: Callable[[], AsyncSession],
+    mutation: str,
+) -> None:
+    async def claim(kind: str, key: str, account: str) -> DurableBridgeLookup:
+        return await coordinator.claim_live_session(
+            session_key_kind=kind,
+            session_key_value=key,
+            api_key_id=None,
+            instance_id="instance-a",
+            owner_process_epoch="test-process",
+            lease_ttl_seconds=120.0,
+            account_id=account,
+            model="gpt-5.6-sol",
+            service_tier=None,
+            latest_turn_state=None,
+            latest_response_id=None,
+            allow_takeover=True,
+        )
+
+    source = await claim("internal_pool_lane", "exact-source-lane", "acc-a")
+    alias = "http_turn_exact_pool_source"
+    assert (
+        await coordinator.register_turn_state(
+            session_id=source.session_id,
+            api_key_id=None,
+            instance_id="instance-a",
+            owner_epoch=source.owner_epoch,
+            turn_state=alias,
+            lease_ttl_seconds=120.0,
+        )
+        == DurableBridgeAliasRegistration.REGISTERED
+    )
+    fence = DurableBridgeAliasSourceFence(
+        session_id=source.session_id,
+        api_key_scope=durable_bridge_api_key_scope(None),
+        instance_id="instance-a",
+        owner_epoch=source.owner_epoch,
+        owner_process_epoch="test-process",
+        account_id="acc-a",
+        canonical_kind=source.canonical_kind,
+        canonical_key=source.canonical_key,
+    )
+    # The real adapter captures the proof before its controlled source close.
+    await coordinator.release_live_session(
+        session_id=source.session_id, instance_id="instance-a", owner_epoch=source.owner_epoch, draining=False
+    )
+    kind, key = make_http_bridge_account_neutral_replay_key("exact-pool-source")
+    target = await claim(kind, key, "acc-b")
+    previous_alias_session_id = source.session_id
+    if mutation == "moved-alias":
+        moved = await claim("turn_state_header", "moved-exact-source", "acc-c")
+        await coordinator.register_turn_state(
+            session_id=moved.session_id,
+            api_key_id=None,
+            instance_id="instance-a",
+            owner_epoch=moved.owner_epoch,
+            turn_state=alias,
+            lease_ttl_seconds=120.0,
+        )
+        previous_alias_session_id = moved.session_id
+    elif mutation.startswith("source-"):
+        values = {
+            "source-epoch": {"owner_epoch": source.owner_epoch + 1},
+            "source-owner": {"owner_instance_id": "foreign-instance"},
+            "source-account": {"account_id": "acc-c"},
+            "source-api": {"api_key_scope": "foreign-api"},
+            "source-process": {"owner_process_epoch": "foreign-process"},
+        }[mutation]
+        async with async_session_factory() as db_session:
+            await db_session.execute(
+                update(HttpBridgeSessionRecord).where(HttpBridgeSessionRecord.id == source.session_id).values(**values)
+            )
+            await db_session.commit()
+
+    receipt = await coordinator.register_recovery_turn_state(
+        session_id=target.session_id,
+        api_key_id=None,
+        instance_id="instance-a",
+        owner_epoch=target.owner_epoch + (mutation == "target-owner"),
+        turn_state=alias,
+        lease_ttl_seconds=120.0,
+        source_fence=None if mutation == "no-proof" else fence,
+    )
+    if mutation not in {"none", "rollback-after-reclaim"}:
+        assert receipt.status == (
+            DurableBridgeAliasRegistration.OWNER_FENCED
+            if mutation == "target-owner"
+            else DurableBridgeAliasRegistration.ALIAS_PROTECTED
+        )
+        async with async_session_factory() as db_session:
+            assert (
+                await db_session.scalar(
+                    select(HttpBridgeSessionAlias.session_id).where(HttpBridgeSessionAlias.alias_value == alias)
+                )
+                == previous_alias_session_id
+            )
+        return
+
+    assert receipt.status == DurableBridgeAliasRegistration.REGISTERED
+    registered = await coordinator.lookup_turn_state_target(turn_state=alias, api_key_id=None)
+    assert registered is not None and registered.session_id == target.session_id
+    if mutation == "rollback-after-reclaim":
+        async with async_session_factory() as db_session:
+            await db_session.execute(
+                update(HttpBridgeSessionRecord)
+                .where(HttpBridgeSessionRecord.id == source.session_id)
+                .values(owner_epoch=source.owner_epoch + 1, account_id="acc-c", owner_instance_id="foreign-instance")
+            )
+            await db_session.commit()
+    assert await coordinator.rollback_recovery_turn_state_registration(receipt=receipt)
+    restored = await coordinator.lookup_turn_state_target(turn_state=alias, api_key_id=None)
+    if mutation == "rollback-after-reclaim":
+        assert restored is None
+    else:
+        assert restored is not None and restored.session_id == source.session_id
 
 
 @pytest.mark.asyncio
@@ -3863,3 +4000,67 @@ async def test_reclaimed_detached_row_fences_prior_generation_operations(
         request_text='{"model":"gpt-5.4","input":"new turn"}',
     )
     assert accepted is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("specific_conflict", [False, True])
+async def test_pool_lanes_do_not_inherit_broad_alias_or_merge_specific_branches(coordinator, specific_conflict):
+    rows = []
+    for kind, value in (("prompt_cache", "pool-cache"), ("internal_pool_lane", "pool-lane.1")):
+        rows.append(
+            await coordinator.claim_live_session(
+                session_key_kind=kind,
+                session_key_value=value,
+                api_key_id="pool-key",
+                instance_id="instance-a",
+                owner_process_epoch="test-process",
+                lease_ttl_seconds=120,
+                account_id="same-account",
+                model="gpt-5.4",
+                service_tier=None,
+                latest_turn_state=None,
+                latest_response_id=None,
+                allow_takeover=True,
+            )
+        )
+    await coordinator.register_session_header(
+        session_id=rows[0].session_id, api_key_id="pool-key", session_header="shared-process"
+    )
+    if specific_conflict:
+        await coordinator.register_turn_state(
+            session_id=rows[0].session_id,
+            api_key_id="pool-key",
+            instance_id="instance-a",
+            owner_epoch=rows[0].owner_epoch,
+            turn_state="first-lane-turn",
+            lease_ttl_seconds=120,
+        )
+        await coordinator.register_previous_response_id(
+            session_id=rows[1].session_id,
+            api_key_id="pool-key",
+            instance_id="instance-a",
+            owner_epoch=rows[1].owner_epoch,
+            response_id="second-lane-response",
+            lease_ttl_seconds=120,
+        )
+        with pytest.raises(ProxyResponseError) as failure:
+            await coordinator.lookup_request_targets(
+                session_key_kind="internal_pool_lane",
+                session_key_value="pool-lane.1",
+                api_key_id="pool-key",
+                turn_state="first-lane-turn",
+                previous_response_id="second-lane-response",
+                session_header="shared-process",
+            )
+        assert failure.value.payload["error"]["code"] == "continuity_owner_conflict"
+    else:
+        resolved = await coordinator.lookup_request_targets(
+            session_key_kind="internal_pool_lane",
+            session_key_value="pool-lane.1",
+            api_key_id="pool-key",
+            turn_state=None,
+            previous_response_id=None,
+            session_header="shared-process",
+        )
+        assert resolved is not None
+        assert resolved.session_id == rows[1].session_id

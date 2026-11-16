@@ -63,6 +63,7 @@ from app.core.clients.proxy_websocket import (
     filter_inbound_websocket_headers,
     is_account_neutral_websocket_error_code,
 )
+from app.core.clients.thread_cache_identity import ThreadCacheIdentity, scope_session_headers
 from app.core.clock import Clock, Scheduler, clock_for, scheduler_for
 from app.core.errors import (
     PREVIOUS_RESPONSE_MALFORMED_PARAM_REASON,
@@ -125,6 +126,7 @@ from app.modules.proxy._service.compact import (
 from app.modules.proxy._service.http_bridge.accepted_replay import (
     _stage_websocket_request_state_for_replay,
 )
+from app.modules.proxy._service.http_bridge.execution import release_http_bridge_execution
 from app.modules.proxy._service.http_bridge.helpers import (
     _active_http_bridge_instance_ring as _active_http_bridge_instance_ring,
 )
@@ -342,6 +344,8 @@ from app.modules.proxy._service.support import (
     _clear_websocket_request_error_overrides,
     _DownstreamWebSocketActivity,
     _finalize_ttft_reasoning_deltas,
+    _http_operation_owner_key,
+    _http_operation_terminal_decision,
     _PreparedWebSocketRequest,
     _record_response_event,
     _record_websocket_route_metadata,
@@ -458,6 +462,7 @@ from app.modules.proxy._service.websocket.helpers import (
     _wrapped_websocket_error_event,
 )
 from app.modules.proxy._service.websocket.protocol import _WebSocketServiceProtocol
+from app.modules.proxy.account_create_lease import _release_request_state_account_create_lease
 from app.modules.proxy.affinity import (
     _AffinityPolicy,
     _is_synthesized_turn_state,
@@ -498,7 +503,9 @@ from app.modules.proxy.http_bridge_forwarding import (
 from app.modules.proxy.http_bridge_forwarding import (
     OwnerForwardRelayFailure as OwnerForwardRelayFailure,
 )
+from app.modules.proxy.http_operation import DecisionAction, ResourceKey, SettlementResource
 from app.modules.proxy.load_balancer import AccountLease, effective_account_concurrency_caps
+from app.modules.proxy.operation_effects import execute_resource, execute_resource_now
 from app.modules.proxy.request_policy import (
     apply_api_key_enforcement,
     apply_enforced_service_tier_model_fallback,
@@ -995,19 +1002,16 @@ async def _await_owned_websocket_task_after_reader_cancellation(
 async def _release_websocket_response_create_ownership_for_cleanup(
     request_state: _WebSocketRequestState,
     response_create_gate: asyncio.Semaphore,
-) -> None:
+    *,
+    scheduler: Scheduler,
+) -> bool:
     """Release every create owner even when one release side effect fails."""
 
     response_create_admission = request_state.response_create_admission
-    account_response_create_lease = request_state.account_response_create_lease
-    account_response_create_release = request_state.account_response_create_release
-    response_create_gate_acquired = request_state.response_create_gate_acquired
     request_state.response_create_admission = None
-    request_state.account_response_create_lease = None
-    request_state.account_response_create_release = None
     request_state.awaiting_response_created = False
     request_state.response_create_gate = None
-    request_state.response_create_gate_acquired = False
+    cancellation: asyncio.CancelledError | None = None
 
     try:
         if response_create_admission is not None:
@@ -1019,18 +1023,23 @@ async def _release_websocket_response_create_ownership_for_cleanup(
                     request_state.request_log_id or request_state.request_id,
                     exc_info=True,
                 )
-        if account_response_create_lease is not None and account_response_create_release is not None:
-            try:
-                await account_response_create_release(account_response_create_lease)
-            except Exception:
-                _facade().logger.warning(
-                    "Failed to release websocket account create lease during terminal cleanup request_id=%s",
-                    request_state.request_log_id or request_state.request_id,
-                    exc_info=True,
-                )
+        try:
+            cancellation = await _release_request_state_account_create_lease(request_state, scheduler=scheduler)
+        except Exception:
+            _facade().logger.warning(
+                "Failed to release websocket account create lease during terminal cleanup request_id=%s",
+                request_state.request_log_id or request_state.request_id,
+                exc_info=True,
+            )
     finally:
-        if response_create_gate_acquired:
+        if request_state.response_create_gate_acquired:
+            request_state.response_create_gate_acquired = False
             response_create_gate.release()
+    if cancellation is not None:
+        raise cancellation
+    # A retained or unowned account lease has not settled. The operation's
+    # resource executor must leave its receipt resumable by normal detach.
+    return request_state.account_response_create_lease is None
 
 
 async def _process_and_forward_upstream_websocket_text(
@@ -1355,6 +1364,43 @@ async def _process_upstream_websocket_transport_end(
 
 
 class _WebSocketMixin:
+    async def _acquire_request_state_global_response_create_admission(
+        self,
+        request_state: _WebSocketRequestState,
+        *,
+        compact: bool,
+        deadline: float | None,
+    ) -> None:
+        proxy = cast(_WebSocketServiceProtocol, self)
+        admission = proxy._get_work_admission().acquire_response_create(compact=compact)
+        if deadline is None:
+            request_state.response_create_admission = await admission
+            return
+        try:
+            request_state.response_create_admission = await scheduler_for(proxy).wait_for(
+                admission, timeout=max(0.0, deadline - clock_for(proxy).monotonic())
+            )
+        except TimeoutError as exc:
+            raise ProxyResponseError(
+                429,
+                openai_error("response_create_gate_timeout", "HTTP bridge response-create admission timed out"),
+                local_pre_dispatch_refusal=True,
+            ) from exc
+
+    async def _release_request_state_account_response_create_lease(
+        self,
+        request_state: _WebSocketRequestState,
+    ) -> None:
+        proxy = cast(_WebSocketServiceProtocol, self)
+        if (
+            request_state.account_response_create_lease is not None
+            and request_state.account_response_create_release is None
+        ):
+            request_state.account_response_create_release = proxy._load_balancer.release_account_lease
+        cancellation = await _release_request_state_account_create_lease(request_state, scheduler=scheduler_for(proxy))
+        if cancellation is not None:
+            raise cancellation
+
     async def _touch_active_websocket_thread_affinity(
         self,
         request_state: _WebSocketRequestState,
@@ -4680,6 +4726,7 @@ class _WebSocketMixin:
         *,
         timeout_seconds: float,
         request_state: "_WebSocketRequestState | None" = None,
+        thread_cache_identity: ThreadCacheIdentity | None = None,
     ) -> UpstreamWebSocket:
         proxy = cast(_WebSocketServiceProtocol, self)
         clock = clock_for(proxy)
@@ -4702,6 +4749,11 @@ class _WebSocketMixin:
                         headers,
                         request_state=request_state,
                         connect_progress=connect_progress,
+                        **(
+                            {"thread_cache_identity": thread_cache_identity}
+                            if thread_cache_identity is not None
+                            else {}
+                        ),
                     )
                 recovery.log_recovered()
                 return upstream
@@ -4755,6 +4807,7 @@ class _WebSocketMixin:
         headers: dict[str, str],
         *,
         request_state: "_WebSocketRequestState | None" = None,
+        thread_cache_identity: ThreadCacheIdentity | None = None,
         connect_progress: _WebSocketConnectProgress | None = None,
     ) -> UpstreamWebSocket:
         proxy = cast(_WebSocketServiceProtocol, self)
@@ -4765,6 +4818,8 @@ class _WebSocketMixin:
             getattr(account, "codex_installation_id", None),
             wire_profile=CODEX_0150_RESPONSES_WEBSOCKET_WIRE_PROFILE,
         )
+        if thread_cache_identity is not None:
+            scope_session_headers(headers, thread_cache_identity)
         account_id = _header_account_id(account.chatgpt_account_id)
         connect_lease = await proxy._get_work_admission().acquire_websocket_connect()
         try:
@@ -6245,12 +6300,29 @@ class _WebSocketMixin:
                 for request_state in pending_requests
                 if _http_bridge_request_counts_against_queue(request_state)
             ]
-        return _websocket_receive_timeout_for_pending_requests(
+            operation_deadlines = [
+                request_state.http_operation.deadline
+                for request_state in pending_requests
+                if _http_bridge_request_counts_against_queue(request_state)
+                and request_state.http_operation is not None
+                and request_state.http_operation.deadline is not None
+            ]
+        now = clock_for(proxy).monotonic()
+        timeout = _websocket_receive_timeout_for_pending_requests(
             started_ats,
             proxy_request_budget_seconds=proxy_request_budget_seconds,
             stream_idle_timeout_seconds=stream_idle_timeout_seconds,
-            now=clock_for(proxy).monotonic(),
+            now=now,
         )
+        if operation_deadlines:
+            remaining = max(0.0, min(operation_deadlines) - now)
+            if timeout is None or remaining <= timeout.timeout_seconds:
+                return _WebSocketReceiveTimeout(
+                    timeout_seconds=remaining,
+                    error_code="upstream_request_timeout",
+                    error_message="Original HTTP response deadline exhausted",
+                )
+        return timeout
 
     async def _emit_pending_websocket_keepalive(
         self,
@@ -6351,7 +6423,12 @@ class _WebSocketMixin:
             expired_requests = [
                 request_state
                 for request_state in list(pending_requests)
-                if now >= request_state.started_at + request_budget_seconds
+                if now
+                >= (
+                    request_state.http_operation.deadline
+                    if request_state.http_operation is not None and request_state.http_operation.deadline is not None
+                    else request_state.started_at + request_budget_seconds
+                )
             ]
             for request_state in expired_requests:
                 pending_requests.remove(request_state)
@@ -6385,6 +6462,11 @@ class _WebSocketMixin:
     ) -> None:
         proxy = cast(_WebSocketServiceProtocol, self)
         _ = proxy
+        operation = request_state.http_operation
+        decision = _http_operation_terminal_decision(request_state, successful=event_type == "response.completed")
+        if decision is not None and decision.action is DecisionAction.IGNORE:
+            return
+        owner_key = _http_operation_owner_key(request_state)
         status = "success"
         error_code = None
         error_message = None
@@ -6394,7 +6476,11 @@ class _WebSocketMixin:
         response_service_tier = request_state.service_tier
 
         if request_state.draining_until_terminal:
-            await _release_websocket_response_create_gate(
+            await execute_resource(
+                operation,
+                decision,
+                ResourceKey(SettlementResource.CREATE_GATE, owner_key),
+                _release_websocket_response_create_gate,
                 request_state,
                 response_create_gate,
                 scheduler=scheduler_for(proxy),
@@ -6507,8 +6593,18 @@ class _WebSocketMixin:
             and error_message in STREAM_INCOMPLETE_ANCHOR_NEUTRAL_MESSAGES
         ):
             settlement.account_health_error = False
-        proxy._cancel_request_state_api_key_reservation_heartbeat(request_state)
-        await _release_websocket_response_create_gate(
+        execute_resource_now(
+            operation,
+            decision,
+            ResourceKey(SettlementResource.HEARTBEAT, owner_key),
+            proxy._cancel_request_state_api_key_reservation_heartbeat,
+            request_state,
+        )
+        await execute_resource(
+            operation,
+            decision,
+            ResourceKey(SettlementResource.CREATE_GATE, owner_key),
+            _release_websocket_response_create_gate,
             request_state,
             response_create_gate,
             scheduler=scheduler_for(proxy),
@@ -6519,7 +6615,16 @@ class _WebSocketMixin:
             upstream_control.reconnect_requested = True
             upstream_control.retire_after_drain = True
         lifecycle = request_state.deferred_account_backoff_lifecycle
-        settlement_committed = await proxy._settle_stream_api_key_usage(
+        settlement_effect = await execute_resource(
+            operation,
+            decision,
+            operation.reservation_key(
+                decision,
+                request_state.api_key_reservation.reservation_id if request_state.api_key_reservation else None,
+            )
+            if operation is not None and decision is not None
+            else ResourceKey(SettlementResource.RESERVATION, owner_key),
+            proxy._settle_stream_api_key_usage,
             api_key,
             request_state.api_key_reservation,
             settlement,
@@ -6527,13 +6632,16 @@ class _WebSocketMixin:
             # The reservation must be settled before the load-balancer
             # health write below (settlement-ordering invariant).
             wait_for_settlement=(
-                lifecycle is not None
+                operation is not None
+                or lifecycle is not None
                 or settlement.account_health_error
                 or settlement.record_success
                 or bool(request_state.deferred_account_error_backoffs)
                 or bool(request_state.deferred_keyed_stream_health)
             ),
+            **({"operation": operation, "decision": decision} if operation is not None else {}),
         )
+        settlement_committed = not settlement_effect.executed or bool(settlement_effect.result)
         # Settlement responsibility has transferred (the settle path tracks
         # its own failure/cancellation fallback release). Clear any terminal-
         # bookkeeping settlement claim so a later abort of the surrounding
@@ -6566,7 +6674,11 @@ class _WebSocketMixin:
                 _websocket_downstream_response_id(request_state) if settlement.record_success else response_id
             )
             try:
-                await proxy._write_request_log(
+                await execute_resource(
+                    operation,
+                    decision,
+                    ResourceKey(SettlementResource.REQUEST_LOG, owner_key),
+                    proxy._write_request_log,
                     affinity_observation=request_state.affinity_observation,
                     account_id=account_id_value,
                     api_key=api_key,
@@ -6663,7 +6775,11 @@ class _WebSocketMixin:
                 )
             else:
                 try:
-                    await proxy._handle_stream_error(
+                    await execute_resource(
+                        operation,
+                        decision,
+                        ResourceKey(SettlementResource.HEALTH, owner_key),
+                        proxy._handle_stream_error,
                         account,
                         _stream_settlement_error_payload(settlement),
                         settlement.error_code or "upstream_error",
@@ -6701,7 +6817,13 @@ class _WebSocketMixin:
                 )
             else:
                 try:
-                    await proxy._load_balancer.record_success(account)
+                    await execute_resource(
+                        operation,
+                        decision,
+                        ResourceKey(SettlementResource.HEALTH, owner_key),
+                        proxy._load_balancer.record_success,
+                        account,
+                    )
                 except Exception:
                     _facade().logger.warning(
                         "Failed to record websocket account-health success request_id=%s",
@@ -6959,6 +7081,13 @@ class _WebSocketMixin:
     ) -> bool:
         proxy = cast(_WebSocketServiceProtocol, self)
         _ = proxy
+        cleanup_requests = remaining
+        remaining = [
+            request_state
+            for request_state in remaining
+            if (decision := _http_operation_terminal_decision(request_state)) is None
+            or decision.action is not DecisionAction.IGNORE
+        ]
 
         penalty_code: str | None = None
         penalty_message: str | None = None
@@ -6980,9 +7109,27 @@ class _WebSocketMixin:
                     break
 
         reservation_release_succeeded = True
-        for request_state in remaining:
+        for request_state in cleanup_requests:
+            operation = request_state.http_operation
+            # Old attempts may no longer publish a terminal result, but they
+            # still own their reservation and physical cleanup resources.
+            decision = _http_operation_terminal_decision(request_state, compensation=True)
+            owner_key = _http_operation_owner_key(request_state)
+            execute_resource_now(
+                operation,
+                decision,
+                ResourceKey(SettlementResource.EXECUTION, owner_key),
+                release_http_bridge_execution,
+                request_state,
+            )
             try:
-                proxy._cancel_request_state_api_key_reservation_heartbeat(request_state)
+                execute_resource_now(
+                    operation,
+                    decision,
+                    ResourceKey(SettlementResource.HEARTBEAT, owner_key),
+                    proxy._cancel_request_state_api_key_reservation_heartbeat,
+                    request_state,
+                )
             except Exception:
                 _facade().logger.warning(
                     "Failed to stop websocket reservation heartbeat during terminal cleanup request_id=%s",
@@ -6998,10 +7145,41 @@ class _WebSocketMixin:
                     request_state.request_log_id or request_state.request_id,
                     exc_info=True,
                 )
+            if response_create_gate is not None:
+                await execute_resource(
+                    operation,
+                    decision,
+                    ResourceKey(SettlementResource.CREATE_GATE, owner_key),
+                    _release_websocket_response_create_ownership_for_cleanup,
+                    request_state,
+                    response_create_gate,
+                    scheduler=scheduler_for(proxy),
+                )
+            if request_state.websocket_stream_lease is not None:
+                websocket_stream_lease = request_state.websocket_stream_lease
+                try:
+                    await execute_resource(
+                        operation,
+                        decision,
+                        ResourceKey(SettlementResource.LEASE, str(id(websocket_stream_lease))),
+                        proxy._load_balancer.release_account_lease,
+                        websocket_stream_lease,
+                    )
+                except Exception:
+                    _facade().logger.warning(
+                        "Failed to release websocket stream lease during terminal cleanup request_id=%s",
+                        request_state.request_log_id or request_state.request_id,
+                        exc_info=True,
+                    )
+                else:
+                    request_state.websocket_stream_lease = None
 
         request_log_handoff_succeeded = True
         last_index = len(remaining) - 1
         for index, request_state in enumerate(remaining):
+            operation = request_state.http_operation
+            decision = _http_operation_terminal_decision(request_state)
+            owner_key = _http_operation_owner_key(request_state)
             request_error_code = request_state.error_code_override or error_code
             request_error_message = request_state.error_message_override or error_message
             request_error_type = request_state.error_type_override or "server_error"
@@ -7033,25 +7211,13 @@ class _WebSocketMixin:
                         exc_info=True,
                     )
 
-            if response_create_gate is not None:
-                await _release_websocket_response_create_ownership_for_cleanup(
-                    request_state,
-                    response_create_gate,
-                )
-            if request_state.websocket_stream_lease is not None:
-                websocket_stream_lease = request_state.websocket_stream_lease
-                request_state.websocket_stream_lease = None
-                try:
-                    await proxy._load_balancer.release_account_lease(websocket_stream_lease)
-                except Exception:
-                    _facade().logger.warning(
-                        "Failed to release websocket stream lease during terminal cleanup request_id=%s",
-                        request_state.request_log_id or request_state.request_id,
-                        exc_info=True,
-                    )
             if request_state.event_queue is not None:
                 try:
-                    await request_state.event_queue.put(
+                    await execute_resource(
+                        operation,
+                        decision,
+                        ResourceKey(SettlementResource.TERMINAL_DELIVERY, owner_key + ":frame"),
+                        request_state.event_queue.put,
                         format_sse_event(
                             response_failed_event(
                                 request_error_code,
@@ -7060,9 +7226,15 @@ class _WebSocketMixin:
                                 response_id=_websocket_downstream_response_id(request_state),
                                 error_param=request_error_param,
                             )
-                        )
+                        ),
                     )
-                    await request_state.event_queue.put(None)
+                    await execute_resource(
+                        operation,
+                        decision,
+                        ResourceKey(SettlementResource.TERMINAL_DELIVERY, owner_key + ":end"),
+                        request_state.event_queue.put,
+                        None,
+                    )
                 except Exception:
                     _facade().logger.warning(
                         "Failed to publish websocket terminal queue event during cleanup request_id=%s",
@@ -7107,7 +7279,11 @@ class _WebSocketMixin:
                         0, int((ttft_visible_at - request_state.started_at) * 1000)
                     )
             try:
-                await proxy._write_request_log(
+                await execute_resource(
+                    operation,
+                    decision,
+                    ResourceKey(SettlementResource.REQUEST_LOG, owner_key),
+                    proxy._write_request_log,
                     affinity_observation=request_state.affinity_observation,
                     account_id=account_id_value,
                     # HTTP-bridge callers fan a shared session failure out to
@@ -7189,7 +7365,12 @@ class _WebSocketMixin:
                 )
             else:
                 try:
-                    await proxy._handle_stream_error(
+                    penalty_owner = remaining[0]
+                    await execute_resource(
+                        penalty_owner.http_operation,
+                        _http_operation_terminal_decision(penalty_owner),
+                        ResourceKey(SettlementResource.HEALTH, _http_operation_owner_key(penalty_owner)),
+                        proxy._handle_stream_error,
                         account,
                         {"message": penalty_message or error_message},
                         penalty_code,
@@ -7237,6 +7418,7 @@ class _WebSocketMixin:
             await _release_websocket_response_create_ownership_for_cleanup(
                 request_state,
                 response_create_gate,
+                scheduler=scheduler_for(proxy),
             )
         try:
             await proxy._send_downstream_websocket_text(

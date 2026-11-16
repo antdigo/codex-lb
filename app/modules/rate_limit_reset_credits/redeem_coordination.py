@@ -26,6 +26,7 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
+from app.core.utils.shared_future import _await_result_deferring_cancellation
 from app.db.models import ResetCreditRedeemClaim, ResetCreditRedeemRequest
 from app.db.session import SessionLocal, close_session
 
@@ -149,8 +150,20 @@ async def renew_redeem_claim_periodically(
     while True:
         await asyncio.sleep(renew_interval_seconds)
         try:
-            renewed = await renew_redeem_claim(account_id, holder_id, lease_seconds=lease_seconds)
+            # A cancelled aiosqlite execute can strand an unconsumed RETURNING
+            # cursor. Own the short transaction through result consumption,
+            # commit/rollback and session close before surfacing cancellation.
+            renewed, cancellation = await _await_result_deferring_cancellation(
+                renew_redeem_claim(account_id, holder_id, lease_seconds=lease_seconds)
+            )
+            if cancellation is not None:
+                raise cancellation
         except Exception:
+            task = asyncio.current_task()
+            if task is not None and task.cancelling():
+                # A renewal failure cannot swallow the owner's cancellation
+                # and start another transaction on the next heartbeat tick.
+                raise asyncio.CancelledError
             logger.warning(
                 "reset-credit redeem claim renewal failed account_id=%s (retrying next tick)",
                 account_id,

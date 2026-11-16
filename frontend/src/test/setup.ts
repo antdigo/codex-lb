@@ -7,6 +7,7 @@ import "@/i18n";
 import { LANGUAGE_STORAGE_KEY } from "@/i18n";
 import { resetMockState } from "@/test/mocks/handlers";
 import { server, startMockServer } from "@/test/mocks/server";
+import { disposeTestQueryClients } from "@/test/query-client-lifecycle";
 
 if (typeof window !== "undefined" && typeof window.matchMedia !== "function") {
   Object.defineProperty(window, "matchMedia", {
@@ -70,7 +71,9 @@ beforeAll(() => {
   startMockServer();
 });
 
-afterEach(() => {
+afterEach(async () => {
+  cleanup();
+  await disposeTestQueryClients();
   if (typeof window !== "undefined") {
     window.history.replaceState({}, "", "/");
     try {
@@ -81,7 +84,6 @@ afterEach(() => {
   }
   resetMockState();
   server.resetHandlers();
-  cleanup();
 });
 
 afterAll(() => {

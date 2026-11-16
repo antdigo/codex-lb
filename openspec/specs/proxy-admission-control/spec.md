@@ -672,7 +672,7 @@ Per-account concurrency caps are partitioned per bridge-ring replica and are cor
 
 ### Requirement: Stream leases reflect in-flight turns, not session lifetime
 
-An HTTP bridge session's per-account stream lease MUST be held only while the session has in-flight work. When a session's last in-flight turn detaches — no queued requests, no admission waiters, and no pending requests — the session MUST release its account stream lease while remaining alive for reuse, so a warm idle upstream WebSocket does not occupy a per-account stream slot for its idle TTL. Cancellation MUST NOT interrupt that idle lease settlement after the lease is detached from the session. A turn admitted to a session holding no lease MUST reacquire one under normal cap admission before it is counted into the session queue, and a denied reacquisition MUST fail with the standard HTTP 429 `account_stream_cap` envelope so the recoverable capacity wait and client retry semantics apply unchanged. Reacquisition MUST carry the turn's usage-budget token estimate into the lease, matching initial bridge selection and reconnect, so capacity-weighted routing pressure continues to see turns running on reused warm sessions. The stream recovery reserve MUST NOT be consulted at reacquisition, consistent with the reserve being a selection-time reserve. Session close MUST keep its existing lease settlement; a session that already released while idle has nothing further to settle.
+An HTTP bridge session's per-account stream lease MUST be held only while the session has in-flight work. When a session's last in-flight turn detaches — no queued requests, no admission waiters, and no pending requests — the session MUST release its account stream lease while remaining alive for reuse, so a warm idle upstream WebSocket does not occupy a per-account stream slot for its idle TTL. Cancellation MUST NOT interrupt that idle lease settlement after the lease is detached from the session. A turn admitted to a session holding no lease MUST reacquire one under normal cap admission before it is counted into the session queue, and a denied reacquisition MUST fail with the standard HTTP 429 `account_stream_cap` envelope so the recoverable capacity wait and client retry semantics apply unchanged. Reacquisition MUST carry the turn's usage-budget token estimate into the lease, matching initial bridge selection and reconnect, so capacity-weighted routing pressure continues to see turns running on reused warm sessions. Ordinary warm HTTP bridge reacquisition MUST consult the configured recovery reserve and admit only below the effective account stream cap minus that reserve, matching ordinary selection. Reconnect and reattach recovery MUST use the established authoritative recovery selection path, which MAY use the full hard cap and MUST preserve its fair-share exemption. Warm session reuse alone MUST NOT authorize access to reserved capacity. Session close MUST keep its existing lease settlement; a session that already released while idle has nothing further to settle.
 
 The lease remains per-session, matching the pre-existing lease lifecycle: a session MUST hold at most one stream lease at a time, and turns queued on a session that already holds a lease MUST NOT acquire additional leases — queued turns multiplex over the session's single upstream stream, which is what the per-account stream cap bounds. If the session closes while a reacquisition is in flight, the freshly acquired lease MUST be released back rather than installed on the closed session, and the turn MUST fail with the standard closed-bridge error envelope. Cancellation MUST NOT interrupt release of that detached lease. A submit MUST be registered as in-flight work (admission waiter) atomically with its lease reacquisition, so a completed turn's finalizer running concurrently cannot observe the session as idle and release the reacquired lease before the new turn is counted into the session queue. Any failure after waiter registration and before queue admission MUST remove that waiter and settle an otherwise-idle lease. Reconnect and reacquisition MUST serialize changes to the session lease so a reconnect lease cannot be overwritten and leaked by a concurrent reacquisition. Cancellation MUST NOT interrupt settlement of a lease detached during reconnect replacement. If prewarm fails after the upstream reader closes the session and defers retirement for that admission waiter, removing the final waiter MUST retire the closed session and release its stream lease. Prewarm cancellation MUST NOT interrupt removal of the admission waiter or settlement of an otherwise-idle stream lease.
 
@@ -772,6 +772,19 @@ The lease remains per-session, matching the pre-existing lease lifecycle: a sess
 - **GIVEN** a bridge session with another turn still queued or pending
 - **WHEN** one of its turns detaches
 - **THEN** the session's stream lease is retained
+
+#### Scenario: Warm reuse preserves recovery capacity
+
+- **GIVEN** an effective account stream cap of eight, reserve one and seven active streams
+- **WHEN** an idle HTTP bridge session admits an ordinary turn
+- **THEN** warm lease reacquisition fails with account_stream_cap
+- **AND** an authorized reconnect through reattach selection may acquire the eighth slot
+
+#### Scenario: Recovery cannot exceed the hard cap
+
+- **GIVEN** eight streams occupy an account capped at eight
+- **WHEN** recovery attempts another acquisition
+- **THEN** admission is denied without increasing the hard cap
 
 ### Requirement: Stream admission applies congestion-aware per-API-key fair share
 
@@ -1128,3 +1141,11 @@ The settings API MUST report, for each of `proxy_account_response_create_limit`,
 - **WHEN** the operator opens routing settings
 - **THEN** the stream limit's "Reset to inherited" action is disabled with the reason that the reserve would exceed the limit, while the reserve's reset (which would clear it to 1) stays enabled
 
+### Requirement: Create-owner settlement receipts confirm completed release
+An HTTP operation SHALL mark its create-owner cleanup receipt complete only after the retained account-create lease is actually released. A failed release SHALL remain retryable by ordinary compensation while independent execution gates, stream leases, reservations and terminal delivery continue settling. Retrying SHALL NOT release an already released semaphore or settle unrelated resources twice.
+
+#### Scenario: Account-create release fails once during terminal cleanup
+- **GIVEN** an HTTP operation retaining an account-create lease whose release fails transiently
+- **WHEN** terminal cleanup runs and its downstream then detaches
+- **THEN** the create-owner receipt remains incomplete until the detach retries that release successfully
+- **AND** independent resources and terminal delivery settle once

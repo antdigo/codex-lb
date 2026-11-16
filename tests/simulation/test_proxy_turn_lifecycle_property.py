@@ -84,10 +84,11 @@ import pytest
 
 from app.core.clients.proxy_websocket import UpstreamWebSocket
 from app.core.utils.shared_future import wait_on_shared_future
-from app.db.models import AccountStatus
+from app.db.models import AccountStatus, DashboardSettings
 from app.modules.api_keys.service import ApiKeyData, ApiKeyUsageReservationData
 from app.modules.proxy import service as proxy_service
 from app.modules.proxy._service.websocket.helpers import _release_websocket_response_create_gate
+from app.modules.proxy.http_operation import OperationController, OperationDecision
 from app.modules.proxy.work_admission import AdmissionLease, WorkAdmissionController
 from tests.simulation.test_anyio_lock_cancelled_waiter import (
     ANYIO_LOCK_RELEASE_SKIPS_CANCELLED_WAITERS,
@@ -96,6 +97,21 @@ from tests.simulation.test_anyio_lock_cancelled_waiter import (
 from tests.simulation.virtual_time import ABANDONED_SHIELD_ORACLE_SUPPORTED, VirtualClock, VirtualScheduler
 
 pytestmark = pytest.mark.unit
+
+
+@pytest.fixture(autouse=True)
+def _virtual_turn_dashboard_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Account-owner changes now reacquire their create lease from this snapshot.
+    # Keep this repository boundary inside the pure virtual-time harness.
+    snapshot = DashboardSettings()
+
+    async def get_snapshot() -> DashboardSettings:
+        return snapshot
+
+    monkeypatch.setattr(
+        proxy_service, "get_settings_cache", lambda: SimpleNamespace(get=get_snapshot, cached_row=lambda: snapshot)
+    )
+
 
 ScheduleEvent = Literal[
     "admission_wait",
@@ -269,6 +285,7 @@ class _RecordingProxyService(proxy_service.ProxyService):
         self.redundant_reservation_releases: list[SettlementPath] = []
         self.interrupted_reservation_writes = 0
         self.reservation_writes_in_flight = 0
+        self.reservation_write_tasks: set[asyncio.Task[Any]] = set()
         self._settled_reservation_ids: set[str] = set()
         self.finalizations = 0
         self.abort_settlements = 0
@@ -288,6 +305,9 @@ class _RecordingProxyService(proxy_service.ProxyService):
         """One modelled DB round trip ending in the compare-and-set on the reservation row."""
 
         self.reservation_writes_in_flight += 1
+        writer = asyncio.current_task()
+        assert writer is not None
+        self.reservation_write_tasks.add(writer)
         try:
             await self._scheduler.sleep(self.latency.reservation_write)
         except asyncio.CancelledError:
@@ -295,13 +315,20 @@ class _RecordingProxyService(proxy_service.ProxyService):
             raise
         finally:
             self.reservation_writes_in_flight -= 1
+            self.reservation_write_tasks.discard(writer)
         if reservation.reservation_id in self._settled_reservation_ids:
             self.redundant_reservation_releases.append(path)
             return
         self._settled_reservation_ids.add(reservation.reservation_id)
         self.reservation_settlements.append(path)
 
-    async def _release_websocket_reservation(self, reservation: ApiKeyUsageReservationData | None) -> None:
+    async def _release_websocket_reservation(
+        self,
+        reservation: ApiKeyUsageReservationData | None,
+        *,
+        operation: OperationController | None = None,
+        decision: OperationDecision | None = None,
+    ) -> None:
         if reservation is None:
             return
         await self._write_reservation(reservation, _settlement_path.get())
@@ -314,6 +341,8 @@ class _RecordingProxyService(proxy_service.ProxyService):
         request_id: str,
         *,
         wait_for_settlement: bool = False,
+        operation: OperationController | None = None,
+        decision: OperationDecision | None = None,
     ) -> bool:
         del settlement
         if api_key is None or api_key_reservation is None:
@@ -583,9 +612,27 @@ class _ProductionBridgeTurn:
 
         self.settlement_cancel_attempts += 1
         await self._wait_until_claimed()
-        if cancel_offset > 0:
+        cancel_at_inline_write = cancel_offset > 0 and self.request_state.draining_until_terminal
+        if cancel_at_inline_write:
+            # A draining terminal releases its reservation inline. The create
+            # lease release is now an owned shared task, so a guessed offset
+            # can hit that shielded release instead of interrupting the DB
+            # write this scenario promises to exercise. Observe actual writer
+            # entry; detached settlement writers remain protected, and each
+            # terminal task still receives at most one raw cancellation.
+            while (
+                any(task not in self._schedule_cancelled for task in self._terminal_tasks)
+                and not self.service.reservation_settlements
+                and not any(
+                    task in self.service.reservation_write_tasks
+                    for task in self._terminal_tasks
+                    if task not in self._schedule_cancelled
+                )
+            ):
+                await asyncio.sleep(0)
+        elif cancel_offset > 0:
             await self.scheduler.sleep(cancel_offset)
-        for _ in range(yields):
+        for _ in range(0 if cancel_at_inline_write else yields):
             await asyncio.sleep(0)
         # One raw cancellation per bookkeeping task, which is the contract the
         # reader owners honour (``_await_cancelled_task`` cancels once and
@@ -706,7 +753,13 @@ class _LostAbortSettlementProxyService(_RecordingProxyService):
 class _DroppedApiKeyReleaseProxyService(_RecordingProxyService):
     """Service whose API-key reservation release silently does nothing."""
 
-    async def _release_websocket_reservation(self, reservation: ApiKeyUsageReservationData | None) -> None:
+    async def _release_websocket_reservation(
+        self,
+        reservation: ApiKeyUsageReservationData | None,
+        *,
+        operation: OperationController | None = None,
+        decision: OperationDecision | None = None,
+    ) -> None:
         del reservation
 
 
@@ -888,6 +941,18 @@ async def _run_schedule(turn: _BridgeTurn, schedule: Schedule, scheduler: Virtua
         if all(task.done() for task in scheduler.owned_tasks):
             break
         await scheduler.advance(_ADVANCE_SECONDS)
+    if not all(task.done() for task in tasks):
+        print("LIFECYCLE_QUIESCENCE", turn.snapshot())
+        for task in scheduler.owned_tasks:
+            if not task.done():
+                current = task.get_coro()
+                chain = []
+                while current is not None:
+                    frame = getattr(current, "cr_frame", None) or getattr(current, "gi_frame", None)
+                    if frame is not None:
+                        chain.append((frame.f_code.co_name, frame.f_lineno))
+                    current = getattr(current, "cr_await", None) or getattr(current, "gi_yieldfrom", None)
+                print("LIFECYCLE_PENDING", task.get_name(), chain)
     assert all(task.done() for task in tasks), f"schedule did not quiesce schedule={schedule}"
     # Every task production spawned on this turn is scheduler-owned, so a
     # lingering one is a leak of the turn, not test scaffolding.

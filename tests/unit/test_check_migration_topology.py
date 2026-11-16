@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -400,12 +402,56 @@ def test_parent_unknown_to_the_base_ref_does_not_report_a_fork(checker: ModuleTy
     assert report.errors == []
 
 
-def test_base_ref_revisions_reads_the_graph_out_of_git(checker: ModuleType) -> None:
-    """The git plumbing must reproduce the same edges as reading the working tree."""
+def test_base_ref_revisions_reads_the_graph_out_of_git(
+    checker: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Real git plumbing reads the copied migration graph without host Git metadata/config."""
+    repository = tmp_path / "migration-repository"
+    versions = repository / "app" / "db" / "alembic" / "versions"
+    versions.mkdir(parents=True)
+    for source in VERSIONS_DIR.glob("*.py"):
+        shutil.copyfile(source, versions / source.name)
+    empty_hooks = tmp_path / "empty-hooks"
+    empty_hooks.mkdir()
+    empty_config = tmp_path / "empty-gitconfig"
+    empty_config.write_text("", encoding="utf-8")
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(empty_config))
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "0")
+    monkeypatch.setenv("GIT_ATTR_NOSYSTEM", "1")
+    for name in (
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CONFIG_PARAMETERS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    for role in ("AUTHOR", "COMMITTER"):
+        monkeypatch.setenv(f"GIT_{role}_NAME", "Migration Fixture")
+        monkeypatch.setenv(f"GIT_{role}_EMAIL", "migration-fixture@example.invalid")
+    git = [
+        "git",
+        "-c",
+        f"core.hooksPath={empty_hooks}",
+        "-c",
+        "commit.gpgsign=false",
+        "-c",
+        "core.fsmonitor=false",
+    ]
+    for arguments in (
+        ["init", "--initial-branch=fixture", f"--template={empty_hooks}"],
+        ["add", "--", "app/db/alembic/versions"],
+        ["commit", "--no-gpg-sign", "-m", "Synthetic migration graph fixture"],
+    ):
+        subprocess.run([*git, *arguments], cwd=repository, check=True, capture_output=True, text=True)
+    monkeypatch.setattr(checker, "ROOT", repository)
     base_revisions = checker.base_ref_revisions("HEAD")
     assert base_revisions is not None
     from_git = {revision.revision: revision.down_revisions for revision in base_revisions}
-    from_disk = {revision.revision: revision.down_revisions for revision in checker.load_graph(VERSIONS_DIR)}
+    from_disk = {revision.revision: revision.down_revisions for revision in checker.load_graph(versions)}
     assert from_git == from_disk
     assert "__init__" not in from_git
 

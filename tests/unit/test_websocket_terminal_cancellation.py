@@ -20,8 +20,11 @@ from app.core.utils.time import utcnow
 from app.db.models import Account
 from app.modules.api_keys.service import ApiKeyData, ApiKeyUsageReservationData
 from app.modules.proxy import service as proxy_service
+from app.modules.proxy._service.support import _http_operation_owner_key
 from app.modules.proxy._service.websocket import mixin as websocket_mixin
+from app.modules.proxy.http_operation import OperationController, ResourceKey, SettlementResource
 from tests.simulation.virtual_time import VirtualClock, VirtualScheduler
+from tests.unit.test_http_bridge_idle_leases import _make_bridge_session
 
 pytestmark = pytest.mark.unit
 
@@ -858,7 +861,7 @@ async def test_drain_start_during_admission_rejects_turn_before_connect_or_send(
 
     async def release_account_create_lease(lease: object | None) -> None:
         account_lease_release_calls.append(lease)
-        if release_failure == "account_create_lease":
+        if release_failure == "account_create_lease" and len(account_lease_release_calls) == 1:
             raise RuntimeError("account create lease release failed")
 
     account_create_lease = object()
@@ -933,8 +936,13 @@ async def test_drain_start_during_admission_rejects_turn_before_connect_or_send(
     assert account_lease_release_calls == [account_create_lease]
     assert request_state.response_create_gate is None
     assert request_state.response_create_admission is None
-    assert request_state.account_response_create_lease is None
-    assert request_state.account_response_create_release is None
+    if release_failure == "account_create_lease":
+        assert request_state.account_response_create_lease is account_create_lease
+        assert request_state.account_response_create_release is release_account_create_lease
+    else:
+        assert request_state.account_response_create_lease is None
+        assert request_state.account_response_create_release is None
+    assert request_state.account_response_create_release_task is None
     assert [json.loads(text)["type"] for text in downstream.sent_text] == ["response.failed"]
     assert json.loads(downstream.sent_text[0])["response"]["error"]["code"] == "service_unavailable"
     assert downstream.lifecycle == ["send:response.failed", "close:1012"]
@@ -948,12 +956,21 @@ async def test_drain_start_during_admission_rejects_turn_before_connect_or_send(
             "Failed to release websocket account create lease during terminal cleanup request_id=request_late_drain"
             in caplog.messages
         )
+        await service._release_request_state_account_response_create_lease(request_state)
+        assert account_lease_release_calls == [account_create_lease, account_create_lease]
+        assert request_state.account_response_create_lease is None
+        assert request_state.account_response_create_release is None
+        assert request_state.account_response_create_release_task is None
+        release_reservation.assert_awaited_once_with(request_state)
+        assert downstream.lifecycle == ["send:response.failed", "close:1012"]
 
 
+@pytest.mark.parametrize("controlled_http", [False, True], ids=["direct_websocket", "http_operation"])
 @pytest.mark.asyncio
 async def test_terminal_send_failure_does_not_skip_mandatory_cleanup_or_next_state(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    controlled_http: bool,
 ) -> None:
     @asynccontextmanager
     async def repo_factory() -> AsyncIterator[SimpleNamespace]:
@@ -976,7 +993,7 @@ async def test_terminal_send_failure_does_not_skip_mandatory_cleanup_or_next_sta
 
     async def release_account_create(lease: object | None) -> None:
         account_create_releases.append(lease)
-        if lease is account_create_leases[0]:
+        if lease is account_create_leases[0] and account_create_releases.count(lease) == 1:
             raise RuntimeError("account create lease release failed")
 
     def dump_oversized_request(
@@ -987,6 +1004,14 @@ async def test_terminal_send_failure_does_not_skip_mandatory_cleanup_or_next_sta
         raise RuntimeError("oversized request dump failed")
 
     for index, state in enumerate(states):
+        if controlled_http:
+            state.http_operation = OperationController(None)
+            state.response_create_attempt = state.http_operation.begin_attempt(
+                permit=state.http_operation.pending_dispatch,
+                now=1,
+                account_id="account_partial_failure",
+                generation=1,
+            )
 
         def release_admission(request_id: str = state.request_id) -> None:
             admission_release_calls.append(request_id)
@@ -1044,7 +1069,11 @@ async def test_terminal_send_failure_does_not_skip_mandatory_cleanup_or_next_sta
     assert oversized_dump_calls == [states[-1].request_id]
     assert all(state.response_create_gate is None for state in states)
     assert all(state.response_create_admission is None for state in states)
-    assert all(state.account_response_create_lease is None for state in states)
+    assert states[0].account_response_create_lease is account_create_leases[0]
+    assert states[0].account_response_create_release is release_account_create
+    assert states[1].account_response_create_lease is None
+    assert states[1].account_response_create_release is None
+    assert all(state.account_response_create_release_task is None for state in states)
     assert all(state.websocket_stream_lease is None for state in states)
     await asyncio.wait_for(response_create_gate.acquire(), timeout=0.1)
     await asyncio.wait_for(response_create_gate.acquire(), timeout=0.1)
@@ -1064,6 +1093,28 @@ async def test_terminal_send_failure_does_not_skip_mandatory_cleanup_or_next_sta
         "Failed to dump oversized websocket request during terminal cleanup "
         "request_id=request_after_partial_failure" in caplog.messages
     )
+    if controlled_http:
+        operation = states[0].http_operation
+        assert operation is not None
+        key = ResourceKey(SettlementResource.CREATE_GATE, _http_operation_owner_key(states[0]))
+        receipt = operation.resource_receipt(key)
+        assert receipt is not None and not receipt.completed
+        session = _make_bridge_session()
+        session.response_create_gate = response_create_gate
+        assert await service._detach_http_bridge_request(session, request_state=states[0]) is False
+        receipt = operation.resource_receipt(key)
+        assert receipt is not None and receipt.completed
+        assert response_create_gate.locked(), "compensation must not release the semaphore again"
+    else:
+        await service._release_request_state_account_response_create_lease(states[0])
+    assert account_create_releases == [*account_create_leases, account_create_leases[0]]
+    assert all(state.account_response_create_lease is None for state in states)
+    assert all(state.account_response_create_release is None for state in states)
+    assert all(state.account_response_create_release_task is None for state in states)
+    assert stream_release.await_count == 2
+    assert reservation_release.await_count == 2
+    assert request_log.await_count == 2
+    assert emit_terminal.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -1180,7 +1231,10 @@ async def test_pending_failure_cancellation_after_claim_remains_drain_owned(
 
 
 @pytest.mark.asyncio
-async def test_cancelled_task_wait_is_strictly_bounded_by_shared_deadline() -> None:
+async def test_cancelled_task_wait_is_strictly_bounded_by_shared_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = VirtualClock()
+    scheduler = VirtualScheduler(clock)
+    monkeypatch.setattr(shutdown_state, "time", SimpleNamespace(monotonic=clock.monotonic))
     release_task = asyncio.Event()
     cancellation_seen = asyncio.Event()
 
@@ -1191,29 +1245,33 @@ async def test_cancelled_task_wait_is_strictly_bounded_by_shared_deadline() -> N
             except asyncio.CancelledError:
                 cancellation_seen.set()
 
-    task = asyncio.create_task(cancellation_resistant_task())
-    await asyncio.sleep(0)
+    task = scheduler.create_task(cancellation_resistant_task())
+    await scheduler.drain()
     shutdown_state.commit_shutdown(timeout_seconds=0.05)
-    release_later = asyncio.create_task(_release_after(release_task, 0.25))
-
-    loop = asyncio.get_running_loop()
-    started_at = loop.time()
-    cancelled = await proxy_service._await_cancelled_task(
-        task,
-        timeout_seconds=1.0,
-        label="cancellation-resistant task",
+    waiter = scheduler.create_task(
+        proxy_service._await_cancelled_task(
+            task,
+            timeout_seconds=1.0,
+            label="cancellation-resistant task",
+            scheduler=scheduler,
+        )
     )
-    elapsed = loop.time() - started_at
-
-    release_task.set()
-    await asyncio.wait_for(task, timeout=1)
-    release_later.cancel()
-    with suppress(asyncio.CancelledError):
-        await release_later
-
-    assert cancelled is False
-    assert elapsed < 0.15
-    assert cancellation_seen.is_set()
+    try:
+        await scheduler.drain()
+        await scheduler.advance(0.049)
+        assert not waiter.done()
+        await scheduler.advance(0.001)
+        assert waiter.done()
+        assert await waiter is False
+        assert clock.monotonic() == pytest.approx(0.05)
+        assert cancellation_seen.is_set()
+        release_task.set()
+        await scheduler.drain()
+        assert task.done()
+    finally:
+        release_task.set()
+        await scheduler.drain()
+        await scheduler.cancel_owned_tasks()
 
 
 @pytest.mark.asyncio
@@ -1284,10 +1342,10 @@ async def test_terminal_message_ownership_survives_relay_cancellation(
         response_create_gate: asyncio.Semaphore,
         *,
         scheduler: Scheduler,
-    ) -> None:
+    ) -> bool:
         gate_entered.set()
         await release_gate.wait()
-        await original_release_gate(request_state, response_create_gate, scheduler=scheduler)
+        return await original_release_gate(request_state, response_create_gate, scheduler=scheduler)
 
     monkeypatch.setattr(
         websocket_mixin,
@@ -1466,7 +1524,12 @@ async def test_terminal_message_cancellation_is_bounded_by_shared_deadline(
     async def repo_factory() -> AsyncIterator[SimpleNamespace]:
         yield SimpleNamespace(request_logs=_RequestLogsRecorder(), api_keys=object())
 
-    service = proxy_service.ProxyService(cast(proxy_service.ProxyRepoFactory, repo_factory))
+    clock = VirtualClock()
+    scheduler = VirtualScheduler(clock)
+    monkeypatch.setattr(shutdown_state, "time", SimpleNamespace(monotonic=clock.monotonic))
+    service = proxy_service.ProxyService(
+        cast(proxy_service.ProxyRepoFactory, repo_factory), clock=clock, scheduler=scheduler
+    )
     monkeypatch.setattr(
         proxy_service,
         "get_settings",
@@ -1494,7 +1557,7 @@ async def test_terminal_message_cancellation_is_bounded_by_shared_deadline(
 
     upstream = _TerminalThenBlockingUpstream("{}")
     downstream = _DownstreamWebSocket()
-    relay = asyncio.create_task(
+    relay = scheduler.create_task(
         service._relay_upstream_websocket_messages(
             cast(WebSocket, downstream),
             cast(UpstreamWebSocket, upstream),
@@ -1512,32 +1575,38 @@ async def test_terminal_message_cancellation_is_bounded_by_shared_deadline(
         ),
         name="test-terminal-relay-timeout",
     )
-    await asyncio.wait_for(child_started.wait(), timeout=1)
-
-    loop = asyncio.get_running_loop()
-    started_at = loop.time()
+    await scheduler.drain()
+    assert child_started.is_set()
     shutdown_state.commit_shutdown(timeout_seconds=0.05)
-    release_later = asyncio.create_task(_release_after(release_child, 0.25))
-    cancelled = await proxy_service._await_cancelled_task(
-        relay,
-        timeout_seconds=0.05,
-        label="test terminal relay timeout",
+    waiter = scheduler.create_task(
+        proxy_service._await_cancelled_task(
+            relay,
+            timeout_seconds=1.0,
+            label="test terminal relay timeout",
+            scheduler=scheduler,
+        )
     )
-    elapsed = loop.time() - started_at
-
-    release_later.cancel()
-    with suppress(asyncio.CancelledError):
-        await release_later
-    assert cancelled is False
-    assert elapsed < 0.15
-    assert child_cancelled.is_set() is False
-    assert any(
-        task.get_name() == "proxy-websocket-terminal-account_terminal_timeout"
-        for task in service._background_cleanup_tasks
-        if not task.done()
-    )
-    release_child.set()
-    assert await service.drain_persistence_tasks(timeout_seconds=0.1)
+    try:
+        await scheduler.drain()
+        await scheduler.advance(0.049)
+        assert not waiter.done()
+        await scheduler.advance(0.001)
+        assert waiter.done()
+        assert await waiter is False
+        assert clock.monotonic() == pytest.approx(0.05)
+        assert child_cancelled.is_set() is False
+        assert any(
+            task.get_name() == "proxy-websocket-terminal-account_terminal_timeout"
+            for task in service._background_cleanup_tasks
+            if not task.done()
+        )
+        release_child.set()
+        await scheduler.drain()
+        assert await service.drain_persistence_tasks(timeout_seconds=0.1)
+    finally:
+        release_child.set()
+        await scheduler.drain()
+        await scheduler.cancel_owned_tasks()
 
 
 @pytest.mark.asyncio
@@ -2264,3 +2333,41 @@ async def test_scope_cancellation_while_waiting_for_reconnect_reader_preserves_a
 async def _release_after(event: asyncio.Event, delay_seconds: float) -> None:
     await asyncio.sleep(delay_seconds)
     event.set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cleanup", [False, True], ids=["ordinary_release", "terminal_cleanup"])
+async def test_create_owner_receipt_waits_for_a_missing_account_release_callback(cleanup):
+    from app.modules.proxy._service.http_bridge import request_submit
+    from app.modules.proxy._service.support import _http_operation_terminal_decision
+    from app.modules.proxy.operation_effects import execute_resource
+
+    state = _request_state("missing-create-release-callback")
+    operation = state.http_operation = OperationController(None)
+    gate = asyncio.BoundedSemaphore(1)
+    await gate.acquire()
+    state.response_create_gate = gate
+    state.response_create_gate_acquired = True
+    lease = object()
+    state.account_response_create_lease = cast(Any, lease)
+    key = ResourceKey(SettlementResource.CREATE_GATE, _http_operation_owner_key(state))
+    effect = (
+        websocket_mixin._release_websocket_response_create_ownership_for_cleanup
+        if cleanup
+        else request_submit._release_websocket_response_create_gate
+    )
+    decision = _http_operation_terminal_decision(state, compensation=True)
+    await execute_resource(operation, decision, key, effect, state, gate, scheduler=REAL_SCHEDULER)
+    receipt = operation.resource_receipt(key)
+    assert receipt is not None and not receipt.completed
+    assert state.account_response_create_lease is lease
+    assert not gate.locked()
+    release = AsyncMock()
+    state.account_response_create_release = release
+    await execute_resource(operation, decision, key, effect, state, gate, scheduler=REAL_SCHEDULER)
+    receipt = operation.resource_receipt(key)
+    assert receipt is not None and receipt.completed
+    assert state.account_response_create_lease is None
+    release.assert_awaited_once_with(lease)
+    await asyncio.wait_for(gate.acquire(), timeout=1)
+    assert gate.locked(), "resumed cleanup released the bounded gate only once"

@@ -4,12 +4,13 @@ import { HttpResponse, http } from "msw";
 import { describe, expect, it } from "vitest";
 
 import App from "@/App";
+import { FirewallSection } from "@/features/firewall/components/firewall-section";
 import { renderWithProviders } from "@/test/utils";
 import { ADMIN_PERMISSIONS } from "@/test/mocks/factories";
 import { server } from "@/test/mocks/server";
 
 describe("firewall flow integration", () => {
-  it("loads firewall section in settings and performs add/remove", async () => {
+  it("persists add/remove through the firewall section and its query cache", async () => {
     const user = userEvent.setup({ delay: null });
     const entries: Array<{ ipAddress: string; createdAt: string }> = [];
 
@@ -47,11 +48,7 @@ describe("firewall flow integration", () => {
       }),
     );
 
-    window.history.pushState({}, "", "/settings");
-    renderWithProviders(<App />);
-
-    // Firewall lives in the collapsed-by-default Advanced group.
-    await user.click(await screen.findByRole("button", { name: "Show advanced settings" }));
+    renderWithProviders(<FirewallSection />);
 
     const firewallHeading = await screen.findByRole("heading", { name: "Firewall" });
     expect(firewallHeading).toBeInTheDocument();
@@ -61,7 +58,8 @@ describe("firewall flow integration", () => {
     expect(firewallSection).toHaveClass("scroll-mt-16");
     const fw = within(firewallSection);
 
-    await user.type(fw.getByPlaceholderText("127.0.0.1 or 2001:db8::1"), "127.0.0.1");
+    await user.click(fw.getByPlaceholderText("127.0.0.1 or 2001:db8::1"));
+    await user.paste("127.0.0.1");
     await user.click(fw.getByRole("button", { name: "Add IP" }));
 
     expect(await fw.findByText("127.0.0.1")).toBeInTheDocument();
@@ -72,7 +70,7 @@ describe("firewall flow integration", () => {
     await user.click(within(dialog).getByRole("button", { name: "Remove" }));
 
     await waitFor(() => {
-      expect(screen.queryByText("127.0.0.1")).not.toBeInTheDocument();
+      expect(fw.queryByText("127.0.0.1")).not.toBeInTheDocument();
     });
   });
 

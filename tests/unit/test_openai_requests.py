@@ -114,7 +114,7 @@ def test_subscription_inline_function_call_preserves_responses_lite_id(request_t
 
 
 @pytest.mark.parametrize("request_type", [ResponsesRequest, ResponsesCompactRequest])
-def test_subscription_inline_function_call_preserves_incremental_lite_id(request_type):
+def test_subscription_inline_function_call_preserves_marker_only_id_until_transport_is_known(request_type):
     call = {
         "type": "function_call",
         "id": "fc_call_example",
@@ -131,7 +131,13 @@ def test_subscription_inline_function_call_preserves_incremental_lite_id(request
             "client_metadata": {"ws_request_header_x_openai_internal_codex_responses_lite": "true"},
         }
     )
-    assert request.to_payload()["input"] == [call]
+    expected_call = (
+        {"type": "function_call", "call_id": "call_example", "name": "note", "arguments": "{}"}
+        if request_type is ResponsesCompactRequest
+        else call
+    )
+    assert request.to_payload()["input"] == [expected_call]
+    assert request.input == [call]
 
 
 @pytest.mark.parametrize("request_type", [ResponsesRequest, ResponsesCompactRequest])
@@ -197,7 +203,7 @@ def test_subscription_inline_message_preserves_incomplete_or_opaque_ids(request_
 
 @pytest.mark.parametrize("request_type", [ResponsesRequest, ResponsesCompactRequest])
 @pytest.mark.parametrize("metadata_only", [False, True])
-def test_subscription_inline_message_preserves_lite_ids(request_type, metadata_only):
+def test_subscription_inline_message_preserves_effective_lite_ids(request_type, metadata_only):
     message = {
         "type": "message",
         "id": "msg_lite",
@@ -214,7 +220,20 @@ def test_subscription_inline_message_preserves_lite_ids(request_type, metadata_o
             "client_metadata": {"ws_request_header_x_openai_internal_codex_responses_lite": "true"},
         }
     )
-    assert request.to_payload()["input"] == items
+    expected_items = (
+        [
+            {
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "OK"}],
+            }
+        ]
+        if request_type is ResponsesCompactRequest and metadata_only
+        else items
+    )
+    assert request.to_payload()["input"] == expected_items
+    assert request.input == items
 
 
 def test_responses_requires_input():

@@ -17,7 +17,7 @@ from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import aiohttp
 import pytest
@@ -639,32 +639,6 @@ async def test_non_streaming_http_request_is_covered_by_the_same_chokepoint(loop
     assert json.loads(loopback[0].body)["input"][0]["content"][0]["text"] == _isolated().scope_line
 
 
-def test_isolated_coverage_boundary_is_the_core_upstream_client() -> None:
-    """Pin which egress paths thread the identity, so the gap cannot drift silently.
-
-    ``stream_responses``/``compact_responses`` in the core upstream client are
-    the covered chokepoints. The HTTP session bridge and the direct downstream
-    WebSocket surface are NOT covered yet: both serialize the request text
-    before an account is chosen and treat that text as a dispatch-owner and
-    replay key. If a later change wires either one, this test should be updated
-    deliberately rather than discovered by an operator.
-    """
-    import inspect
-
-    from app.core.clients import proxy as core
-
-    for entry in (core.stream_responses, core.compact_responses):
-        assert "thread_cache_identity" in inspect.signature(entry).parameters, entry.__name__
-
-    from app.modules.proxy._service.http_bridge import streaming as bridge
-
-    bridge_source = inspect.getsource(bridge)
-    assert "thread_cache_identity" not in bridge_source, (
-        "The HTTP session bridge now references the thread cache identity. "
-        "If that is intentional, extend the spec's coverage statement and this test."
-    )
-
-
 # --------------------------------------------------------------------------
 # 7. websocket response.create over the real egress path
 # --------------------------------------------------------------------------
@@ -795,7 +769,7 @@ async def _drive_compact(identity: ThreadCacheIdentity | None) -> None:
     session = AsyncMock()
     # The payload and headers are fully built before the POST; failing there
     # keeps the test on the real build path without a live upstream.
-    session.post.side_effect = RuntimeError("stop after the payload is built")
+    session.post = Mock(side_effect=RuntimeError("stop after the payload is built"))
     with contextlib.suppress(Exception):
         await compact_responses(
             _compact_request(),

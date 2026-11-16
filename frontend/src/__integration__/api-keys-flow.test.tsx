@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
 
 import App from "@/App";
+import { ApiKeysSection } from "@/features/api-keys/components/api-keys-section";
 import { renderWithProviders } from "@/test/utils";
 
 function getParentRow(cell: HTMLElement): HTMLElement {
@@ -16,20 +17,33 @@ async function openRowActions(user: ReturnType<typeof userEvent.setup>, row: HTM
   await user.click(actionsButton);
 }
 
+async function openCreateDialog(user: ReturnType<typeof userEvent.setup>) {
+  const button = await screen.findByRole("button", { name: "Create key" });
+  await waitFor(() => expect(button).toBeEnabled());
+  await user.click(button);
+  return within(await screen.findByRole("dialog", { name: "Create API key" }));
+}
+
+function renderKeyManagement() {
+  return renderWithProviders(<ApiKeysSection
+    apiKeyAuthEnabled={false}
+    hideUpstreamQuotaFromApiKeys={false}
+    onApiKeyAuthEnabledChange={() => {}}
+    onHideUpstreamQuotaFromApiKeysChange={() => {}}
+  />);
+}
+
 describe("api keys flow integration", () => {
-  it("creates, shows plain key dialog, edits, and deletes an api key", async () => {
+  it("creates a key and shows its plain value once", async () => {
     const user = userEvent.setup();
     const createdName = "Integration Key";
-    const updatedName = "Integration Key Updated";
 
-    window.history.pushState({}, "", "/settings");
-    renderWithProviders(<App />);
+    renderKeyManagement();
 
-    const createButton = await screen.findByRole("button", { name: "Create key" });
-    expect(createButton).toBeInTheDocument();
-    await user.click(createButton);
-    await user.type(screen.getByLabelText("Name"), createdName);
-    await user.click(screen.getByRole("button", { name: "Create" }));
+    const createDialog = await openCreateDialog(user);
+    await user.click(createDialog.getByLabelText("Name"));
+    await user.paste(createdName);
+    await user.click(createDialog.getByRole("button", { name: "Create" }));
 
     const createdDialog = await screen.findByRole("dialog", { name: "API key created" });
     expect(screen.getByText(/sk-test-generated/i)).toBeInTheDocument();
@@ -41,44 +55,51 @@ describe("api keys flow integration", () => {
       closeCandidates[0];
     await user.click(closeButton);
 
-    const createdRow = getParentRow(await screen.findByText(createdName));
+    expect(await screen.findByText(createdName)).toBeInTheDocument();
+  });
 
-    await openRowActions(user, createdRow);
+  it("edits an existing api key", async () => {
+    const user = userEvent.setup();
+    const updatedName = "Integration Key Updated";
+    window.history.pushState({}, "", "/settings");
+    renderWithProviders(<App />);
+    const row = getParentRow(await screen.findByText("Default key"));
+    await openRowActions(user, row);
     await user.click(await screen.findByRole("menuitem", { name: /Edit/ }));
-    const nameInput = await screen.findByLabelText("Name");
-    await user.clear(nameInput);
-    await user.type(nameInput, updatedName);
-    await user.click(screen.getByRole("button", { name: "Save" }));
+    const dialog = within(await screen.findByRole("dialog", { name: "Edit API key" }));
+    const input = dialog.getByLabelText("Name");
+    await user.clear(input);
+    await user.paste(updatedName);
+    await user.click(dialog.getByRole("button", { name: "Save" }));
+    expect(await screen.findByText(updatedName)).toBeInTheDocument();
+    expect(screen.queryByText("Default key")).not.toBeInTheDocument();
+  });
 
-    const updatedRow = getParentRow(await screen.findByText(updatedName));
-
-    await openRowActions(user, updatedRow);
+  it("deletes an existing api key after confirmation", async () => {
+    const user = userEvent.setup();
+    window.history.pushState({}, "", "/settings");
+    renderWithProviders(<App />);
+    const row = getParentRow(await screen.findByText("Read only key"));
+    await openRowActions(user, row);
     await user.click(await screen.findByRole("menuitem", { name: /Delete/ }));
-    const confirmTitle = await screen.findByText("Delete API key");
-    const confirmDialog = confirmTitle.closest("[role='alertdialog']");
-    expect(confirmDialog).not.toBeNull();
-    if (!confirmDialog) throw new Error("Expected confirm dialog");
-    await user.click(
-      within(confirmDialog as HTMLElement).getByRole("button", { name: "Delete" }),
-    );
-
-    await waitFor(() => {
-      expect(screen.queryByText(updatedName)).not.toBeInTheDocument();
-    });
+    const dialog = within(await screen.findByRole("alertdialog", { name: "Delete API key" }));
+    await user.click(dialog.getByRole("button", { name: "Delete" }));
+    await waitFor(() => expect(screen.queryByText("Read only key")).not.toBeInTheDocument());
+    expect(screen.getByText("Default key")).toBeInTheDocument();
   });
 
   it("creates an api key with assigned accounts", async () => {
     const user = userEvent.setup();
 
-    window.history.pushState({}, "", "/settings");
-    renderWithProviders(<App />);
+    renderKeyManagement();
 
-    await user.click(await screen.findByRole("button", { name: "Create key" }));
-    await user.type(screen.getByLabelText("Name"), "Scoped Integration Key");
+    const createDialog = await openCreateDialog(user);
+    await user.click(createDialog.getByLabelText("Name"));
+    await user.paste("Scoped Integration Key");
     await user.click(await screen.findByRole("button", { name: "All accounts" }));
     await user.click(screen.getByRole("menuitemcheckbox", { name: /primary@example\.com/i }));
     await user.keyboard("{Escape}");
-    await user.click(screen.getByRole("button", { name: "Create" }));
+    await user.click(createDialog.getByRole("button", { name: "Create" }));
 
     const createdDialog = await screen.findByRole("dialog", { name: "API key created" });
     const closeCandidates = within(createdDialog).getAllByRole("button", {

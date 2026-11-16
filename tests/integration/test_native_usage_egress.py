@@ -168,16 +168,32 @@ async def test_native_usage_retries_status_without_waiting_for_body(helper):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["truncated", "body_timeout", "head_timeout"])
-async def test_native_usage_preserves_transport_failures_and_peer(helper, failure):
+async def test_native_usage_preserves_transport_failures_and_peer(helper, failure, monkeypatch):
     calls = 0
+    warming = failure == "head_timeout"
+    head_seen = asyncio.Event()
+    original_request = helper.request
+
+    async def request(request: native_egress.NativeEgressRequest) -> native_egress.NativeEgressResponse:
+        response = await original_request(request)
+        head_seen.set()
+        return response
+
+    monkeypatch.setattr(helper, "request", request)
 
     async def origin(reader, writer, head, body):
         nonlocal calls
+        if warming:
+            await _reply(writer)
+            return
         calls += 1
         if calls > 1:
             await _reply(writer)
         elif failure == "truncated":
-            writer.write(b'HTTP/1.1 200 OK\r\nContent-Length: 999\r\n\r\n{"plan_type":')
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 999\r\n\r\n")
+            await writer.drain()
+            await asyncio.wait_for(head_seen.wait(), timeout=5)
+            writer.write(b'{"plan_type":')
             await writer.drain()
         else:
             if failure == "body_timeout":
@@ -186,8 +202,17 @@ async def test_native_usage_preserves_transport_failures_and_peer(helper, failur
             await reader.read()
 
     async with _serve_http(origin) as url:
+        if warming:
+            # This probe measures a stalled wire HEAD, not cold Rust/client
+            # initialization consuming the entire 150ms before dispatch.
+            assert (await _fetch(url, timeout=5)).plan_type == "plus"
+            warming = False
+            head_seen.clear()
         with pytest.raises(usage.UsageFetchError) as caught:
-            await _fetch(url, retries=0 if failure == "head_timeout" else 2, timeout=0.15)
+            await _fetch(
+                url, retries=0 if failure == "head_timeout" else 2, timeout=0.15 if failure == "head_timeout" else 5.0
+            )
+        assert head_seen.is_set() == (failure != "head_timeout")
         assert caught.value.status_code == 0
         assert isinstance(caught.value.__cause__, NativeEgressTransportError)
         assert calls == 1, "body failures must not replay an already selected response"

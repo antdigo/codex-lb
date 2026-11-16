@@ -29,6 +29,7 @@ from app.core.clients.proxy import (  # noqa: F401  # noqa: F401
 from app.core.clients.proxy import codex_control_request as core_codex_control_request  # noqa: F401
 from app.core.clients.proxy import compact_responses as core_compact_responses  # noqa: F401
 from app.core.clients.proxy import transcribe_audio as core_transcribe_audio  # noqa: F401
+from app.core.clients.thread_cache_identity import ThreadCachePolicy
 from app.core.clock import clock_for, scheduler_for
 from app.core.errors import (
     openai_error,
@@ -400,6 +401,7 @@ class _HTTPBridgeOwnerForwardingMixin:
         proxy_api_authorization: str | None,
         file_owner_account_id: str | None = None,
         client_ip: str | None = None,
+        cache_policy: ThreadCachePolicy | None = None,
     ) -> AsyncIterator[str]:
         current_instance, _ = _normalized_http_bridge_instance_ring(_service_get_settings())
         incoming_turn_state = _sticky_key_from_turn_state_header(headers)
@@ -433,6 +435,7 @@ class _HTTPBridgeOwnerForwardingMixin:
             original_affinity_key=owner_forward.key.affinity_key,
             file_owner_account_id=file_owner_account_id,
             client_ip=client_ip,
+            cache_policy=cache_policy,
         )
         forward_headers = _headers_with_authorization(headers, proxy_api_authorization)
         clock = clock_for(self)

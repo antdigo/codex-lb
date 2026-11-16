@@ -344,6 +344,7 @@ class LoadBalancer:
         api_key_id: str | None = None,
         api_key_stream_fair_share_threshold_pct: int = 0,
         routing_tunables: RoutingTunables | None = None,
+        stream_reserve_slots: int = 0,
     ) -> AccountLease | None:
         """Acquire a lease pinned to one account, or None on a cap denial.
 
@@ -367,7 +368,7 @@ class LoadBalancer:
                     return None
             else:
                 cap = caps.stream_limit
-                if cap > 0 and runtime.inflight_streams >= cap:
+                if cap > 0 and runtime.inflight_streams >= max(1, cap - max(0, stream_reserve_slots)):
                     _record_account_cap_rejection("stream")
                     return None
                 denial = self._api_key_stream_fair_share_denial_locked(
@@ -375,7 +376,7 @@ class LoadBalancer:
                     lease_kind=kind,
                     candidate_account_ids=(account_id,),
                     caps=caps,
-                    stream_reserve_slots=0,
+                    stream_reserve_slots=stream_reserve_slots,
                     threshold_pct=api_key_stream_fair_share_threshold_pct,
                 )
                 if denial is not None:

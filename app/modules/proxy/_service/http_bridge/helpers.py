@@ -95,6 +95,7 @@ from app.modules.proxy._service.compact import (
 from app.modules.proxy._service.compact import (
     _sticky_key_from_compact_payload as _sticky_key_from_compact_payload,
 )
+from app.modules.proxy._service.http_bridge.continuation import response_output_identity
 from app.modules.proxy._service.http_bridge.protocol import _HTTPBridgeServiceProtocol
 from app.modules.proxy._service.observability import (
     _hash_identifier as _hash_identifier,
@@ -188,6 +189,8 @@ from app.modules.proxy.affinity import (
 from app.modules.proxy.continuity import (
     is_http_bridge_account_neutral_replay,
     make_http_bridge_account_neutral_replay_key,
+    resolve_reconnect_preferred_account_id,
+    resolve_required_account_id,
 )
 from app.modules.proxy.durable_bridge_coordinator import (
     DurableBridgeLookup,
@@ -195,6 +198,7 @@ from app.modules.proxy.durable_bridge_coordinator import (
 from app.modules.proxy.durable_bridge_repository import (
     DurableBridgeAliasRegistration,
     DurableBridgeAliasRegistrationReceipt,
+    DurableBridgeAliasSourceFence,
 )
 from app.modules.proxy.durable_bridge_runtime import http_bridge_owner_process_epoch
 from app.modules.proxy.helpers import (
@@ -879,7 +883,12 @@ def _http_bridge_pending_count_nowait(
         # pending_lock free (issue #1971). Counting it keeps capacity LRU
         # eviction and shutdown drain from treating the session as idle and
         # closing it under the admitting turn.
-        return max(visible_pending_count, session.queued_request_count, session.admission_waiter_count)
+        return max(
+            visible_pending_count,
+            session.queued_request_count,
+            session.admission_waiter_count,
+            session.pool_waiter_count,
+        )
     finally:
         session.pending_lock.release()
 
@@ -1045,15 +1054,28 @@ def http_bridge_activity_snapshot_nowait(service: Any) -> dict[str, int | bool]:
             or task.get_name().startswith("http-bridge-close-")
         )
     )
+    pool = getattr(service, "_http_bridge_affinity_pool", None)
+    pool_active = pool.active_operations if pool is not None else 0
+    pool_queued = pool.queued_operations if pool is not None else 0
     bridge_active = (
-        live_sessions > 0
+        pool_active > 0
+        or pool_queued > 0
+        or live_sessions > 0
         or pending_or_queued_requests > 0
         or pending_unknown_sessions > 0
         or inflight_session_creates > 0
     )
-    restart_blocking = pending_or_queued_requests > 0 or pending_unknown_sessions > 0 or inflight_session_creates > 0
+    restart_blocking = (
+        pending_or_queued_requests > 0
+        or pending_unknown_sessions > 0
+        or inflight_session_creates > 0
+        or pool_active > 0
+        or pool_queued > 0
+    )
     return {
         "http_bridge_live_sessions": live_sessions,
+        "http_bridge_pool_active_operations": pool_active,
+        "http_bridge_pool_queued_operations": pool_queued,
         "http_bridge_pending_or_queued_requests": pending_or_queued_requests,
         "http_bridge_pending_unknown_sessions": pending_unknown_sessions,
         "http_bridge_inflight_session_creates": inflight_session_creates,
@@ -1121,7 +1143,11 @@ def _http_bridge_precreated_retry_failure_error(
     return 502, "upstream_unavailable", message, "server_error", None
 
 
-def _trim_http_bridge_previous_response_input_items(input_items: list[JsonValue]) -> list[JsonValue]:
+def _trim_http_bridge_previous_response_input_items(
+    input_items: list[JsonValue], *, covered_output_identities: tuple[str, ...] = ()
+) -> list[JsonValue]:
+    if not covered_output_identities:
+        return input_items
     first_output_index = next(
         (
             index
@@ -1136,6 +1162,13 @@ def _trim_http_bridge_previous_response_input_items(input_items: list[JsonValue]
     prefix = input_items[:first_output_index]
     if not all(_is_http_bridge_previous_response_output_item(item) for item in prefix):
         return input_items
+    # The native markers classify a candidate; only exact owned output can
+    # authorize deletion. A client may omit other covered output items.
+    covered = iter(covered_output_identities)
+    for item in prefix:
+        identity = response_output_identity(item)
+        if identity is None or not any(identity == candidate for candidate in covered):
+            return input_items
     return input_items[first_output_index:]
 
 
@@ -1890,6 +1923,15 @@ def _http_bridge_incompatible_model_fork_key(
     return fork_key
 
 
+def _http_bridge_recovery_owner(preferred_account_id: str | None, session: _HTTPBridgeSession) -> str | None:
+    if not is_http_bridge_account_neutral_replay(kind=session.key.affinity_kind, key=session.key.affinity_key):
+        return preferred_account_id
+    return resolve_required_account_id(
+        ("requested continuity owner", preferred_account_id),
+        ("local account-neutral recovery", session.account.id),
+    )
+
+
 def _http_bridge_locally_owned_fork_key(
     fork_key: "_HTTPBridgeSessionKey",
     forwarded_request: bool,
@@ -2052,11 +2094,16 @@ async def _refresh_reused_http_bridge_session_with_handoff(
     key: "_HTTPBridgeSessionKey",
     request_scope_id: str,
     reserve_handoff: bool,
-) -> None:
+) -> bool:
     if reserve_handoff:
         _reserve_http_bridge_unanchored_handoff(session, request_scope_id=request_scope_id)
     try:
         await service._refresh_durable_http_bridge_session(session)
+        # An older response can detach while lease refresh yields. Its
+        # retirement does not take the registry lock held by this lookup.
+        # Only a reserved handoff already owns the condemned generation.
+        if session.upstream_control.retire_after_drain and not reserve_handoff:
+            return False
         _log_http_bridge_event(
             "reuse",
             key,
@@ -2066,6 +2113,7 @@ async def _refresh_reused_http_bridge_session_with_handoff(
             cache_key_family=key.affinity_kind,
             model_class=_extract_model_class(session.request_model) if session.request_model else None,
         )
+        return True
     except BaseException:
         if reserve_handoff:
             _release_http_bridge_unanchored_handoff(session, request_scope_id=request_scope_id)
@@ -2486,6 +2534,12 @@ def _turn_keys(
     requested_key: _HTTPBridgeSessionKey,
     fallback_key: _HTTPBridgeSessionKey | None,
 ) -> tuple[str | None, _HTTPBridgeSessionKey | None]:
+    from app.modules.proxy.pool_identity import HTTP_BRIDGE_POOL_LANE_KIND
+
+    if requested_key.affinity_kind == HTTP_BRIDGE_POOL_LANE_KIND:
+        # Each pool lane owns its specific response/turn aliases; a shared
+        # process header cannot redirect a new independent turn to a sibling.
+        return None, None
     thread_key = _codex_backend_identity(headers).thread_selection_key
     thread_fallback_key = (
         _HTTPBridgeSessionKey("thread_header", thread_key, api_key.id if api_key is not None else None)
@@ -2877,6 +2931,7 @@ async def _persist_http_bridge_turn_state_alias(
     lease_ttl_seconds: float,
     local_alias_was_published: bool = True,
     reversible: bool = False,
+    source_fence: DurableBridgeAliasSourceFence | None = None,
 ) -> tuple[DurableBridgeAliasRegistration | None, DurableBridgeAliasRegistrationReceipt | None]:
     owner_epoch = session.durable_owner_epoch
     try:
@@ -2889,6 +2944,7 @@ async def _persist_http_bridge_turn_state_alias(
                 owner_epoch=owner_epoch,
                 turn_state=turn_state,
                 lease_ttl_seconds=lease_ttl_seconds,
+                **({"source_fence": source_fence} if source_fence is not None else {}),
             )
             registered = receipt.status
         else:
@@ -2953,6 +3009,7 @@ async def _persist_http_bridge_previous_response_alias(
     instance_id: str,
     lease_ttl_seconds: float,
     local_alias_was_published: bool = True,
+    advance_latest: bool = True,
 ) -> DurableBridgeAliasRegistration | None:
     owner_epoch = session.durable_owner_epoch
     try:
@@ -2966,6 +3023,7 @@ async def _persist_http_bridge_previous_response_alias(
             input_item_count=input_item_count,
             input_full_fingerprint=input_full_fingerprint,
             pending_tool_calls=pending_tool_calls,
+            **({"advance_latest": False} if not advance_latest else {}),
         )
     except Exception:
         logger.warning("Failed to persist durable HTTP bridge previous_response_id alias", exc_info=True)
@@ -3440,6 +3498,35 @@ def _http_bridge_previous_response_owner_unavailable_error() -> ProxyResponseErr
             error_type="server_error",
         ),
     )
+
+
+def _http_bridge_reconnect_required_owners(
+    request_state: _WebSocketRequestState,
+    session_account_id: str,
+    *,
+    require_same_account: bool,
+    require_preferred_account: bool,
+    account_neutral_recovery: bool,
+) -> tuple[str | None, str | None]:
+    """Resolve physical ownership while retaining the continuity error contract."""
+    continuity_owner = resolve_required_account_id(
+        (
+            "requested reconnect owner",
+            resolve_reconnect_preferred_account_id(
+                request_state, session_account_id, require_preferred_account, account_neutral_recovery
+            ),
+        ),
+        ("physical socket rotation owner", request_state.bridge_age_required_account_id),
+        ("account-neutral recovery", session_account_id if account_neutral_recovery else None),
+    )
+    required_owner = resolve_required_account_id(
+        ("continuity owner", continuity_owner),
+        ("same-account reconnect", session_account_id if require_same_account else None),
+    )
+    # A transport-only retry owns its physical account without claiming that
+    # the client supplied a previous-response anchor. Keep its existing error
+    # envelope while applying the same exclusion, selection and socket fences.
+    return required_owner, continuity_owner
 
 
 def _http_bridge_reconnect_selection_failure(
